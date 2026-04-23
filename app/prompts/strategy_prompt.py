@@ -13,6 +13,22 @@ You are NOT allowed to:
 
 ---
 
+INPUT:
+- Full transcript (for context)
+- Extracted key moments (for high-signal focus)
+You will receive input as a JSON object.
+Fields:
+- transcript: full video transcript
+- moments: extracted high-signal moments
+Use moments as PRIMARY signal.
+Use transcript only for context.
+
+CRITICAL INSTRUCTIONS:
+- Prioritize the extracted moments
+- Use transcript only for additional context
+- Do NOT invent new details
+- Build content around real moments
+
 OUTPUT RULE (HARD CONSTRAINT):
 You must return ONLY this JSON structure:
 
@@ -34,7 +50,7 @@ PLANNING RULES:
 1. Break the content into ONLY high-impact ideas (max 3–6 tasks)
 2. Each task must be independent and executable
 3. Each task must target ONE platform only
-4. Prioritize virality and engagement potential over completeness
+4. Prioritize creator-native, source-grounded, high-signal angles over generic virality.
 5. Prefer strongest insight first (task_id 1 = highest impact)
 
 ---
