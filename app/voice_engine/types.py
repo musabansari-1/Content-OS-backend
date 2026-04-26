@@ -1,0 +1,127 @@
+from typing import List, Optional
+
+from pydantic import BaseModel, Field, validator
+
+
+INVALID_DEVICE_TERMS = {
+    "youtube",
+    "twitter",
+    "x",
+    "linkedin",
+    "instagram",
+    "tiktok",
+    "facebook",
+    "threads",
+    "newsletter",
+    "email",
+    "blog",
+    "podcast",
+    "discord",
+    "reddit",
+    "telegram",
+    "whatsapp",
+    "video platform",
+    "social media",
+    "platform",
+    "channel",
+}
+
+
+def _normalize_preferred_devices(values: List[str]) -> List[str]:
+    normalized = []
+
+    for raw_value in values or []:
+        value = (raw_value or "").strip()
+        if not value:
+            continue
+
+        lowered = value.lower()
+
+        if any(term in lowered for term in INVALID_DEVICE_TERMS):
+            continue
+
+        normalized.append(value)
+
+    return list(dict.fromkeys(normalized))
+
+
+class VoiceProfile(BaseModel):
+    tone: List[str] = Field(default_factory=list)
+    sentence_rhythm: str = ""
+    hook_style: List[str] = Field(default_factory=list)
+    cta_style: List[str] = Field(default_factory=list)
+    humor_style: str = ""
+    emotional_intensity: str = ""
+    emoji_usage: str = ""
+    punctuation_style: str = ""
+    preferred_devices: List[str] = Field(default_factory=list)
+    banned_phrases: List[str] = Field(default_factory=list)
+    preferred_phrases: List[str] = Field(default_factory=list)
+    narrative_behavior: "NarrativeBehavior" = Field(default_factory=lambda: NarrativeBehavior())
+    cognitive_style: "CognitiveStyle" = Field(default_factory=lambda: CognitiveStyle())
+    constraint_profile: "ConstraintProfile" = Field(default_factory=lambda: ConstraintProfile())
+    voice_anchors: List[str] = Field(default_factory=list)
+    style_summary: str = ""
+
+    @validator("preferred_devices", pre=True, always=True)
+    def validate_preferred_devices(cls, value):
+        if value is None:
+            return []
+
+        if isinstance(value, str):
+            value = [value]
+
+        return _normalize_preferred_devices(value)
+
+
+class NarrativeBehavior(BaseModel):
+    opening_pattern: str = ""
+    idea_progression: List[str] = Field(default_factory=list)
+    tension_pattern: str = ""
+    teaching_pattern: str = ""
+    authority_pattern: str = ""
+    closing_pattern: str = ""
+
+
+class CognitiveStyle(BaseModel):
+    reasoning_style: List[str] = Field(default_factory=list)
+    decision_lens: List[str] = Field(default_factory=list)
+    abstraction_pattern: str = ""
+    problem_solving_style: str = ""
+    common_reframes: List[str] = Field(default_factory=list)
+
+
+class ConstraintProfile(BaseModel):
+    avoids: List[str] = Field(default_factory=list)
+    never_does: List[str] = Field(default_factory=list)
+    overuse_risks: List[str] = Field(default_factory=list)
+
+
+class CreatorVoiceProfileRecord(BaseModel):
+    id: int
+    creator_id: str
+    voice_profile_json: VoiceProfile
+    style_summary: str
+    version: int
+    created_at: str
+    updated_at: str
+
+
+class CreateVoiceProfileRequest(BaseModel):
+    creator_id: str
+    samples: List[str] = Field(default_factory=list)
+
+
+class CreateVoiceProfileFromYoutubeRequest(BaseModel):
+    creator_id: str
+    youtube_video_ids: List[str] = Field(default_factory=list)
+    youtube_urls: List[str] = Field(default_factory=list)
+
+
+class GenerateContentRequest(BaseModel):
+    video_id: Optional[str] = None
+    video_url: Optional[str] = None
+    creator_id: Optional[str] = None
+
+
+VoiceProfile.update_forward_refs()

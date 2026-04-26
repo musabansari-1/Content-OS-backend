@@ -41,6 +41,46 @@ No exceptions.
 
 This is mandatory.
 
+7. 🔴 VOICE FIDELITY (CRITICAL)
+- Does this sound like the creator, not just a good AI writer?
+- Does it preserve the creator’s tone, rhythm, phrasing, and identity markers?
+- Does it preserve how the creator thinks, teaches, and builds arguments?
+- Does it preserve the creator’s reasoning style (not just surface tone)?
+- Does it sound like the same creator speaking on another platform?
+
+Flag issues if the output:
+- sounds generic but polished
+- sounds more corporate than the creator
+- sounds more hype-driven than the creator
+- sounds more dramatic than the creator
+- sounds more platform-native than creator-native
+- loses the creator’s natural phrasing or reasoning patterns
+- feels like “AI imitating the creator” instead of the creator adapting naturally
+
+This is a major scoring category.
+Voice drift must reduce score significantly.
+
+9. 🔴 REASONING FIDELITY
+- Does the content preserve how the creator thinks?
+- Does it move like the creator’s natural thought process?
+- Does it follow the creator’s narrative logic (example → deconstruction → principle → takeaway)?
+- Or does it flatten into generic social-media pacing?
+
+If the wording sounds similar but the thinking pattern is generic,
+flag:
+"reasoning_drift"
+
+10. 🔴 GENERIC AI TONE DETECTION
+Flag if the output feels like:
+- polished generic AI content
+- overly clean “thought leadership”
+- generic productivity advice
+- generic motivational framing
+- broad internet wisdom instead of lived insight
+
+If present, flag:
+"ai_flattening"
+
 ---
 
 SCORING RULE:
