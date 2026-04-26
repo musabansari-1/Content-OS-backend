@@ -1,5 +1,4 @@
 EXAMPLE_VOICE_PROFILE_EXTRACTION_INPUT = {
-    "creator_id": "creator_42",
     "samples": [
         "I used to think consistency was the problem. It wasn't. Distribution was.",
         "Most people are creating more. The winners are repackaging better.",

@@ -16,14 +16,20 @@ class CreatorVoiceProfileService:
 
     def createOrUpdateVoiceProfile(
         self,
-        creatorId: str,
+        userId: Optional[int],
         samples: List[str],
     ) -> CreatorVoiceProfileRecord:
-        voice_profile = self.extractor.extractVoiceProfile(creatorId, samples)
-        return self.repository.create_or_update(creatorId, voice_profile)
+        voice_profile = self.extractor.extractVoiceProfile(samples)
+        return self.repository.create_or_update(userId, voice_profile)
 
-    def getVoiceProfile(self, creatorId: str) -> Optional[CreatorVoiceProfileRecord]:
-        return self.repository.get_by_creator_id(creatorId)
+    def getVoiceProfile(
+        self,
+        userId: Optional[int],
+    ) -> Optional[CreatorVoiceProfileRecord]:
+        return self.repository.get_by_user_id(userId)
+
+    def listVoiceProfiles(self, userId: int) -> list[CreatorVoiceProfileRecord]:
+        return self.repository.list_all(userId)
 
     def repairStoredPreferredDevices(self) -> list[CreatorVoiceProfileRecord]:
         repaired_records = []
@@ -37,7 +43,10 @@ class CreatorVoiceProfileService:
                 continue
 
             repaired_records.append(
-                self.repository.create_or_update(record.creator_id, normalized_profile)
+                self.repository.create_or_update(
+                    record.user_id,
+                    normalized_profile,
+                )
             )
 
         return repaired_records

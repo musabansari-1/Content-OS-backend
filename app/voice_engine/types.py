@@ -99,7 +99,7 @@ class ConstraintProfile(BaseModel):
 
 class CreatorVoiceProfileRecord(BaseModel):
     id: int
-    creator_id: str
+    user_id: Optional[int] = None
     voice_profile_json: VoiceProfile
     style_summary: str
     version: int
@@ -107,13 +107,11 @@ class CreatorVoiceProfileRecord(BaseModel):
     updated_at: str
 
 
-class CreateVoiceProfileRequest(BaseModel):
-    creator_id: str
+class SaveMyVoiceProfileRequest(BaseModel):
     samples: List[str] = Field(default_factory=list)
 
 
-class CreateVoiceProfileFromYoutubeRequest(BaseModel):
-    creator_id: str
+class SaveMyVoiceProfileFromYoutubeRequest(BaseModel):
     youtube_video_ids: List[str] = Field(default_factory=list)
     youtube_urls: List[str] = Field(default_factory=list)
 
@@ -121,7 +119,6 @@ class CreateVoiceProfileFromYoutubeRequest(BaseModel):
 class GenerateContentRequest(BaseModel):
     video_id: Optional[str] = None
     video_url: Optional[str] = None
-    creator_id: Optional[str] = None
 
 
 VoiceProfile.update_forward_refs()

@@ -74,15 +74,15 @@ def execute_task(task, source, creator_voice_profile=None):
 def run_execution_pipeline(
     execution_plan: list,
     source: str,
-    creator_id=None,
+    user_id=None,
     creator_voice_profile_service=None,
 ):
     results = []
     voice_profile_record = None
 
-    if creator_id:
+    if user_id is not None:
         profile_service = creator_voice_profile_service or CreatorVoiceProfileService()
-        voice_profile_record = profile_service.getVoiceProfile(creator_id)
+        voice_profile_record = profile_service.getVoiceProfile(user_id)
 
     creator_voice_profile = None
     if voice_profile_record:

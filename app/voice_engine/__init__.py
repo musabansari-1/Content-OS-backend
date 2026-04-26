@@ -1,11 +1,11 @@
 from app.voice_engine.types import (
     CognitiveStyle,
     ConstraintProfile,
-    CreateVoiceProfileRequest,
-    CreateVoiceProfileFromYoutubeRequest,
     CreatorVoiceProfileRecord,
     GenerateContentRequest,
     NarrativeBehavior,
+    SaveMyVoiceProfileFromYoutubeRequest,
+    SaveMyVoiceProfileRequest,
     VoiceProfile,
 )
 
@@ -15,7 +15,7 @@ __all__ = [
     "CognitiveStyle",
     "ConstraintProfile",
     "CreatorVoiceProfileRecord",
-    "CreateVoiceProfileRequest",
-    "CreateVoiceProfileFromYoutubeRequest",
     "GenerateContentRequest",
+    "SaveMyVoiceProfileRequest",
+    "SaveMyVoiceProfileFromYoutubeRequest",
 ]

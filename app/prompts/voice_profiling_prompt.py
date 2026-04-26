@@ -16,7 +16,6 @@ The output will be used by downstream generation agents to preserve creator iden
 across transformed content (Twitter, LinkedIn, TikTok, YouTube, etc).
 
 You will receive a JSON payload with:
-- creator_id: string
 - samples: array of writing samples
 
 Return JSON only.

@@ -4,20 +4,22 @@ import json
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from youtube_transcript_api import YouTubeTranscriptApi
 
 from app.agents.execution_agent import run_execution_pipeline
+from app.auth.dependencies import auth_service, require_current_user
+from app.auth.types import AuthResponse, LoginRequest, RegisterRequest, UserResponse
 from app.agents.moment_agent import extract_moments
 from app.agents.strategy_agent import generate_strategy
 from app.voice_engine.db import run_migrations
 from app.voice_engine.service import CreatorVoiceProfileService
 from app.voice_engine.types import (
-    CreateVoiceProfileRequest,
-    CreateVoiceProfileFromYoutubeRequest,
     CreatorVoiceProfileRecord,
     GenerateContentRequest,
+    SaveMyVoiceProfileFromYoutubeRequest,
+    SaveMyVoiceProfileRequest,
 )
 
 app = FastAPI()
@@ -82,7 +84,10 @@ def fetch_video_transcripts(video_inputs):
     return [fetch_video_transcript(video_input) for video_input in video_inputs]
 
 
-def _generate_from_video(video_input: str, creator_id: Optional[str] = None):
+def _generate_from_video(
+    video_input: str,
+    user_id: int,
+):
     transcript = fetch_video_transcript(video_input)
 
     moments = extract_moments(transcript)
@@ -105,7 +110,7 @@ def _generate_from_video(video_input: str, creator_id: Optional[str] = None):
     results = run_execution_pipeline(
         execution_plan,
         transcript,
-        creator_id=creator_id,
+        user_id=user_id,
         creator_voice_profile_service=creator_voice_profile_service,
     )
 
@@ -119,42 +124,77 @@ def _generate_from_video(video_input: str, creator_id: Optional[str] = None):
 def generate(
     video_id: Optional[str] = None,
     video_url: Optional[str] = None,
-    creator_id: Optional[str] = None,
+    current_user: UserResponse = Depends(require_current_user),
 ):
     video_input = video_url or video_id
 
     if not video_input:
         raise HTTPException(status_code=400, detail="Provide either video_id or video_url.")
 
-    return _generate_from_video(video_input, creator_id)
+    return _generate_from_video(
+        video_input,
+        current_user.id,
+    )
 
 
 @app.post("/generate-from-video")
-def generate_from_video(request: GenerateContentRequest):
+def generate_from_video(
+    request: GenerateContentRequest,
+    current_user: UserResponse = Depends(require_current_user),
+):
     video_input = request.video_url or request.video_id
 
     if not video_input:
         raise HTTPException(status_code=400, detail="Provide either video_id or video_url.")
 
-    return _generate_from_video(video_input, request.creator_id)
+    return _generate_from_video(
+        video_input,
+        current_user.id,
+    )
 
 
-@app.post("/creator-voice-profiles", response_model=CreatorVoiceProfileRecord)
-def create_or_update_creator_voice_profile(
-    request: CreateVoiceProfileRequest,
+@app.get("/me", response_model=UserResponse)
+def get_me(current_user: UserResponse = Depends(require_current_user)):
+    return current_user
+
+
+@app.post("/auth/register", response_model=AuthResponse)
+def register(request: RegisterRequest):
+    return auth_service.register(request)
+
+
+@app.post("/auth/login", response_model=AuthResponse)
+def login(request: LoginRequest):
+    return auth_service.login(request)
+
+
+@app.get("/me/voice-profile", response_model=CreatorVoiceProfileRecord)
+def get_my_default_voice_profile(
+    current_user: UserResponse = Depends(require_current_user),
+):
+    profile = creator_voice_profile_service.getVoiceProfile(current_user.id)
+
+    if not profile:
+        raise HTTPException(status_code=404, detail="Creator voice profile not found.")
+
+    return profile
+
+
+@app.post("/me/voice-profile", response_model=CreatorVoiceProfileRecord)
+def create_or_update_my_default_voice_profile(
+    request: SaveMyVoiceProfileRequest,
+    current_user: UserResponse = Depends(require_current_user),
 ):
     return creator_voice_profile_service.createOrUpdateVoiceProfile(
-        request.creator_id,
+        current_user.id,
         request.samples,
     )
 
 
-@app.post(
-    "/creator-voice-profiles/from-youtube",
-    response_model=CreatorVoiceProfileRecord,
-)
-def create_or_update_creator_voice_profile_from_youtube(
-    request: CreateVoiceProfileFromYoutubeRequest,
+@app.post("/me/voice-profile/from-youtube", response_model=CreatorVoiceProfileRecord)
+def create_or_update_my_default_voice_profile_from_youtube(
+    request: SaveMyVoiceProfileFromYoutubeRequest,
+    current_user: UserResponse = Depends(require_current_user),
 ):
     video_inputs = [
         video_id.strip() for video_id in request.youtube_video_ids if video_id.strip()
@@ -172,19 +212,6 @@ def create_or_update_creator_voice_profile_from_youtube(
     samples = fetch_video_transcripts(video_inputs)
 
     return creator_voice_profile_service.createOrUpdateVoiceProfile(
-        request.creator_id,
+        current_user.id,
         samples,
     )
-
-
-@app.get(
-    "/creator-voice-profiles/{creator_id}",
-    response_model=CreatorVoiceProfileRecord,
-)
-def get_creator_voice_profile(creator_id: str):
-    profile = creator_voice_profile_service.getVoiceProfile(creator_id)
-
-    if not profile:
-        raise HTTPException(status_code=404, detail="Creator voice profile not found.")
-
-    return profile
