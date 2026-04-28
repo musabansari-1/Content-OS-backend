@@ -1,6 +1,8 @@
 # main.py
 
 import json
+import os
+from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -23,12 +25,47 @@ from app.voice_engine.types import (
     SaveMyVoiceProfileRequest,
 )
 
+
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+
+
+def _load_env_file() -> None:
+    env_path = BACKEND_DIR / ".env"
+    if not env_path.exists():
+        return
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+def _get_allowed_origins() -> list[str]:
+    _load_env_file()
+    configured_origins = os.getenv("CORS_ALLOWED_ORIGINS", "").strip()
+    if configured_origins:
+        return [origin.strip() for origin in configured_origins.split(",") if origin.strip()]
+
+    frontend_url = os.getenv("FRONTEND_URL", "").strip()
+    if frontend_url:
+        return [frontend_url]
+
+    return [
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "https://content-os-frontend.vercel.app",
+    ]
+
+
 app = FastAPI()
 creator_voice_profile_service = CreatorVoiceProfileService()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_get_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
