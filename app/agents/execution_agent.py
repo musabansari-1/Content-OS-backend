@@ -4,9 +4,14 @@ import json
 from typing import Optional
 
 from app.agents.critic_agent import critic_agent
+from app.assets import AVAILABLE_TARGET_ASSETS
+from app.prompts.blog_post_prompt import BLOG_POST_PROMPT
 from app.prompts.conversion_prompt import CONVERSION_PROMPT
 from app.prompts.execution_prompt import build_execution_user_prompt
+from app.prompts.instagram_carousel_prompt import INSTAGRAM_CAROUSEL_PROMPT
+from app.prompts.instagram_reel_prompt import INSTAGRAM_REEL_PROMPT
 from app.prompts.linkedin_prompt import LINKEDIN_PROMPT
+from app.prompts.newsletter_prompt import NEWSLETTER_PROMPT
 from app.prompts.tiktok_prompt import TIKTOK_PROMPT
 from app.prompts.twitter_prompt import TWITTER_PROMPT
 from app.prompts.youtube_prompt import YOUTUBE_PROMPT
@@ -53,22 +58,34 @@ def _voice_profile_to_dict(voice_profile) -> Optional[dict]:
 
 
 def execute_task(task, source, creator_voice_profile=None):
-    platform = task["platform"]
+    asset_type = task["asset_type"]
     user_prompt = build_execution_user_prompt(task, source, creator_voice_profile)
 
-    if platform == "twitter":
+    if asset_type == "twitter_thread":
         return call_llm(TWITTER_PROMPT, user_prompt)
 
-    if platform == "tiktok":
+    if asset_type == "tiktok_clip":
         return call_llm(TIKTOK_PROMPT, user_prompt)
 
-    if platform == "linkedin":
+    if asset_type == "linkedin_post":
         return call_llm(LINKEDIN_PROMPT, user_prompt)
 
-    if platform == "youtube":
+    if asset_type == "youtube_video_idea":
         return call_llm(YOUTUBE_PROMPT, user_prompt)
 
-    raise ValueError(f"Unsupported platform: {platform}")
+    if asset_type == "instagram_carousel":
+        return call_llm(INSTAGRAM_CAROUSEL_PROMPT, user_prompt)
+
+    if asset_type == "instagram_reel":
+        return call_llm(INSTAGRAM_REEL_PROMPT, user_prompt)
+
+    if asset_type == "blog_post":
+        return call_llm(BLOG_POST_PROMPT, user_prompt)
+
+    if asset_type == "newsletter":
+        return call_llm(NEWSLETTER_PROMPT, user_prompt)
+
+    raise ValueError(f"Unsupported asset type: {asset_type}")
 
 
 def run_execution_pipeline(
@@ -96,7 +113,12 @@ def run_execution_pipeline(
     # snippets before execution, without changing storage or extraction contracts.
 
     for task in execution_plan:
-        print(f"Executing task {task['task_id']} on {task['platform']}...")
+        if task.get("asset_type") not in AVAILABLE_TARGET_ASSETS:
+            raise ValueError(
+                f"Unsupported asset type in execution plan: {task.get('asset_type')}"
+            )
+
+        print(f"Executing task {task['task_id']} on {task['asset_type']}...")
 
         max_attempts = 3
         attempt = 0
@@ -149,6 +171,7 @@ def run_execution_pipeline(
         results.append(
             {
                 "task_id": task["task_id"],
+                "asset_type": task["asset_type"],
                 "platform": task["platform"],
                 "output": optimized_output,
             }

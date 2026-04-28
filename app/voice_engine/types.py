@@ -119,6 +119,7 @@ class SaveMyVoiceProfileFromYoutubeRequest(BaseModel):
 class GenerateContentRequest(BaseModel):
     video_id: Optional[str] = None
     video_url: Optional[str] = None
+    target_assets: List[str] = Field(default_factory=list)
 
 
 VoiceProfile.update_forward_refs()

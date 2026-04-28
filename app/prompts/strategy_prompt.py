@@ -16,10 +16,13 @@ You are NOT allowed to:
 INPUT:
 - Full transcript (for context)
 - Extracted key moments (for high-signal focus)
+- Requested target assets
 You will receive input as a JSON object.
 Fields:
 - transcript: full video transcript
 - moments: extracted high-signal moments
+- target_assets: array of requested asset_type ids
+- asset_catalog: array describing each allowed asset_type, platform, format, and output_type
 Use moments as PRIMARY signal.
 Use transcript only for context.
 
@@ -28,6 +31,7 @@ CRITICAL INSTRUCTIONS:
 - Use transcript only for additional context
 - Do NOT invent new details
 - Build content around real moments
+- Plan ONLY for the requested target_assets
 
 OUTPUT RULE (HARD CONSTRAINT):
 You must return ONLY this JSON structure:
@@ -36,9 +40,11 @@ You must return ONLY this JSON structure:
   "execution_plan": [
     {
       "task_id": integer,
+      "asset_type": "string from target_assets",
+      "platform": "string from asset_catalog",
+      "format": "string from asset_catalog",
       "input": "single atomic content idea",
-      "platform": "twitter | youtube | tiktok | linkedin",
-      "output_type": "tweet_thread | short_video | video_idea | post",
+      "output_type": "string from asset_catalog",
       "goal": "clear engagement objective"
     }
   ]
@@ -47,11 +53,13 @@ You must return ONLY this JSON structure:
 ---
 
 PLANNING RULES:
-1. Break the content into ONLY high-impact ideas (max 3–6 tasks)
+1. Break the content into ONLY high-impact ideas (max 3-6 tasks)
 2. Each task must be independent and executable
-3. Each task must target ONE platform only
-4. Prioritize creator-native, source-grounded, high-signal angles over generic virality.
+3. Each task must target ONE requested asset_type only
+4. Prioritize creator-native, source-grounded, high-signal angles over generic virality
 5. Prefer strongest insight first (task_id 1 = highest impact)
+6. Use ONLY asset_type values present in target_assets
+7. Do NOT invent asset types, platforms, formats, or output types beyond asset_catalog
 
 ---
 

@@ -9,10 +9,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from youtube_transcript_api import YouTubeTranscriptApi
 
 from app.agents.execution_agent import run_execution_pipeline
-from app.auth.dependencies import auth_service, require_current_user
-from app.auth.types import AuthResponse, LoginRequest, RegisterRequest, UserResponse
 from app.agents.moment_agent import extract_moments
 from app.agents.strategy_agent import generate_strategy
+from app.assets import build_asset_brief, get_asset_catalog, normalize_target_assets
+from app.auth.dependencies import auth_service, require_current_user
+from app.auth.types import AuthResponse, LoginRequest, RegisterRequest, UserResponse
 from app.voice_engine.db import run_migrations
 from app.voice_engine.service import CreatorVoiceProfileService
 from app.voice_engine.types import (
@@ -87,25 +88,22 @@ def fetch_video_transcripts(video_inputs):
 def _generate_from_video(
     video_input: str,
     user_id: int,
+    target_assets: list[str],
 ):
     transcript = fetch_video_transcript(video_input)
-
     moments = extract_moments(transcript)
 
     strategy_output = generate_strategy(
         {
             "transcript": transcript,
             "moments": moments,
+            "target_assets": target_assets,
+            "asset_catalog": build_asset_brief(target_assets),
         }
     )
 
-    print(transcript)
-    print(strategy_output)
-
     strategy_output = json.loads(strategy_output)
     execution_plan = strategy_output["execution_plan"]
-
-    print(execution_plan)
 
     results = run_execution_pipeline(
         execution_plan,
@@ -124,6 +122,7 @@ def _generate_from_video(
 def generate(
     video_id: Optional[str] = None,
     video_url: Optional[str] = None,
+    target_assets: Optional[str] = None,
     current_user: UserResponse = Depends(require_current_user),
 ):
     video_input = video_url or video_id
@@ -131,9 +130,17 @@ def generate(
     if not video_input:
         raise HTTPException(status_code=400, detail="Provide either video_id or video_url.")
 
+    try:
+        selected_target_assets = normalize_target_assets(
+            target_assets.split(",") if target_assets else None
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
     return _generate_from_video(
         video_input,
         current_user.id,
+        selected_target_assets,
     )
 
 
@@ -147,10 +154,21 @@ def generate_from_video(
     if not video_input:
         raise HTTPException(status_code=400, detail="Provide either video_id or video_url.")
 
+    try:
+        selected_target_assets = normalize_target_assets(request.target_assets)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
     return _generate_from_video(
         video_input,
         current_user.id,
+        selected_target_assets,
     )
+
+
+@app.get("/target-assets")
+def get_target_assets():
+    return {"target_assets": get_asset_catalog()}
 
 
 @app.get("/me", response_model=UserResponse)
