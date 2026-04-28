@@ -1,36 +1,57 @@
-import sqlite3
+import os
 from pathlib import Path
 from threading import Lock
 
+from psycopg import Connection, connect
+from psycopg.rows import dict_row
+
 
 PROJECT_BACKEND_DIR = Path(__file__).resolve().parents[2]
-DATA_DIR = PROJECT_BACKEND_DIR / "data"
-DATABASE_PATH = DATA_DIR / "contentos.db"
 MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "migrations"
 
 _migration_lock = Lock()
 
 
-def get_connection() -> sqlite3.Connection:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+def _load_env_file() -> None:
+    env_path = PROJECT_BACKEND_DIR / ".env"
+    if not env_path.exists():
+        return
 
-    connection = sqlite3.connect(str(DATABASE_PATH), check_same_thread=False)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL;")
-    connection.execute("PRAGMA foreign_keys=ON;")
-    return connection
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+def _get_database_url() -> str:
+    _load_env_file()
+    database_url = os.getenv("DATABASE_URL") or os.getenv("NEON_DATABASE_URL")
+    if not database_url:
+        raise RuntimeError(
+            "DATABASE_URL is not set. Add your Neon Postgres connection string to backend/.env."
+        )
+
+    return database_url
+
+
+def get_connection() -> Connection:
+    return connect(
+        _get_database_url(),
+        row_factory=dict_row,
+    )
 
 
 def run_migrations() -> None:
     with _migration_lock:
-        connection = get_connection()
-
-        try:
+        with get_connection() as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS schema_migrations (
                     version TEXT PRIMARY KEY,
-                    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
@@ -45,12 +66,8 @@ def run_migrations() -> None:
                     continue
 
                 sql = migration_path.read_text(encoding="utf-8")
-                connection.executescript(sql)
+                connection.execute(sql)
                 connection.execute(
-                    "INSERT INTO schema_migrations(version) VALUES (?)",
+                    "INSERT INTO schema_migrations(version) VALUES (%s)",
                     (migration_path.name,),
                 )
-
-            connection.commit()
-        finally:
-            connection.close()

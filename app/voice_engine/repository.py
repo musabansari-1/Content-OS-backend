@@ -28,7 +28,7 @@ class CreatorVoiceProfileRepository:
                 """
                 SELECT id, version
                 FROM creator_voice_profiles
-                WHERE user_id = ?
+                WHERE user_id = %s
                 """,
                 (user_id,),
             ).fetchone()
@@ -38,11 +38,11 @@ class CreatorVoiceProfileRepository:
                 connection.execute(
                     """
                     UPDATE creator_voice_profiles
-                    SET voice_profile_json = ?,
-                        style_summary = ?,
-                        version = ?,
+                    SET voice_profile_json = %s,
+                        style_summary = %s,
+                        version = %s,
                         updated_at = CURRENT_TIMESTAMP
-                    WHERE user_id = ?
+                    WHERE user_id = %s
                     """,
                     (
                         payload,
@@ -60,7 +60,7 @@ class CreatorVoiceProfileRepository:
                         style_summary,
                         version
                     )
-                    VALUES (?, ?, ?, 1)
+                    VALUES (%s, %s, %s, 1)
                     """,
                     (
                         user_id,
@@ -92,7 +92,7 @@ class CreatorVoiceProfileRepository:
                     created_at,
                     updated_at
                 FROM creator_voice_profiles
-                WHERE user_id = ?
+                WHERE user_id = %s
                 """,
                 (user_id,),
             ).fetchone()
@@ -144,7 +144,7 @@ class CreatorVoiceProfileRepository:
                         created_at,
                         updated_at
                     FROM creator_voice_profiles
-                    WHERE user_id = ?
+                    WHERE user_id = %s
                     ORDER BY id ASC
                     """,
                     (user_id,),

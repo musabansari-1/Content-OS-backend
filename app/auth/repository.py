@@ -12,15 +12,16 @@ class UserRepository:
         connection = get_connection()
 
         try:
-            cursor = connection.execute(
+            row = connection.execute(
                 """
                 INSERT INTO users (email, password_hash, display_name)
-                VALUES (?, ?, ?)
+                VALUES (%s, %s, %s)
+                RETURNING id
                 """,
                 (email, password_hash, display_name),
-            )
+            ).fetchone()
             connection.commit()
-            return self.get_by_id(int(cursor.lastrowid))
+            return self.get_by_id(int(row["id"]))
         finally:
             connection.close()
 
@@ -32,7 +33,7 @@ class UserRepository:
                 """
                 SELECT id, email, password_hash, display_name, created_at
                 FROM users
-                WHERE email = ?
+                WHERE email = %s
                 """,
                 (email,),
             ).fetchone()
@@ -58,7 +59,7 @@ class UserRepository:
                 """
                 SELECT id, email, display_name, created_at
                 FROM users
-                WHERE id = ?
+                WHERE id = %s
                 """,
                 (user_id,),
             ).fetchone()

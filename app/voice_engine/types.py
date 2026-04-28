@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import List, Optional
 
 from pydantic import BaseModel, Field, validator
@@ -103,8 +104,8 @@ class CreatorVoiceProfileRecord(BaseModel):
     voice_profile_json: VoiceProfile
     style_summary: str
     version: int
-    created_at: str
-    updated_at: str
+    created_at: datetime
+    updated_at: datetime
 
 
 class SaveMyVoiceProfileRequest(BaseModel):
