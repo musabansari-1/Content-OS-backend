@@ -110,6 +110,42 @@ def _generate_from_video(
     }
 
 
+def _generate_from_transcript(
+    transcript: str,
+    user_id: int,
+    target_assets: list[str],
+):
+    normalized_transcript = transcript.strip()
+    if not normalized_transcript:
+        raise HTTPException(status_code=400, detail="A transcript is required.")
+
+    moments = extract_moments(normalized_transcript)
+
+    strategy_output = generate_strategy(
+        {
+            "transcript": normalized_transcript,
+            "moments": moments,
+            "target_assets": target_assets,
+            "asset_catalog": build_asset_brief(target_assets),
+        }
+    )
+
+    strategy_output = json.loads(strategy_output)
+    execution_plan = strategy_output["execution_plan"]
+
+    results = run_execution_pipeline(
+        execution_plan,
+        normalized_transcript,
+        user_id=user_id,
+        creator_voice_profile_service=creator_voice_profile_service,
+    )
+
+    return {
+        "strategy": strategy_output,
+        "results": results,
+    }
+
+
 @app.get("/generate")
 def generate(
     video_id: Optional[str] = None,
@@ -142,20 +178,27 @@ def generate_from_video(
     current_user: UserResponse = Depends(require_current_user),
 ):
     video_input = request.video_url or request.video_id
+    transcript = request.transcript.strip()
 
-    if not video_input:
-        raise HTTPException(status_code=400, detail="Provide either video_id or video_url.")
+    if not video_input and not transcript:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide a YouTube video URL/ID or paste a transcript.",
+        )
 
     try:
         selected_target_assets = normalize_target_assets(request.target_assets)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error))
 
-    return _generate_from_video(
-        video_input,
-        current_user.id,
-        selected_target_assets,
-    )
+    if transcript:
+        return _generate_from_transcript(
+            transcript,
+            current_user.id,
+            selected_target_assets,
+        )
+
+    return _generate_from_video(video_input, current_user.id, selected_target_assets)
 
 
 @app.get("/target-assets")
@@ -213,13 +256,17 @@ def create_or_update_my_default_voice_profile_from_youtube(
         [video_url.strip() for video_url in request.youtube_urls if video_url.strip()]
     )
 
-    if not video_inputs:
+    transcripts = [transcript.strip() for transcript in request.transcripts if transcript.strip()]
+
+    if not video_inputs and not transcripts:
         raise HTTPException(
             status_code=400,
-            detail="At least one YouTube video ID or URL is required.",
+            detail="At least one YouTube video ID, URL, or transcript is required.",
         )
 
-    samples = fetch_video_transcripts(video_inputs)
+    samples = list(transcripts)
+    if video_inputs:
+        samples.extend(fetch_video_transcripts(video_inputs))
 
     return creator_voice_profile_service.createOrUpdateVoiceProfile(
         current_user.id,

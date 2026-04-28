@@ -115,11 +115,13 @@ class SaveMyVoiceProfileRequest(BaseModel):
 class SaveMyVoiceProfileFromYoutubeRequest(BaseModel):
     youtube_video_ids: List[str] = Field(default_factory=list)
     youtube_urls: List[str] = Field(default_factory=list)
+    transcripts: List[str] = Field(default_factory=list)
 
 
 class GenerateContentRequest(BaseModel):
     video_id: Optional[str] = None
     video_url: Optional[str] = None
+    transcript: str = ""
     target_assets: List[str] = Field(default_factory=list)
 
 
