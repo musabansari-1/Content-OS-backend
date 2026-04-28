@@ -6,14 +6,16 @@ from psycopg import Connection, connect
 from psycopg.rows import dict_row
 
 
-PROJECT_BACKEND_DIR = Path(__file__).resolve().parents[2]
-MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "migrations"
+VOICE_ENGINE_DIR = Path(__file__).resolve().parent
+APP_DIR = VOICE_ENGINE_DIR.parent
+BACKEND_DIR = APP_DIR.parent
+MIGRATIONS_DIR = APP_DIR / "migrations"
 
 _migration_lock = Lock()
 
 
 def _load_env_file() -> None:
-    env_path = PROJECT_BACKEND_DIR / ".env"
+    env_path = BACKEND_DIR / ".env"
     if not env_path.exists():
         return
 

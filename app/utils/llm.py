@@ -4,8 +4,13 @@ from pathlib import Path
 from groq import Groq
 
 
+UTILS_DIR = Path(__file__).resolve().parent
+APP_DIR = UTILS_DIR.parent
+BACKEND_DIR = APP_DIR.parent
+
+
 def _load_env_file() -> None:
-    env_path = Path(__file__).resolve().parents[2] / ".env"
+    env_path = BACKEND_DIR / ".env"
     if not env_path.exists():
         return
 
