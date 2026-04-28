@@ -9,6 +9,15 @@ from urllib.parse import parse_qs, urlparse
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import (
+    CouldNotRetrieveTranscript,
+    InvalidVideoId,
+    NoTranscriptFound,
+    RequestBlocked,
+    TranscriptsDisabled,
+    VideoUnavailable,
+    YouTubeTranscriptApiException,
+)
 
 from app.agents.execution_agent import run_execution_pipeline
 from app.agents.moment_agent import extract_moments
@@ -113,9 +122,28 @@ def resolve_youtube_video_id(video_input: str) -> str:
 
 def fetch_video_transcript(video_input: str) -> str:
     video_id = resolve_youtube_video_id(video_input)
-    ytt_api = YouTubeTranscriptApi()
-    transcript = ytt_api.fetch(video_id)
-    return transcript_to_text(transcript)
+
+    try:
+        ytt_api = YouTubeTranscriptApi()
+        transcript = ytt_api.fetch(video_id)
+        return transcript_to_text(transcript)
+    except InvalidVideoId as error:
+        raise HTTPException(status_code=400, detail=f"Invalid YouTube video ID: {video_id}") from error
+    except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable) as error:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Transcript unavailable for YouTube video: {video_id}",
+        ) from error
+    except (RequestBlocked, CouldNotRetrieveTranscript) as error:
+        raise HTTPException(
+            status_code=502,
+            detail="Could not retrieve the YouTube transcript right now. Please try again.",
+        ) from error
+    except YouTubeTranscriptApiException as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"YouTube transcript lookup failed for video: {video_id}",
+        ) from error
 
 
 def fetch_video_transcripts(video_inputs):
