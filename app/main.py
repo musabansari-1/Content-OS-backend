@@ -4,20 +4,9 @@ import json
 import os
 from pathlib import Path
 from typing import Optional
-from urllib.parse import parse_qs, urlparse
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import (
-    CouldNotRetrieveTranscript,
-    InvalidVideoId,
-    NoTranscriptFound,
-    RequestBlocked,
-    TranscriptsDisabled,
-    VideoUnavailable,
-    YouTubeTranscriptApiException,
-)
 
 from app.agents.execution_agent import run_execution_pipeline
 from app.agents.moment_agent import extract_moments
@@ -25,6 +14,7 @@ from app.agents.strategy_agent import generate_strategy
 from app.assets import build_asset_brief, get_asset_catalog, normalize_target_assets
 from app.auth.dependencies import auth_service, require_current_user
 from app.auth.types import AuthResponse, LoginRequest, RegisterRequest, UserResponse
+from app.youtube_transcripts import fetch_video_transcript, fetch_video_transcripts
 from app.voice_engine.db import run_migrations
 from app.voice_engine.service import CreatorVoiceProfileService
 from app.voice_engine.types import (
@@ -85,69 +75,6 @@ app.add_middleware(
 def startup() -> None:
     run_migrations()
     creator_voice_profile_service.repairStoredPreferredDevices()
-
-
-def transcript_to_text(transcript):
-    return " ".join(snippet.text for snippet in transcript.snippets)
-
-
-def resolve_youtube_video_id(video_input: str) -> str:
-    value = (video_input or "").strip()
-
-    if not value:
-        raise HTTPException(status_code=400, detail="A YouTube video ID or URL is required.")
-
-    if "youtube.com" not in value and "youtu.be" not in value:
-        return value
-
-    parsed_url = urlparse(value)
-    hostname = (parsed_url.netloc or "").lower()
-
-    if "youtu.be" in hostname:
-        video_id = parsed_url.path.strip("/").split("/")[0]
-        if video_id:
-            return video_id
-
-    if "youtube.com" in hostname:
-        query_video_id = parse_qs(parsed_url.query).get("v", [])
-        if query_video_id and query_video_id[0]:
-            return query_video_id[0]
-
-        path_parts = [part for part in parsed_url.path.split("/") if part]
-        if len(path_parts) >= 2 and path_parts[0] in {"shorts", "embed", "live"}:
-            return path_parts[1]
-
-    raise HTTPException(status_code=400, detail="Invalid YouTube URL or unsupported YouTube format.")
-
-
-def fetch_video_transcript(video_input: str) -> str:
-    video_id = resolve_youtube_video_id(video_input)
-
-    try:
-        ytt_api = YouTubeTranscriptApi()
-        transcript = ytt_api.fetch(video_id)
-        return transcript_to_text(transcript)
-    except InvalidVideoId as error:
-        raise HTTPException(status_code=400, detail=f"Invalid YouTube video ID: {video_id}") from error
-    except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable) as error:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Transcript unavailable for YouTube video: {video_id}",
-        ) from error
-    except (RequestBlocked, CouldNotRetrieveTranscript) as error:
-        raise HTTPException(
-            status_code=502,
-            detail="Could not retrieve the YouTube transcript right now. Please try again.",
-        ) from error
-    except YouTubeTranscriptApiException as error:
-        raise HTTPException(
-            status_code=502,
-            detail=f"YouTube transcript lookup failed for video: {video_id}",
-        ) from error
-
-
-def fetch_video_transcripts(video_inputs):
-    return [fetch_video_transcript(video_input) for video_input in video_inputs]
 
 
 def _generate_from_video(
