@@ -1,24 +1,24 @@
 import os
+import json
 import tempfile
 import logging
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import parse_qs, urlparse
+from urllib.request import Request, urlopen
 
 from fastapi import HTTPException
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import InvalidVideoId
 from yt_dlp import YoutubeDL
 
 from app.utils.llm import client as groq_client
 
 
 GROQ_TRANSCRIPTION_MODEL = os.getenv("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3-turbo")
+YOUTUBE_TRANSCRIPT_API_URL = os.getenv(
+    "YOUTUBE_TRANSCRIPT_API_URL",
+    "https://youtube-transcript-api-tau-one.vercel.app/transcript",
+)
 logger = logging.getLogger(__name__)
-
-
-def transcript_to_text(transcript) -> str:
-    return " ".join(snippet.text for snippet in transcript.snippets)
 
 
 def resolve_youtube_video_id(video_input: str) -> str:
@@ -113,10 +113,58 @@ def _transcribe_audio_with_groq(audio_path: Path) -> str:
     return text
 
 
-def _fetch_transcript_from_youtube_api(video_id: str) -> str:
-    ytt_api = YouTubeTranscriptApi()
-    transcript = ytt_api.fetch(video_id)
-    return transcript_to_text(transcript)
+def _normalize_remote_transcript_response(payload) -> str:
+    if isinstance(payload, str):
+        return payload.strip()
+
+    if isinstance(payload, dict):
+        for key in ("transcript", "text", "caption", "captions"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if isinstance(value, list):
+                text = " ".join(
+                    str(item.get("text", "")).strip()
+                    for item in value
+                    if isinstance(item, dict)
+                ).strip()
+                if text:
+                    return text
+
+    if isinstance(payload, list):
+        text = " ".join(
+            str(item.get("text", "")).strip()
+            for item in payload
+            if isinstance(item, dict)
+        ).strip()
+        if text:
+            return text
+
+    return ""
+
+
+def _fetch_transcript_from_hosted_api(video_input: str) -> str:
+    payload = {"video_url": video_input}
+    request = Request(
+        YOUTUBE_TRANSCRIPT_API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    with urlopen(request, timeout=90) as response:
+        response_body = response.read().decode("utf-8")
+
+    try:
+        data = json.loads(response_body)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Hosted YouTube transcript API returned invalid JSON.") from error
+
+    transcript_text = _normalize_remote_transcript_response(data)
+    if not transcript_text:
+        raise RuntimeError("Hosted YouTube transcript API returned an empty transcript.")
+
+    return transcript_text
 
 
 def _fetch_transcript_with_audio_fallback(video_id: str) -> str:
@@ -127,18 +175,17 @@ def _fetch_transcript_with_audio_fallback(video_id: str) -> str:
 
 def fetch_video_transcript(video_input: str) -> str:
     video_id = resolve_youtube_video_id(video_input)
+    source_url = f"https://www.youtube.com/watch?v={video_id}"
     primary_error: Exception | None = None
 
     try:
-        return _fetch_transcript_from_youtube_api(video_id)
-    except InvalidVideoId as error:
-        raise HTTPException(status_code=400, detail=f"Invalid YouTube video ID: {video_id}") from error
+        return _fetch_transcript_from_hosted_api(source_url)
     except HTTPException:
         raise
     except Exception as error:
         primary_error = error
         logger.warning(
-            "YouTube transcript API failed for %s; trying audio fallback.",
+            "Hosted YouTube transcript API failed for %s; trying audio fallback.",
             video_id,
             exc_info=True,
         )
