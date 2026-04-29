@@ -53,13 +53,16 @@ You must return ONLY this JSON structure:
 ---
 
 PLANNING RULES:
-1. Break the content into ONLY high-impact ideas (max 3-6 tasks)
-2. Each task must be independent and executable
-3. Each task must target ONE requested asset_type only
-4. Prioritize creator-native, source-grounded, high-signal angles over generic virality
-5. Prefer strongest insight first (task_id 1 = highest impact)
-6. Use ONLY asset_type values present in target_assets
-7. Do NOT invent asset types, platforms, formats, or output types beyond asset_catalog
+1. Create EXACTLY one task for each requested asset_type in target_assets
+2. Total number of tasks must equal the number of requested target_assets
+3. Each task must be the single best, highest-confidence angle for that asset
+4. Each task must be independent and executable
+5. Each task must target ONE requested asset_type only
+6. Prioritize creator-native, source-grounded, high-signal angles over generic virality
+7. Prefer strongest insight first (task_id 1 = highest impact)
+8. Use ONLY asset_type values present in target_assets
+9. Do NOT invent asset types, platforms, formats, or output types beyond asset_catalog
+10. Do NOT create multiple alternative tasks for the same asset_type
 
 ---
 
@@ -68,9 +71,11 @@ You must assign:
 - depends_on (list of task_ids this task relies on)
 
 Rules:
+- Every task must include priority and depends_on
 - At least one task must have depends_on = []
 - Lower priority tasks may depend on higher priority tasks
 - Keep dependencies logical and minimal
+- Prefer depends_on = [] unless a dependency is truly necessary
 
 CRITICAL CONSTRAINT:
 If you output anything other than "execution_plan", the response is invalid.
