@@ -1,26 +1,20 @@
 import os
 import tempfile
+import logging
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import parse_qs, urlparse
 
 from fastapi import HTTPException
 from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import (
-    CouldNotRetrieveTranscript,
-    InvalidVideoId,
-    NoTranscriptFound,
-    RequestBlocked,
-    TranscriptsDisabled,
-    VideoUnavailable,
-    YouTubeTranscriptApiException,
-)
+from youtube_transcript_api._errors import InvalidVideoId
 from yt_dlp import YoutubeDL
 
 from app.utils.llm import client as groq_client
 
 
 GROQ_TRANSCRIPTION_MODEL = os.getenv("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3-turbo")
+logger = logging.getLogger(__name__)
 
 
 def transcript_to_text(transcript) -> str:
@@ -108,7 +102,11 @@ def _transcribe_audio_with_groq(audio_path: Path) -> str:
     finally:
         audio_path.unlink(missing_ok=True)
 
-    text = transcription.text.strip()
+    text = getattr(transcription, "text", None)
+    if text is None and isinstance(transcription, dict):
+        text = transcription.get("text", "")
+
+    text = str(text or "").strip()
     if not text:
         raise RuntimeError("Groq Whisper returned an empty transcript.")
 
@@ -135,15 +133,15 @@ def fetch_video_transcript(video_input: str) -> str:
         return _fetch_transcript_from_youtube_api(video_id)
     except InvalidVideoId as error:
         raise HTTPException(status_code=400, detail=f"Invalid YouTube video ID: {video_id}") from error
-    except (
-        NoTranscriptFound,
-        TranscriptsDisabled,
-        VideoUnavailable,
-        RequestBlocked,
-        CouldNotRetrieveTranscript,
-        YouTubeTranscriptApiException,
-    ) as error:
+    except HTTPException:
+        raise
+    except Exception as error:
         primary_error = error
+        logger.warning(
+            "YouTube transcript API failed for %s; trying audio fallback.",
+            video_id,
+            exc_info=True,
+        )
 
     try:
         return _fetch_transcript_with_audio_fallback(video_id)
@@ -153,6 +151,7 @@ def fetch_video_transcript(video_input: str) -> str:
             f"Transcript API error: {primary_error}. "
             f"Audio transcription fallback error: {fallback_error}"
         )
+        logger.exception("YouTube transcript fallback failed for %s.", video_id)
         raise HTTPException(status_code=502, detail=detail) from fallback_error
 
 
