@@ -1,23 +1,24 @@
-import os
 import json
-import tempfile
 import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import parse_qs, urlparse
 from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 from fastapi import HTTPException
 from yt_dlp import YoutubeDL
 
 from app.utils.llm import client as groq_client
+from app.utils.transcript_conversion import normalize_transcript
 
 
 GROQ_TRANSCRIPTION_MODEL = os.getenv("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3-turbo")
-YOUTUBE_TRANSCRIPT_API_URL = os.getenv(
-    "YOUTUBE_TRANSCRIPT_API_URL",
-    "https://youtube-transcript-api-tau-one.vercel.app/transcript",
+TRANSCRIPTYT_API_URL = os.getenv(
+    "TRANSCRIPTYT_API_URL",
+    "https://api.transcriptyt.com/api/v1/transcript",
 )
 logger = logging.getLogger(__name__)
 
@@ -51,60 +52,115 @@ def resolve_youtube_video_id(video_input: str) -> str:
     raise HTTPException(status_code=400, detail="Invalid YouTube URL or unsupported YouTube format.")
 
 
+def _build_ytdlp_option_candidates(output_template: str) -> list[dict]:
+    base_options = {
+        "format": "bestaudio/best",
+        "outtmpl": output_template,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+    }
+
+    user_agent = os.getenv("YTDLP_USER_AGENT", "").strip()
+    if user_agent:
+        base_options["http_headers"] = {"User-Agent": user_agent}
+
+    candidates: list[dict] = []
+
+    cookie_file = os.getenv("YTDLP_COOKIES_FILE", "").strip()
+    if cookie_file:
+        cookie_file_path = Path(cookie_file).expanduser()
+        if cookie_file_path.exists():
+            candidates.append({**base_options, "cookiefile": str(cookie_file_path)})
+        else:
+            logger.warning("YTDLP_COOKIES_FILE was set but the file does not exist: %s", cookie_file)
+
+    cookies_from_browser = os.getenv("YTDLP_COOKIES_FROM_BROWSER", "").strip()
+    if cookies_from_browser:
+        browser_parts = tuple(
+            part.strip() for part in cookies_from_browser.split(",") if part.strip()
+        )
+        if browser_parts:
+            candidates.append({**base_options, "cookiesfrombrowser": browser_parts})
+
+    candidates.append(base_options)
+    return candidates
+
+
+def _get_transcriptyt_api_key() -> str:
+    api_key = os.getenv("TRANSCRIPTYT_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "TRANSCRIPTYT_API_KEY is not set. Add it to backend/.env or your environment."
+        )
+    return api_key
+
+
+def _bundle_from_whisper(video_id: str) -> dict:
+    source_url = f"https://www.youtube.com/watch?v={video_id}"
+    audio_path = _download_audio_file(video_id, source_url)
+    full_text = _transcribe_audio_with_groq(audio_path)
+    return {
+        "video_id": video_id,
+        "language": "en",
+        "source": "whisper_fallback",
+        "is_generated": True,
+        "full_text": full_text,
+        "segments": [],
+    }
+
+
 def _download_audio_file(video_id: str, source_url: str) -> Path:
     with tempfile.TemporaryDirectory(prefix="youtube-audio-") as temp_dir:
         output_template = str(Path(temp_dir) / f"{video_id}.%(ext)s")
-        options = {
-            "format": "bestaudio/best",
-            "outtmpl": output_template,
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-        }
+        last_error: Exception | None = None
 
-        cookie_file = os.getenv("YTDLP_COOKIES_FILE", "").strip()
-        if cookie_file:
-            options["cookiefile"] = cookie_file
+        for options in _build_ytdlp_option_candidates(output_template):
+            try:
+                with YoutubeDL(options) as downloader:
+                    info = downloader.extract_info(source_url, download=True)
+                    prepared_path = Path(downloader.prepare_filename(info))
 
-        cookies_from_browser = os.getenv("YTDLP_COOKIES_FROM_BROWSER", "").strip()
-        if cookies_from_browser:
-            browser_parts = tuple(
-                part.strip() for part in cookies_from_browser.split(",") if part.strip()
-            )
-            if browser_parts:
-                options["cookiesfrombrowser"] = browser_parts
+                if prepared_path.exists():
+                    file_descriptor, temp_path = tempfile.mkstemp(
+                        prefix=f"{video_id}-",
+                        suffix=prepared_path.suffix,
+                    )
+                    os.close(file_descriptor)
+                    temp_copy = Path(temp_path)
+                    temp_copy.write_bytes(prepared_path.read_bytes())
+                    return temp_copy
 
-        user_agent = os.getenv("YTDLP_USER_AGENT", "").strip()
-        if user_agent:
-            options["http_headers"] = {"User-Agent": user_agent}
+                matches = sorted(Path(temp_dir).glob(f"{video_id}.*"))
+                if matches:
+                    matched_path = matches[0]
+                    file_descriptor, temp_path = tempfile.mkstemp(
+                        prefix=f"{video_id}-",
+                        suffix=matched_path.suffix,
+                    )
+                    os.close(file_descriptor)
+                    temp_copy = Path(temp_path)
+                    temp_copy.write_bytes(matched_path.read_bytes())
+                    return temp_copy
+            except Exception as error:
+                last_error = error
+                error_text = str(error).lower()
+                if "cookies database" in error_text or "cookies-from-browser" in error_text:
+                    logger.warning(
+                        "yt-dlp browser cookie lookup failed for %s; trying next option.",
+                        video_id,
+                        exc_info=True,
+                    )
+                    continue
 
-        with YoutubeDL(options) as downloader:
-            info = downloader.extract_info(source_url, download=True)
-            prepared_path = Path(downloader.prepare_filename(info))
+                logger.warning(
+                    "yt-dlp audio download failed for %s with a candidate option; trying next option.",
+                    video_id,
+                    exc_info=True,
+                )
+                continue
 
-        if prepared_path.exists():
-            file_descriptor, temp_path = tempfile.mkstemp(
-                prefix=f"{video_id}-",
-                suffix=prepared_path.suffix,
-            )
-            os.close(file_descriptor)
-            temp_copy = Path(temp_path)
-            temp_copy.write_bytes(prepared_path.read_bytes())
-            return temp_copy
-
-        matches = sorted(Path(temp_dir).glob(f"{video_id}.*"))
-        if matches:
-            matched_path = matches[0]
-            file_descriptor, temp_path = tempfile.mkstemp(
-                prefix=f"{video_id}-",
-                suffix=matched_path.suffix,
-            )
-            os.close(file_descriptor)
-            temp_copy = Path(temp_path)
-            temp_copy.write_bytes(matched_path.read_bytes())
-            return temp_copy
-
-    raise RuntimeError("yt-dlp finished without producing a downloadable audio file.")
+    raise RuntimeError(f"yt-dlp finished without producing a downloadable audio file. Last error: {last_error}")
 
 
 def _transcribe_audio_with_groq(audio_path: Path) -> str:
@@ -130,138 +186,124 @@ def _transcribe_audio_with_groq(audio_path: Path) -> str:
     return text
 
 
-def _normalize_remote_transcript_response(payload) -> str:
-    if isinstance(payload, str):
-        return payload.strip()
+def _normalize_transcriptyt_payload(payload) -> dict:
+    if not isinstance(payload, dict):
+        raise RuntimeError("Transcriptyt returned an unexpected response payload.")
 
-    if isinstance(payload, dict):
-        for key in ("transcript", "text", "caption", "captions"):
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-            if isinstance(value, list):
-                text = " ".join(
-                    str(item.get("text", "")).strip()
-                    for item in value
-                    if isinstance(item, dict)
-                ).strip()
-                if text:
-                    return text
+    normalized = normalize_transcript(payload)
+    if not normalized.get("full_text"):
+        raise RuntimeError("Transcriptyt returned an empty transcript.")
 
-    if isinstance(payload, list):
-        text = " ".join(
-            str(item.get("text", "")).strip()
-            for item in payload
-            if isinstance(item, dict)
-        ).strip()
-        if text:
-            return text
+    if not normalized.get("video_id"):
+        normalized["video_id"] = payload.get("video_id")
 
-    return ""
+    return normalized
 
 
-def _fetch_transcript_from_hosted_api(video_input: str) -> str:
+def _post_transcriptyt_request(payload: dict) -> dict:
+    request = Request(
+        TRANSCRIPTYT_API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {_get_transcriptyt_api_key()}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    with urlopen(request, timeout=90) as response:
+        response_body = response.read().decode("utf-8")
+
+    try:
+        return json.loads(response_body)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Transcriptyt returned invalid JSON.") from error
+
+
+def _fetch_transcript_from_transcriptyt(video_input: str) -> dict:
     video_id = resolve_youtube_video_id(video_input)
     request_variants = [
-        {"video_url": video_input},
-        {"video": video_input},
-        {"video_url": video_id},
-        {"video": video_id},
+        {
+            "video_id": video_id,
+            "languages": ["en"],
+            "transcript_type": "manual",
+            "format": "json",
+        },
+        {
+            "video_id": video_id,
+            "languages": ["en"],
+            "transcript_type": "generated",
+            "format": "json",
+        },
     ]
 
     last_error: Exception | None = None
     for payload in request_variants:
-        request = Request(
-            YOUTUBE_TRANSCRIPT_API_URL,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-
         try:
-            with urlopen(request, timeout=90) as response:
-                response_body = response.read().decode("utf-8")
+            response_payload = _post_transcriptyt_request(payload)
+            return _normalize_transcriptyt_payload(response_payload)
         except HTTPError as error:
             last_error = error
-            if error.code == 422:
+            if error.code in {400, 401, 403, 404, 422}:
                 continue
-            raise RuntimeError(
-                f"Hosted YouTube transcript API returned HTTP {error.code}."
-            ) from error
 
-        try:
-            data = json.loads(response_body)
-        except json.JSONDecodeError as error:
+            raise RuntimeError(
+                f"Transcriptyt returned HTTP {error.code}."
+            ) from error
+        except Exception as error:
             last_error = error
+            logger.warning(
+                "Transcriptyt transcript request failed for %s; trying next variant.",
+                video_id,
+                exc_info=True,
+            )
             continue
 
-        transcript_text = _normalize_remote_transcript_response(data)
-        if transcript_text:
-            return transcript_text
-
-        last_error = RuntimeError("Hosted YouTube transcript API returned an empty transcript.")
-
-    raise RuntimeError(
-        f"Hosted YouTube transcript API could not process the request. Last error: {last_error}"
-    )
-
-
-def _fetch_transcript_with_audio_fallback(video_id: str) -> str:
-    source_url = f"https://www.youtube.com/watch?v={video_id}"
-    audio_path = _download_audio_file(video_id, source_url)
-    return _transcribe_audio_with_groq(audio_path)
+    raise RuntimeError(f"Transcriptyt could not process the request. Last error: {last_error}")
 
 
 def fetch_video_transcript(video_input: str) -> str:
-    return fetch_video_transcript_with_fallback(video_input)
+    return fetch_video_transcript_bundle(video_input)["full_text"]
 
 
 def fetch_video_transcript_with_fallback(video_input: str) -> str:
-    video_id = resolve_youtube_video_id(video_input)
-    source_url = f"https://www.youtube.com/watch?v={video_id}"
-    primary_error: Exception | None = None
-
-    try:
-        return _fetch_transcript_from_hosted_api(source_url)
-    except HTTPException:
-        raise
-    except Exception as error:
-        primary_error = error
-        logger.warning(
-            "Hosted YouTube transcript API failed for %s; trying audio fallback.",
-            video_id,
-            exc_info=True,
-        )
-
-    try:
-        return _fetch_transcript_with_audio_fallback(video_id)
-    except Exception as fallback_error:
-        detail = (
-            f"Unable to get a transcript for YouTube video {video_id}. "
-            f"Transcript API error: {primary_error}. "
-            f"Audio transcription fallback error: {fallback_error}"
-        )
-        logger.exception("YouTube transcript fallback failed for %s.", video_id)
-        raise HTTPException(status_code=502, detail=detail) from fallback_error
+    return fetch_video_transcript(video_input)
 
 
 def fetch_video_transcripts(video_inputs: Iterable[str]) -> list[str]:
     return [fetch_video_transcript_with_fallback(video_input) for video_input in video_inputs]
 
 
-def fetch_video_transcript_from_api(video_input: str) -> str:
+def fetch_video_transcript_bundle(video_input: str) -> dict:
     video_id = resolve_youtube_video_id(video_input)
-    source_url = f"https://www.youtube.com/watch?v={video_id}"
+    primary_error: Exception | None = None
 
     try:
-        return _fetch_transcript_from_hosted_api(source_url)
+        return _fetch_transcript_from_transcriptyt(video_input)
     except Exception as error:
-        detail = (
-            f"Unable to get a transcript for YouTube video {video_id} from the hosted transcript API. "
-            f"Transcript API error: {error}"
+        primary_error = error
+        logger.warning(
+            "Transcriptyt transcript API failed for %s; trying audio fallback.",
+            video_id,
+            exc_info=True,
         )
-        raise HTTPException(status_code=502, detail=detail) from error
 
+    try:
+        return _bundle_from_whisper(video_id)
+    except Exception as fallback_error:
+        fallback_error_text = str(fallback_error)
+        cookie_hint = ""
+        if "cookies database" in fallback_error_text.lower():
+            cookie_hint = (
+                " On Render, `cookies-from-browser` usually does not work. "
+                "Set YTDLP_COOKIES_FILE to a Netscape-format cookies.txt file instead."
+            )
 
-def fetch_video_transcripts_from_api(video_inputs: Iterable[str]) -> list[str]:
-    return [fetch_video_transcript_from_api(video_input) for video_input in video_inputs]
+        detail = (
+            f"Unable to get a transcript for YouTube video {video_id}. "
+            f"Transcript API error: {primary_error}. "
+            f"Audio transcription fallback error: {fallback_error}.{cookie_hint}"
+        )
+        logger.exception("YouTube transcript fallback failed for %s.", video_id)
+        raise HTTPException(status_code=502, detail=detail) from fallback_error
+
