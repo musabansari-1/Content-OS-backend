@@ -84,11 +84,15 @@ def normalize_transcript(payload: Dict[str, Any]) -> Dict[str, Any]:
     full_text = " ".join(segment["text"] for segment in segments)
     full_text = clean_full_transcript(full_text)
 
+    is_generated = payload.get("is_generated", False)
+    if isinstance(is_generated, str):
+        is_generated = is_generated.strip().lower() in {"true", "1", "yes", "y"}
+
     return {
         "video_id": payload.get("video_id"),
         "language": payload.get("language_code") or payload.get("language"),
-        "source": "transcript_api_v2",
-        "is_generated": payload.get("is_generated", False),
+        "source": payload.get("source", "transcript_api_v2"),
+        "is_generated": is_generated,
         "full_text": full_text,
         "segments": segments,
     }

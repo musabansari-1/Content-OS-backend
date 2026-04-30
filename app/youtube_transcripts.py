@@ -11,6 +11,7 @@ from urllib.request import Request, urlopen
 from fastapi import HTTPException
 from yt_dlp import YoutubeDL
 
+from app.transcript_cache_repository import TranscriptCacheRepository
 from app.utils.llm import client as groq_client
 from app.utils.transcript_conversion import normalize_transcript
 
@@ -21,6 +22,7 @@ TRANSCRIPTYT_API_URL = os.getenv(
     "https://api.transcriptyt.com/api/v1/transcript",
 )
 logger = logging.getLogger(__name__)
+transcript_cache_repository = TranscriptCacheRepository()
 
 
 def resolve_youtube_video_id(video_input: str) -> str:
@@ -102,6 +104,7 @@ def _bundle_from_whisper(video_id: str) -> dict:
     full_text = _transcribe_audio_with_groq(audio_path)
     return {
         "video_id": video_id,
+        "video_url": source_url,
         "language": "en",
         "source": "whisper_fallback",
         "is_generated": True,
@@ -190,12 +193,15 @@ def _normalize_transcriptyt_payload(payload) -> dict:
     if not isinstance(payload, dict):
         raise RuntimeError("Transcriptyt returned an unexpected response payload.")
 
-    normalized = normalize_transcript(payload)
+    normalized = normalize_transcript({**payload, "source": "transcriptyt"})
     if not normalized.get("full_text"):
         raise RuntimeError("Transcriptyt returned an empty transcript.")
 
     if not normalized.get("video_id"):
         normalized["video_id"] = payload.get("video_id")
+
+    if not normalized.get("video_url") and normalized.get("video_id"):
+        normalized["video_url"] = f"https://www.youtube.com/watch?v={normalized['video_id']}"
 
     return normalized
 
@@ -276,10 +282,14 @@ def fetch_video_transcripts(video_inputs: Iterable[str]) -> list[str]:
 
 def fetch_video_transcript_bundle(video_input: str) -> dict:
     video_id = resolve_youtube_video_id(video_input)
+    cached_bundle = transcript_cache_repository.get_by_video_id(video_id)
+    if cached_bundle:
+        return cached_bundle
+
     primary_error: Exception | None = None
 
     try:
-        return _fetch_transcript_from_transcriptyt(video_input)
+        transcript_bundle = _fetch_transcript_from_transcriptyt(video_input)
     except Exception as error:
         primary_error = error
         logger.warning(
@@ -288,22 +298,31 @@ def fetch_video_transcript_bundle(video_input: str) -> dict:
             exc_info=True,
         )
 
-    try:
-        return _bundle_from_whisper(video_id)
-    except Exception as fallback_error:
-        fallback_error_text = str(fallback_error)
-        cookie_hint = ""
-        if "cookies database" in fallback_error_text.lower():
-            cookie_hint = (
-                " On Render, `cookies-from-browser` usually does not work. "
-                "Set YTDLP_COOKIES_FILE to a Netscape-format cookies.txt file instead."
+        try:
+            transcript_bundle = _bundle_from_whisper(video_id)
+        except Exception as fallback_error:
+            fallback_error_text = str(fallback_error)
+            cookie_hint = ""
+            if "cookies database" in fallback_error_text.lower():
+                cookie_hint = (
+                    " On Render, `cookies-from-browser` usually does not work. "
+                    "Set YTDLP_COOKIES_FILE to a Netscape-format cookies.txt file instead."
+                )
+
+            detail = (
+                f"Unable to get a transcript for YouTube video {video_id}. "
+                f"Transcript API error: {primary_error}. "
+                f"Audio transcription fallback error: {fallback_error}.{cookie_hint}"
             )
+            logger.exception("YouTube transcript fallback failed for %s.", video_id)
+            raise HTTPException(status_code=502, detail=detail) from fallback_error
 
-        detail = (
-            f"Unable to get a transcript for YouTube video {video_id}. "
-            f"Transcript API error: {primary_error}. "
-            f"Audio transcription fallback error: {fallback_error}.{cookie_hint}"
-        )
-        logger.exception("YouTube transcript fallback failed for %s.", video_id)
-        raise HTTPException(status_code=502, detail=detail) from fallback_error
+    transcript_bundle["video_id"] = transcript_bundle.get("video_id") or video_id
+    transcript_bundle["video_url"] = transcript_bundle.get("video_url") or f"https://www.youtube.com/watch?v={video_id}"
+    transcript_bundle["full_text"] = transcript_bundle.get("full_text", "").strip()
+    transcript_bundle["segments"] = transcript_bundle.get("segments", [])
+    transcript_bundle.setdefault("language", "en")
+    transcript_bundle.setdefault("source", "transcriptyt")
+    transcript_bundle.setdefault("is_generated", False)
 
+    return transcript_cache_repository.upsert(transcript_bundle)
