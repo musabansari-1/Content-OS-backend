@@ -21,6 +21,8 @@ TRANSCRIPTYT_API_URL = os.getenv(
     "TRANSCRIPTYT_API_URL",
     "https://api.transcriptyt.com/api/v1/transcript",
 )
+TRANSCRIPTYT_TRANSCRIPT_TYPE = os.getenv("TRANSCRIPTYT_TRANSCRIPT_TYPE", "auto-generated")
+TRANSCRIPTYT_FORMAT = os.getenv("TRANSCRIPTYT_FORMAT", "json")
 logger = logging.getLogger(__name__)
 transcript_cache_repository = TranscriptCacheRepository()
 
@@ -217,8 +219,18 @@ def _post_transcriptyt_request(payload: dict) -> dict:
         method="POST",
     )
 
-    with urlopen(request, timeout=90) as response:
-        response_body = response.read().decode("utf-8")
+    try:
+        with urlopen(request, timeout=90) as response:
+            response_body = response.read().decode("utf-8")
+    except HTTPError as error:
+        error_body = ""
+        try:
+            error_body = error.read().decode("utf-8")
+        except Exception:
+            error_body = ""
+
+        detail = error_body.strip() or error.reason or "Transcriptyt request failed."
+        raise HTTPError(error.url, error.code, detail, error.headers, error.fp) from error
 
     try:
         return json.loads(response_body)
@@ -228,44 +240,25 @@ def _post_transcriptyt_request(payload: dict) -> dict:
 
 def _fetch_transcript_from_transcriptyt(video_input: str) -> dict:
     video_id = resolve_youtube_video_id(video_input)
-    request_variants = [
-        {
-            "video_id": video_id,
-            "languages": ["en"],
-            "transcript_type": "manual",
-            "format": "json",
-        },
-        {
-            "video_id": video_id,
-            "languages": ["en"],
-            "transcript_type": "generated",
-            "format": "json",
-        },
-    ]
+    payload = {
+        "video_id": video_id,
+        "languages": ["en"],
+        "transcript_type": TRANSCRIPTYT_TRANSCRIPT_TYPE,
+        "format": TRANSCRIPTYT_FORMAT,
+    }
 
-    last_error: Exception | None = None
-    for payload in request_variants:
-        try:
-            response_payload = _post_transcriptyt_request(payload)
-            return _normalize_transcriptyt_payload(response_payload)
-        except HTTPError as error:
-            last_error = error
-            if error.code in {400, 401, 403, 404, 422}:
-                continue
-
-            raise RuntimeError(
-                f"Transcriptyt returned HTTP {error.code}."
-            ) from error
-        except Exception as error:
-            last_error = error
-            logger.warning(
-                "Transcriptyt transcript request failed for %s; trying next variant.",
-                video_id,
-                exc_info=True,
-            )
-            continue
-
-    raise RuntimeError(f"Transcriptyt could not process the request. Last error: {last_error}")
+    try:
+        response_payload = _post_transcriptyt_request(payload)
+        return _normalize_transcriptyt_payload(response_payload)
+    except HTTPError as error:
+        raise RuntimeError(f"Transcriptyt returned HTTP {error.code}: {error}") from error
+    except Exception as error:
+        logger.warning(
+            "Transcriptyt transcript request failed for %s.",
+            video_id,
+            exc_info=True,
+        )
+        raise RuntimeError(f"Transcriptyt could not process the request. Last error: {error}") from error
 
 
 def fetch_video_transcript(video_input: str) -> str:
