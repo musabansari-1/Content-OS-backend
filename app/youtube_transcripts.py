@@ -25,6 +25,9 @@ TRANSCRIPTYT_TRANSCRIPT_TYPE = os.getenv("TRANSCRIPTYT_TRANSCRIPT_TYPE", "auto-g
 TRANSCRIPTYT_FORMAT = os.getenv("TRANSCRIPTYT_FORMAT", "json")
 logger = logging.getLogger(__name__)
 transcript_cache_repository = TranscriptCacheRepository()
+TRANSCRIPT_FALLBACK_MESSAGE = (
+    "We were unable to fetch the transcript for this video. Please paste the transcript manually."
+)
 
 
 def resolve_youtube_video_id(video_input: str) -> str:
@@ -273,6 +276,16 @@ def fetch_video_transcripts(video_inputs: Iterable[str]) -> list[str]:
     return [fetch_video_transcript_with_fallback(video_input) for video_input in video_inputs]
 
 
+def _raise_transcript_fetch_error(video_id: str, primary_error: Exception, fallback_error: Exception) -> None:
+    logger.exception(
+        "Transcript fetch failed for %s. Primary error: %s. Fallback error: %s",
+        video_id,
+        primary_error,
+        fallback_error,
+    )
+    raise HTTPException(status_code=502, detail=TRANSCRIPT_FALLBACK_MESSAGE) from fallback_error
+
+
 def fetch_video_transcript_bundle(video_input: str) -> dict:
     video_id = resolve_youtube_video_id(video_input)
     cached_bundle = transcript_cache_repository.get_by_video_id(video_id)
@@ -294,21 +307,7 @@ def fetch_video_transcript_bundle(video_input: str) -> dict:
         try:
             transcript_bundle = _bundle_from_whisper(video_id)
         except Exception as fallback_error:
-            fallback_error_text = str(fallback_error)
-            cookie_hint = ""
-            if "cookies database" in fallback_error_text.lower():
-                cookie_hint = (
-                    " On Render, `cookies-from-browser` usually does not work. "
-                    "Set YTDLP_COOKIES_FILE to a Netscape-format cookies.txt file instead."
-                )
-
-            detail = (
-                f"Unable to get a transcript for YouTube video {video_id}. "
-                f"Transcript API error: {primary_error}. "
-                f"Audio transcription fallback error: {fallback_error}.{cookie_hint}"
-            )
-            logger.exception("YouTube transcript fallback failed for %s.", video_id)
-            raise HTTPException(status_code=502, detail=detail) from fallback_error
+            _raise_transcript_fetch_error(video_id, primary_error, fallback_error)
 
     transcript_bundle["video_id"] = transcript_bundle.get("video_id") or video_id
     transcript_bundle["video_url"] = transcript_bundle.get("video_url") or f"https://www.youtube.com/watch?v={video_id}"
