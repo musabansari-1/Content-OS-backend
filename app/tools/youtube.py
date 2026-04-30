@@ -1,7 +1,7 @@
 # tools/youtube.py
 
-from youtube_transcript_api import YouTubeTranscriptApi
+from app.youtube_transcripts import fetch_video_transcript
 
-def get_transcript(video_id: str):
-    transcript = YouTubeTranscriptApi.get_transcript(video_id)
-    return " ".join([t["text"] for t in transcript])
+
+def get_transcript(video_input: str):
+    return fetch_video_transcript(video_input)

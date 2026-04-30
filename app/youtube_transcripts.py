@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import parse_qs, urlparse
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from fastapi import HTTPException
@@ -60,6 +61,22 @@ def _download_audio_file(video_id: str, source_url: str) -> Path:
             "no_warnings": True,
             "noplaylist": True,
         }
+
+        cookie_file = os.getenv("YTDLP_COOKIES_FILE", "").strip()
+        if cookie_file:
+            options["cookiefile"] = cookie_file
+
+        cookies_from_browser = os.getenv("YTDLP_COOKIES_FROM_BROWSER", "").strip()
+        if cookies_from_browser:
+            browser_parts = tuple(
+                part.strip() for part in cookies_from_browser.split(",") if part.strip()
+            )
+            if browser_parts:
+                options["cookiesfrombrowser"] = browser_parts
+
+        user_agent = os.getenv("YTDLP_USER_AGENT", "").strip()
+        if user_agent:
+            options["http_headers"] = {"User-Agent": user_agent}
 
         with YoutubeDL(options) as downloader:
             info = downloader.extract_info(source_url, download=True)
@@ -144,27 +161,49 @@ def _normalize_remote_transcript_response(payload) -> str:
 
 
 def _fetch_transcript_from_hosted_api(video_input: str) -> str:
-    payload = {"video_url": video_input}
-    request = Request(
-        YOUTUBE_TRANSCRIPT_API_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    video_id = resolve_youtube_video_id(video_input)
+    request_variants = [
+        {"video_url": video_input},
+        {"video": video_input},
+        {"video_url": video_id},
+        {"video": video_id},
+    ]
+
+    last_error: Exception | None = None
+    for payload in request_variants:
+        request = Request(
+            YOUTUBE_TRANSCRIPT_API_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with urlopen(request, timeout=90) as response:
+                response_body = response.read().decode("utf-8")
+        except HTTPError as error:
+            last_error = error
+            if error.code == 422:
+                continue
+            raise RuntimeError(
+                f"Hosted YouTube transcript API returned HTTP {error.code}."
+            ) from error
+
+        try:
+            data = json.loads(response_body)
+        except json.JSONDecodeError as error:
+            last_error = error
+            continue
+
+        transcript_text = _normalize_remote_transcript_response(data)
+        if transcript_text:
+            return transcript_text
+
+        last_error = RuntimeError("Hosted YouTube transcript API returned an empty transcript.")
+
+    raise RuntimeError(
+        f"Hosted YouTube transcript API could not process the request. Last error: {last_error}"
     )
-
-    with urlopen(request, timeout=90) as response:
-        response_body = response.read().decode("utf-8")
-
-    try:
-        data = json.loads(response_body)
-    except json.JSONDecodeError as error:
-        raise RuntimeError("Hosted YouTube transcript API returned invalid JSON.") from error
-
-    transcript_text = _normalize_remote_transcript_response(data)
-    if not transcript_text:
-        raise RuntimeError("Hosted YouTube transcript API returned an empty transcript.")
-
-    return transcript_text
 
 
 def _fetch_transcript_with_audio_fallback(video_id: str) -> str:
@@ -174,6 +213,10 @@ def _fetch_transcript_with_audio_fallback(video_id: str) -> str:
 
 
 def fetch_video_transcript(video_input: str) -> str:
+    return fetch_video_transcript_with_fallback(video_input)
+
+
+def fetch_video_transcript_with_fallback(video_input: str) -> str:
     video_id = resolve_youtube_video_id(video_input)
     source_url = f"https://www.youtube.com/watch?v={video_id}"
     primary_error: Exception | None = None
@@ -203,4 +246,22 @@ def fetch_video_transcript(video_input: str) -> str:
 
 
 def fetch_video_transcripts(video_inputs: Iterable[str]) -> list[str]:
-    return [fetch_video_transcript(video_input) for video_input in video_inputs]
+    return [fetch_video_transcript_with_fallback(video_input) for video_input in video_inputs]
+
+
+def fetch_video_transcript_from_api(video_input: str) -> str:
+    video_id = resolve_youtube_video_id(video_input)
+    source_url = f"https://www.youtube.com/watch?v={video_id}"
+
+    try:
+        return _fetch_transcript_from_hosted_api(source_url)
+    except Exception as error:
+        detail = (
+            f"Unable to get a transcript for YouTube video {video_id} from the hosted transcript API. "
+            f"Transcript API error: {error}"
+        )
+        raise HTTPException(status_code=502, detail=detail) from error
+
+
+def fetch_video_transcripts_from_api(video_inputs: Iterable[str]) -> list[str]:
+    return [fetch_video_transcript_from_api(video_input) for video_input in video_inputs]

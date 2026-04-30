@@ -15,7 +15,10 @@ from app.assets import build_asset_brief, get_asset_catalog, normalize_target_as
 from app.auth.dependencies import auth_service, require_current_user
 from app.auth.types import AuthResponse, LoginRequest, RegisterRequest, UserResponse
 from app.generation_jobs import generation_job_store
-from app.youtube_transcripts import fetch_video_transcript, fetch_video_transcripts
+from app.youtube_transcripts import (
+    fetch_video_transcript,
+    fetch_video_transcripts,
+)
 from app.voice_engine.db import run_migrations
 from app.voice_engine.service import CreatorVoiceProfileService
 from app.voice_engine.types import (
