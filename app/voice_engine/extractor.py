@@ -1,5 +1,5 @@
 import json
-from typing import List
+from typing import List, Optional
 
 from app.prompts.voice_profiling_prompt import VOICE_PROFILE_EXTRACTION_PROMPT
 from app.utils.llm import call_llm
@@ -7,7 +7,11 @@ from app.voice_engine.types import VoiceProfile
 
 
 class VoiceProfileExtractorService:
-    def extractVoiceProfile(self, samples: List[str]) -> VoiceProfile:
+    def extractVoiceProfile(
+        self,
+        samples: List[str],
+        existing_profile: Optional[VoiceProfile] = None,
+    ) -> VoiceProfile:
         cleaned_samples = [sample.strip() for sample in samples if sample and sample.strip()]
 
         if not cleaned_samples:
@@ -15,6 +19,9 @@ class VoiceProfileExtractorService:
 
         payload = {
             "samples": cleaned_samples,
+            "existing_profile": self._voice_profile_to_payload(existing_profile)
+            if existing_profile
+            else None,
         }
 
         response = call_llm(
@@ -24,3 +31,8 @@ class VoiceProfileExtractorService:
 
         voice_profile_json = json.loads(response)
         return VoiceProfile.parse_obj(voice_profile_json)
+
+    def _voice_profile_to_payload(self, voice_profile: VoiceProfile) -> dict:
+        if hasattr(voice_profile, "model_dump"):
+            return voice_profile.model_dump()
+        return voice_profile.dict()

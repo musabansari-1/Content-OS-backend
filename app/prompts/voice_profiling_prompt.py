@@ -17,6 +17,7 @@ across transformed content (Twitter, LinkedIn, TikTok, YouTube, etc).
 
 You will receive a JSON payload with:
 - samples: array of writing samples
+- existing_profile: optional previously saved voice profile to refine
 
 Return JSON only.
 Do not include markdown.
@@ -70,6 +71,9 @@ GENERAL:
 - Infer recurring patterns only from the provided samples.
 - Extract what is repeatedly observable, not what is merely possible.
 - If evidence is weak, prefer conservative phrasing over invented certainty.
+- If existing_profile is provided, treat it as prior memory that should be refined using the new samples.
+- Preserve stable high-signal identity markers unless the new samples clearly contradict them.
+- Strengthen, narrow, or replace older traits only when the new evidence is meaningfully stronger.
 - Do NOT describe the creator generically.
 - Extract traits that are specific enough to distinguish this creator from other educational creators.
 - Prioritize repeatable communication behavior over broad personality labels.

@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 from app.voice_engine.extractor import VoiceProfileExtractorService
 from app.voice_engine.repository import CreatorVoiceProfileRepository
@@ -19,8 +19,11 @@ class CreatorVoiceProfileService:
         userId: Optional[int],
         samples: List[str],
     ) -> CreatorVoiceProfileRecord:
-        voice_profile = self.extractor.extractVoiceProfile(samples)
-        return self.repository.create_or_update(userId, voice_profile)
+        existing_record = self.repository.get_by_user_id(userId)
+        existing_profile = existing_record.voice_profile_json if existing_record else None
+        extracted_profile = self.extractor.extractVoiceProfile(samples, existing_profile)
+        merged_profile = self._merge_voice_profiles(existing_profile, extracted_profile)
+        return self.repository.create_or_update(userId, merged_profile)
 
     def getVoiceProfile(
         self,
@@ -55,3 +58,172 @@ class CreatorVoiceProfileService:
         if hasattr(voice_profile, "model_dump"):
             return voice_profile.model_dump()
         return voice_profile.dict()
+
+    def _merge_voice_profiles(
+        self,
+        existing_profile: Optional[VoiceProfile],
+        refined_profile: VoiceProfile,
+    ) -> VoiceProfile:
+        if not existing_profile:
+            return refined_profile
+
+        merged_payload = {
+            "tone": self._merge_lists(refined_profile.tone, existing_profile.tone, limit=6),
+            "sentence_rhythm": self._prefer_text(
+                refined_profile.sentence_rhythm,
+                existing_profile.sentence_rhythm,
+            ),
+            "hook_style": self._merge_lists(
+                refined_profile.hook_style,
+                existing_profile.hook_style,
+                limit=6,
+            ),
+            "cta_style": self._merge_lists(
+                refined_profile.cta_style,
+                existing_profile.cta_style,
+                limit=5,
+            ),
+            "humor_style": self._prefer_text(
+                refined_profile.humor_style,
+                existing_profile.humor_style,
+            ),
+            "emotional_intensity": self._prefer_text(
+                refined_profile.emotional_intensity,
+                existing_profile.emotional_intensity,
+            ),
+            "emoji_usage": self._prefer_text(
+                refined_profile.emoji_usage,
+                existing_profile.emoji_usage,
+            ),
+            "punctuation_style": self._prefer_text(
+                refined_profile.punctuation_style,
+                existing_profile.punctuation_style,
+            ),
+            "preferred_devices": self._merge_lists(
+                refined_profile.preferred_devices,
+                existing_profile.preferred_devices,
+                limit=8,
+            ),
+            "banned_phrases": self._merge_lists(
+                refined_profile.banned_phrases,
+                existing_profile.banned_phrases,
+                limit=8,
+            ),
+            "preferred_phrases": self._merge_lists(
+                refined_profile.preferred_phrases,
+                existing_profile.preferred_phrases,
+                limit=10,
+            ),
+            "narrative_behavior": {
+                "opening_pattern": self._prefer_text(
+                    refined_profile.narrative_behavior.opening_pattern,
+                    existing_profile.narrative_behavior.opening_pattern,
+                ),
+                "idea_progression": self._merge_lists(
+                    refined_profile.narrative_behavior.idea_progression,
+                    existing_profile.narrative_behavior.idea_progression,
+                    limit=7,
+                ),
+                "tension_pattern": self._prefer_text(
+                    refined_profile.narrative_behavior.tension_pattern,
+                    existing_profile.narrative_behavior.tension_pattern,
+                ),
+                "teaching_pattern": self._prefer_text(
+                    refined_profile.narrative_behavior.teaching_pattern,
+                    existing_profile.narrative_behavior.teaching_pattern,
+                ),
+                "authority_pattern": self._prefer_text(
+                    refined_profile.narrative_behavior.authority_pattern,
+                    existing_profile.narrative_behavior.authority_pattern,
+                ),
+                "closing_pattern": self._prefer_text(
+                    refined_profile.narrative_behavior.closing_pattern,
+                    existing_profile.narrative_behavior.closing_pattern,
+                ),
+            },
+            "cognitive_style": {
+                "reasoning_style": self._merge_lists(
+                    refined_profile.cognitive_style.reasoning_style,
+                    existing_profile.cognitive_style.reasoning_style,
+                    limit=6,
+                ),
+                "decision_lens": self._merge_lists(
+                    refined_profile.cognitive_style.decision_lens,
+                    existing_profile.cognitive_style.decision_lens,
+                    limit=6,
+                ),
+                "abstraction_pattern": self._prefer_text(
+                    refined_profile.cognitive_style.abstraction_pattern,
+                    existing_profile.cognitive_style.abstraction_pattern,
+                ),
+                "problem_solving_style": self._prefer_text(
+                    refined_profile.cognitive_style.problem_solving_style,
+                    existing_profile.cognitive_style.problem_solving_style,
+                ),
+                "common_reframes": self._merge_lists(
+                    refined_profile.cognitive_style.common_reframes,
+                    existing_profile.cognitive_style.common_reframes,
+                    limit=8,
+                ),
+            },
+            "constraint_profile": {
+                "avoids": self._merge_lists(
+                    refined_profile.constraint_profile.avoids,
+                    existing_profile.constraint_profile.avoids,
+                    limit=8,
+                ),
+                "never_does": self._merge_lists(
+                    refined_profile.constraint_profile.never_does,
+                    existing_profile.constraint_profile.never_does,
+                    limit=8,
+                ),
+                "overuse_risks": self._merge_lists(
+                    refined_profile.constraint_profile.overuse_risks,
+                    existing_profile.constraint_profile.overuse_risks,
+                    limit=8,
+                ),
+            },
+            "voice_anchors": self._merge_lists(
+                refined_profile.voice_anchors,
+                existing_profile.voice_anchors,
+                limit=7,
+            ),
+            "style_summary": self._prefer_text(
+                refined_profile.style_summary,
+                existing_profile.style_summary,
+            ),
+        }
+
+        return VoiceProfile.parse_obj(merged_payload)
+
+    def _prefer_text(self, primary: str, fallback: str) -> str:
+        value = (primary or "").strip()
+        if value:
+            return value
+        return (fallback or "").strip()
+
+    def _merge_lists(
+        self,
+        primary: Iterable[str],
+        secondary: Iterable[str],
+        limit: int,
+    ) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+
+        for raw_value in list(primary or []) + list(secondary or []):
+            value = (raw_value or "").strip()
+            if not value:
+                continue
+
+            key = value.casefold()
+            if key in seen:
+                continue
+
+            seen.add(key)
+            merged.append(value)
+
+            if len(merged) >= limit:
+                break
+
+        return merged
