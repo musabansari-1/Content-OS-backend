@@ -44,6 +44,11 @@ If platform == "youtube":
 - Add curiosity gaps in hook
 - Do NOT reveal everything in outline
 
+If platform == "reddit":
+- Title must feel native to Reddit (specific, not salesy; avoid title gore)
+- Body: short paragraphs, authentic voice, open loop toward the video
+- Do NOT sound like an ad or astroturfed promotion
+
 ---
 
 OUTPUT FORMAT:

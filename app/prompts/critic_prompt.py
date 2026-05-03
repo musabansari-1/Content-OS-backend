@@ -180,14 +180,73 @@ Voice drift must reduce score significantly.
 - Is the pacing correct for that asset type?
 - Does the formatting suit the asset?
 
-Examples:
+mandatory Checks to be made for each asset type:
 - twitter_thread → strong hook, progression across tweets, open loop, reply bait
 - linkedin_post → professional narrative, insight-led, scannable structure
 - instagram_carousel → slide-by-slide progression, each slide earns the next swipe
 - tiktok_clip / instagram_reel → spoken cadence, fast hook, retention pacing
 - newsletter → strong subject line, skim-friendly, high signal density
-- blog_post → structured sections, deeper value, narrative + clarity
+- blog_post →
+  - Title is specific, grounded, and not reusable; avoids hype (“top 1%”, “changed everything”) unless supported by the source
+  - Opening starts with a concrete detail or experience (not abstract/generic statements like “most people think…”)
+  - Preserves key specifics from the source (numbers, timeframe, real context); does not generalize them away
+  - Clearly conveys the core insight; does not drift into generic productivity/motivational advice
+  - Stays focused on ONE main idea:
+      * no checklist/system unless present in source
+      * no multiple unrelated tips
+  - Avoids over-explaining:
+      * no repetition
+      * does not fully exhaust the idea (some curiosity remains)
+  - Sections progress logically:
+      * each adds new value
+      * no filler or redundancy
+  - Tone is credible and experience-driven (not overly polished or “content marketer” style)
+  - Avoids generic framing (“99% vs 1%”, broad reusable claims)
+  - CTA is present, natural, and low-hype; does not introduce new promises
+  - FAIL if the article could apply to a different domain without major changes
+
+- reddit_post → 
+  - title is specific, grounded, and not reusable across topics
+  - title is phrased like a real Reddit post (not blog/YouTube style; avoids “should you / how to” framing unless justified)
+  - opening uses a concrete detail or claim (number, habit, or firsthand experience)
+  - does NOT start with abstract or generic statements
+  - preserves at least 1–2 key specifics from the source (e.g., metrics, timeframe, context like company or situation)
+  - clearly reflects the core unique insight from the source (not replaced by generic advice)
+  - avoids generic motivational phrasing (e.g., “99% of people”, “do what others won’t”)
+  - language is specific enough that the post would NOT work for a different topic
+  - includes a clear open loop:
+      * something specific is intentionally not fully explained
+      * the post does NOT fully resolve the idea
+      * creates curiosity tied to the actual insight (not a vague “5 tips” tease)
+  - does NOT over-explain:
+      * if the reader can fully understand and apply the idea without needing more detail, this is a failure
+      * there should be a sense that important nuance or method is missing
+  - body feels Reddit-native:
+      * conversational, believable, not preachy or templated
+      * not overly polished or “content marketer” tone
+  - CTA is present:
+      * natural, low-friction, non-salesy
+      * feels like continuation, not promotion
 - youtube_video_idea → strong title, thumbnail angle, retention-driven outline
+- instagram_reel →
+
+  FAIL IF:
+  - no concrete detail (number, timeframe, real context)
+  - introduces low-credibility or arbitrary habits
+  - uses generic phrases (“this changes everything”, “real learning happens”)
+  - could apply to a different topic
+  - open loop is vague
+  - includes multiple tips or a checklist
+
+  CHECK:
+  - hook is specific and scroll-stopping (not generic)
+  - focuses on ONE core idea
+  - grounded in real experience; preserves key specifics
+  - language is natural (not “content creator” tone)
+  - open loop is specific and curiosity-driven
+  - flow is tight (no fluff/repetition)
+  - caption adds a new angle (not repetition)
+  - CTA is simple and natural
 
 Flag issues if:
 - structure does not match asset
