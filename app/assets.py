@@ -55,6 +55,14 @@ AVAILABLE_TARGET_ASSETS = {
         "label": "Blog Post",
         "description": "A long-form article that expands the video into a readable post.",
     },
+    "reddit_post": {
+        "asset_type": "reddit_post",
+        "platform": "reddit",
+        "format": "text_post",
+        "output_type": "reddit_post",
+        "label": "Reddit Post",
+        "description": "A discussion-style title and body tailored for Reddit communities.",
+    },
     "newsletter": {
         "asset_type": "newsletter",
         "platform": "email",

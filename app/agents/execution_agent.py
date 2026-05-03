@@ -12,6 +12,7 @@ from app.prompts.instagram_carousel_prompt import INSTAGRAM_CAROUSEL_PROMPT
 from app.prompts.instagram_reel_prompt import INSTAGRAM_REEL_PROMPT
 from app.prompts.linkedin_prompt import LINKEDIN_PROMPT
 from app.prompts.newsletter_prompt import NEWSLETTER_PROMPT
+from app.prompts.reddit_post_prompt import REDDIT_POST_PROMPT
 from app.prompts.tiktok_prompt import TIKTOK_PROMPT
 from app.prompts.twitter_prompt import TWITTER_PROMPT
 from app.prompts.youtube_prompt import YOUTUBE_PROMPT
@@ -81,6 +82,9 @@ def execute_task(task, source, creator_voice_profile=None):
 
     if asset_type == "blog_post":
         return call_llm(BLOG_POST_PROMPT, user_prompt)
+
+    if asset_type == "reddit_post":
+        return call_llm(REDDIT_POST_PROMPT, user_prompt)
 
     if asset_type == "newsletter":
         return call_llm(NEWSLETTER_PROMPT, user_prompt)
@@ -235,11 +239,16 @@ def run_execution_pipeline(
 
             attempt += 1
 
-        optimized_output = optimize_for_conversion(
-            best_output,
-            task["platform"],
-            best_critique,
-        )
+        # optimized_output = optimize_for_conversion(
+        #     best_output,
+        #     task["platform"],
+        #     best_critique,
+        # )
+        # print(
+        #     f"output (from optimize conversion, {task['asset_type']} / {task['platform']}): ",
+        #     optimized_output,
+        #     sep="\n",
+        # )
 
         if progress_callback:
             progress_callback(
@@ -266,12 +275,15 @@ def run_execution_pipeline(
                 }
             )
 
+        print("best_output: ", best_output, sep="\n")
+
+
         results.append(
             {
                 "task_id": task["task_id"],
                 "asset_type": task["asset_type"],
                 "platform": task["platform"],
-                "output": optimized_output,
+                "output": best_output,
             }
         )
 
