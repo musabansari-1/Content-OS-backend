@@ -1,7 +1,9 @@
 import json
 import logging
 import os
+import re
 import tempfile
+import time
 from pathlib import Path
 from typing import Iterable
 from urllib.error import HTTPError
@@ -16,18 +18,27 @@ from app.utils.llm import client as groq_client
 from app.utils.transcript_conversion import normalize_transcript
 
 
+try:
+    from supadata import Supadata
+except ImportError:
+    Supadata = None
+
+
 GROQ_TRANSCRIPTION_MODEL = os.getenv("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3-turbo")
-TRANSCRIPTYT_API_URL = os.getenv(
-    "TRANSCRIPTYT_API_URL",
-    "https://api.transcriptyt.com/api/v1/transcript",
-)
-TRANSCRIPTYT_TRANSCRIPT_TYPE = os.getenv("TRANSCRIPTYT_TRANSCRIPT_TYPE", "auto-generated")
-TRANSCRIPTYT_FORMAT = os.getenv("TRANSCRIPTYT_FORMAT", "json")
+SUPADATA_API_KEY = os.getenv("SUPADATA_API_KEY", "").strip()
+SUPADATA_MODE = os.getenv("SUPADATA_MODE", "native")  # 'native', 'auto', or 'generate'
+SUPADATA_JOB_POLL_INTERVAL = 2  # seconds
+SUPADATA_JOB_POLL_TIMEOUT = 300  # 5 minutes
 logger = logging.getLogger(__name__)
 transcript_cache_repository = TranscriptCacheRepository()
 TRANSCRIPT_FALLBACK_MESSAGE = (
     "We were unable to fetch the transcript for this video. Please paste the transcript manually."
 )
+
+
+def clean_transcript(text):
+    """Remove excess whitespace from transcript text to reduce token usage."""
+    return re.sub(r'\s+', ' ', text).strip()
 
 
 def resolve_youtube_video_id(video_input: str) -> str:
@@ -94,13 +105,96 @@ def _build_ytdlp_option_candidates(output_template: str) -> list[dict]:
     return candidates
 
 
-def _get_transcriptyt_api_key() -> str:
-    api_key = os.getenv("TRANSCRIPTYT_API_KEY", "").strip()
-    if not api_key:
+def _get_supadata_client() -> Supadata:
+    """Initialize and return Supadata client"""
+    if not Supadata:
         raise RuntimeError(
-            "TRANSCRIPTYT_API_KEY is not set. Add it to backend/.env or your environment."
+            "Supadata package is not installed. Install it with: pip install supadata"
         )
-    return api_key
+    
+    if not SUPADATA_API_KEY:
+        raise RuntimeError(
+            "SUPADATA_API_KEY is not set. Add it to backend/.env or your environment."
+        )
+    
+    return Supadata(api_key=SUPADATA_API_KEY)
+
+
+def _poll_supadata_job(supadata: Supadata, job_id: str) -> str:
+    """Poll Supadata job status until completion"""
+    start_time = time.time()
+    
+    while time.time() - start_time < SUPADATA_JOB_POLL_TIMEOUT:
+        try:
+            result = supadata.transcript.get_job_status(job_id)
+            
+            if result.status == "completed":
+                content = result.content if hasattr(result, 'content') else str(result)
+                return content
+            elif result.status == "failed":
+                raise RuntimeError(f"Supadata job failed: {result}")
+            elif result.status in ["pending", "processing"]:
+                logger.debug("Supadata job %s status: %s, waiting...", job_id, result.status)
+                time.sleep(SUPADATA_JOB_POLL_INTERVAL)
+            else:
+                logger.warning("Supadata job %s returned unknown status: %s", job_id, result.status)
+                time.sleep(SUPADATA_JOB_POLL_INTERVAL)
+        except Exception as error:
+            logger.warning("Error polling Supadata job %s: %s", job_id, error, exc_info=True)
+            raise RuntimeError(f"Error polling Supadata job status: {error}") from error
+    
+    raise RuntimeError(f"Supadata job {job_id} polling timeout after {SUPADATA_JOB_POLL_TIMEOUT}s")
+
+
+def _fetch_transcript_from_supadata(video_input: str) -> dict:
+    """Fetch transcript from Supadata API with job polling if async"""
+    video_id = resolve_youtube_video_id(video_input)
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
+    
+    try:
+        supadata = _get_supadata_client()
+        
+        # Request transcript from Supadata
+        transcript_result = supadata.transcript(
+            url=video_url,
+            text=True,
+            mode=SUPADATA_MODE
+        )
+        
+        print("Supadata transcript result: ", transcript_result, sep="\n")
+        
+        # Check if result has job_id (async) or direct content
+        if hasattr(transcript_result, 'job_id'):
+            logger.info("Supadata transcript request is async, polling job %s", transcript_result.job_id)
+            # Poll job status until completion or timeout
+            full_text = _poll_supadata_job(supadata, transcript_result.job_id)
+        else:
+            # Direct result - extract content
+            full_text = transcript_result.content if hasattr(transcript_result, 'content') else str(transcript_result)
+        
+        if not full_text or not str(full_text).strip():
+            raise RuntimeError("Supadata returned an empty transcript.")
+        
+        # Clean excess whitespace to reduce token usage
+        cleaned_text = clean_transcript(str(full_text))
+        print("Cleaned transcript text: ", cleaned_text, sep="\n")
+        
+        return {
+            "video_id": video_id,
+            "video_url": video_url,
+            "language": "en",
+            "source": "supadata",
+            "is_generated": SUPADATA_MODE in ["auto", "generate"],
+            "full_text": cleaned_text,
+            "segments": [],
+        }
+    except Exception as error:
+        logger.warning(
+            "Supadata transcript request failed for %s.",
+            video_id,
+            exc_info=True,
+        )
+        raise RuntimeError(f"Supadata could not process the request. Last error: {error}") from error
 
 
 def _bundle_from_whisper(video_id: str) -> dict:
@@ -194,76 +288,6 @@ def _transcribe_audio_with_groq(audio_path: Path) -> str:
     return text
 
 
-def _normalize_transcriptyt_payload(payload) -> dict:
-    if not isinstance(payload, dict):
-        raise RuntimeError("Transcriptyt returned an unexpected response payload.")
-
-    normalized = normalize_transcript({**payload, "source": "transcriptyt"})
-    if not normalized.get("full_text"):
-        raise RuntimeError("Transcriptyt returned an empty transcript.")
-
-    if not normalized.get("video_id"):
-        normalized["video_id"] = payload.get("video_id")
-
-    if not normalized.get("video_url") and normalized.get("video_id"):
-        normalized["video_url"] = f"https://www.youtube.com/watch?v={normalized['video_id']}"
-
-    return normalized
-
-
-def _post_transcriptyt_request(payload: dict) -> dict:
-    request = Request(
-        TRANSCRIPTYT_API_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {_get_transcriptyt_api_key()}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-
-    try:
-        with urlopen(request, timeout=90) as response:
-            response_body = response.read().decode("utf-8")
-    except HTTPError as error:
-        error_body = ""
-        try:
-            error_body = error.read().decode("utf-8")
-        except Exception:
-            error_body = ""
-
-        detail = error_body.strip() or error.reason or "Transcriptyt request failed."
-        raise HTTPError(error.url, error.code, detail, error.headers, error.fp) from error
-
-    try:
-        return json.loads(response_body)
-    except json.JSONDecodeError as error:
-        raise RuntimeError("Transcriptyt returned invalid JSON.") from error
-
-
-def _fetch_transcript_from_transcriptyt(video_input: str) -> dict:
-    video_id = resolve_youtube_video_id(video_input)
-    payload = {
-        "video_id": video_id,
-        "languages": ["en"],
-        "transcript_type": TRANSCRIPTYT_TRANSCRIPT_TYPE,
-        "format": TRANSCRIPTYT_FORMAT,
-    }
-
-    try:
-        response_payload = _post_transcriptyt_request(payload)
-        return _normalize_transcriptyt_payload(response_payload)
-    except HTTPError as error:
-        raise RuntimeError(f"Transcriptyt returned HTTP {error.code}: {error}") from error
-    except Exception as error:
-        logger.warning(
-            "Transcriptyt transcript request failed for %s.",
-            video_id,
-            exc_info=True,
-        )
-        raise RuntimeError(f"Transcriptyt could not process the request. Last error: {error}") from error
-
-
 def fetch_video_transcript(video_input: str) -> str:
     return fetch_video_transcript_bundle(video_input)["full_text"]
 
@@ -295,11 +319,11 @@ def fetch_video_transcript_bundle(video_input: str) -> dict:
     primary_error: Exception | None = None
 
     try:
-        transcript_bundle = _fetch_transcript_from_transcriptyt(video_input)
+        transcript_bundle = _fetch_transcript_from_supadata(video_input)
     except Exception as error:
         primary_error = error
         logger.warning(
-            "Transcriptyt transcript API failed for %s; trying audio fallback.",
+            "Supadata transcript API failed for %s; trying audio fallback.",
             video_id,
             exc_info=True,
         )
@@ -314,7 +338,7 @@ def fetch_video_transcript_bundle(video_input: str) -> dict:
     transcript_bundle["full_text"] = transcript_bundle.get("full_text", "").strip()
     transcript_bundle["segments"] = transcript_bundle.get("segments", [])
     transcript_bundle.setdefault("language", "en")
-    transcript_bundle.setdefault("source", "transcriptyt")
+    transcript_bundle.setdefault("source", "supadata")
     transcript_bundle.setdefault("is_generated", False)
 
     return transcript_cache_repository.upsert(transcript_bundle)
