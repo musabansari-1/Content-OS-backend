@@ -1,4 +1,5 @@
 import json
+import inspect
 import logging
 import os
 from copy import deepcopy
@@ -188,13 +189,18 @@ def _run_generation_pipeline(
             }
         )
 
+    execution_kwargs = {
+        "user_id": user_id,
+        "creator_voice_profile_service": creator_voice_profile_service,
+        "progress_callback": progress_callback,
+    }
+    if "skip_text_asset_types" in inspect.signature(run_execution_pipeline).parameters:
+        execution_kwargs["skip_text_asset_types"] = skip_text_asset_types
+
     results = run_execution_pipeline(
         execution_plan,
         source_text,
-        user_id=user_id,
-        creator_voice_profile_service=creator_voice_profile_service,
-        progress_callback=progress_callback,
-        skip_text_asset_types=skip_text_asset_types,
+        **execution_kwargs,
     )
 
     if progress_callback:
