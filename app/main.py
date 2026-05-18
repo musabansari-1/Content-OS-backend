@@ -280,7 +280,16 @@ def _attach_generated_clips_to_results(
     if not transcription_bundle:
         return pipeline_result
 
-    source_video_path = str(resolve_uploaded_video_path(uploaded_video_path))
+    logger = logging.getLogger(__name__)
+
+    try:
+        source_video_path = str(resolve_uploaded_video_path(uploaded_video_path))
+    except Exception:
+        logger.exception(
+            "Failed to resolve uploaded video path for clip rendering: uploaded_video_path=%s",
+            uploaded_video_path,
+        )
+        raise
 
     if progress_callback:
         progress_callback(
@@ -293,14 +302,22 @@ def _attach_generated_clips_to_results(
             }
         )
 
-    clip_result = generate_short_clips_from_groq(
-        source_video_path=source_video_path,
-        transcription=transcription_bundle,
-        clip_count=len(requested_short_assets),
-        output_dir=str(GENERATED_CLIPS_DIR),
-        create_blur_background=True,
-        debug=True,
-    )
+    try:
+        clip_result = generate_short_clips_from_groq(
+            source_video_path=source_video_path,
+            transcription=transcription_bundle,
+            clip_count=len(requested_short_assets),
+            output_dir=str(GENERATED_CLIPS_DIR),
+            create_blur_background=True,
+            debug=True,
+        )
+    except Exception:
+        logger.exception(
+            "Clip rendering failed: source_video_path=%s target_assets=%s",
+            source_video_path,
+            requested_short_assets,
+        )
+        raise
 
     selected_clips = clip_result.get("selected_clips", [])
     if not selected_clips:
@@ -314,12 +331,12 @@ def _attach_generated_clips_to_results(
             clip_payload = selected_clips[short_asset_index]
             output_payload = {
                 "generated_clip": {
-                "title": clip_payload.get("clip", {}).get("title"),
-                "start": clip_payload.get("clip", {}).get("start"),
-                "end": clip_payload.get("clip", {}).get("end"),
-                "duration": clip_payload.get("clip", {}).get("duration"),
-                "score": clip_payload.get("clip", {}).get("score"),
-                "rationale": clip_payload.get("clip", {}).get("rationale"),
+                    "title": clip_payload.get("clip", {}).get("title"),
+                    "start": clip_payload.get("clip", {}).get("start"),
+                    "end": clip_payload.get("clip", {}).get("end"),
+                    "duration": clip_payload.get("clip", {}).get("duration"),
+                    "score": clip_payload.get("clip", {}).get("score"),
+                    "rationale": clip_payload.get("clip", {}).get("rationale"),
                 }
             }
             next_result["output"] = json.dumps(output_payload)
