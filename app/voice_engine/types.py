@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, validator
 
@@ -123,6 +123,11 @@ class GenerateContentRequest(BaseModel):
     video_url: Optional[str] = None
     transcript: str = ""
     target_assets: List[str] = Field(default_factory=list)
+    uploaded_video_filename: Optional[str] = None
+    uploaded_video_content_type: Optional[str] = None
+    uploaded_video_path: Optional[str] = None
+    uploaded_video_url: Optional[str] = None
+    transcription_bundle: Dict[str, Any] = Field(default_factory=dict)
 
 
 VoiceProfile.update_forward_refs()

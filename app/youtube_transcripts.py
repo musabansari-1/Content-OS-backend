@@ -4,17 +4,18 @@ import os
 import re
 import tempfile
 import time
+from uuid import uuid4
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, Optional
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
-from fastapi import HTTPException
+from fastapi import HTTPException, UploadFile
+from openai import OpenAI
 from yt_dlp import YoutubeDL
 
 from app.transcript_cache_repository import TranscriptCacheRepository
-from app.utils.llm import client as groq_client
 from app.utils.transcript_conversion import normalize_transcript
 
 
@@ -25,15 +26,46 @@ except ImportError:
 
 
 GROQ_TRANSCRIPTION_MODEL = os.getenv("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3-turbo")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").strip()
 SUPADATA_API_KEY = os.getenv("SUPADATA_API_KEY", "").strip()
 SUPADATA_MODE = os.getenv("SUPADATA_MODE", "native")  # 'native', 'auto', or 'generate'
 SUPADATA_JOB_POLL_INTERVAL = 2  # seconds
 SUPADATA_JOB_POLL_TIMEOUT = 300  # 5 minutes
 logger = logging.getLogger(__name__)
 transcript_cache_repository = TranscriptCacheRepository()
+UPLOADED_VIDEO_STORE_DIR = Path(tempfile.gettempdir()) / "contentos-uploaded-videos"
+UPLOADED_VIDEO_STORE_DIR.mkdir(parents=True, exist_ok=True)
+UPLOADED_TRANSCRIPTION_STORE_DIR = Path(tempfile.gettempdir()) / "contentos-uploaded-transcriptions"
+UPLOADED_TRANSCRIPTION_STORE_DIR.mkdir(parents=True, exist_ok=True)
 TRANSCRIPT_FALLBACK_MESSAGE = (
     "We were unable to fetch the transcript for this video. Please paste the transcript manually."
 )
+_GROQ_TRANSCRIPTION_RETRYABLE_TYPES = {
+    "APIConnectionError",
+    "APITimeoutError",
+    "ReadTimeout",
+    "RemoteProtocolError",
+    "TimeoutError",
+}
+_groq_transcription_client: OpenAI | None = None
+
+
+def _load_env_file() -> None:
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    if not env_path.exists():
+        return
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+_load_env_file()
 
 
 def clean_transcript(text):
@@ -212,6 +244,167 @@ def _bundle_from_whisper(video_id: str) -> dict:
     }
 
 
+def _get_groq_transcription_client() -> OpenAI:
+    global _groq_transcription_client
+
+    if _groq_transcription_client is not None:
+        return _groq_transcription_client
+
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "GROQ_API_KEY is not set. Add it to backend/.env or your environment."
+        )
+
+    _groq_transcription_client = OpenAI(
+        api_key=api_key,
+        base_url=GROQ_BASE_URL or "https://api.groq.com/openai/v1",
+    )
+    return _groq_transcription_client
+
+
+def _is_retryable_transcription_error(error: Exception) -> bool:
+    error_name = type(error).__name__
+    if error_name in _GROQ_TRANSCRIPTION_RETRYABLE_TYPES:
+        return True
+
+    message = str(error).lower()
+    retryable_markers = (
+        "incomplete chunked read",
+        "peer closed connection",
+        "connection reset",
+        "connection aborted",
+        "temporary failure",
+        "timed out",
+        "timeout",
+        "read error",
+    )
+    return any(marker in message for marker in retryable_markers)
+
+
+def _transcribe_media_with_groq_bundle_once(media_path: Path) -> dict[str, Any]:
+    transcription_client = _get_groq_transcription_client()
+    with media_path.open("rb") as media_file:
+        transcription = transcription_client.audio.transcriptions.create(
+            model=GROQ_TRANSCRIPTION_MODEL,
+            file=media_file,
+            response_format="verbose_json",
+            timestamp_granularities=["word", "segment"],
+            temperature=0,
+        )
+
+    if hasattr(transcription, "model_dump"):
+        data = transcription.model_dump()
+    elif isinstance(transcription, dict):
+        data = transcription
+    else:
+        data = {
+            "text": getattr(transcription, "text", ""),
+            "segments": getattr(transcription, "segments", []),
+            "words": getattr(transcription, "words", []),
+        }
+
+    text = str(data.get("text") or "").strip()
+    if not text:
+        raise RuntimeError("Groq Whisper returned an empty transcript.")
+
+    segments = []
+    for seg in data.get("segments", []) or []:
+        if isinstance(seg, dict):
+            segments.append(
+                {
+                    "id": seg.get("id"),
+                    "start": float(seg.get("start", 0) or 0),
+                    "end": float(seg.get("end", 0) or 0),
+                    "text": str(seg.get("text", "")).strip(),
+                }
+            )
+        else:
+            segments.append(
+                {
+                    "id": getattr(seg, "id", None),
+                    "start": float(getattr(seg, "start", 0) or 0),
+                    "end": float(getattr(seg, "end", 0) or 0),
+                    "text": str(getattr(seg, "text", "")).strip(),
+                }
+            )
+
+    words = []
+    for word in data.get("words", []) or []:
+        if isinstance(word, dict):
+            token = str(word.get("word", "")).strip()
+            if token:
+                words.append(
+                    {
+                        "word": token,
+                        "start": float(word.get("start", 0) or 0),
+                        "end": float(word.get("end", 0) or 0),
+                    }
+                )
+        else:
+            token = str(getattr(word, "word", "")).strip()
+            if token:
+                words.append(
+                    {
+                        "word": token,
+                        "start": float(getattr(word, "start", 0) or 0),
+                        "end": float(getattr(word, "end", 0) or 0),
+                    }
+                )
+
+    return {
+        "text": text,
+        "segments": segments,
+        "words": words,
+        "raw": data,
+    }
+
+
+def _transcribe_media_with_groq_bundle(media_path: Path) -> dict[str, Any]:
+    last_error: Exception | None = None
+    attempts = 3
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return _transcribe_media_with_groq_bundle_once(media_path)
+        except Exception as error:
+            last_error = error
+            if attempt < attempts and _is_retryable_transcription_error(error):
+                delay_seconds = float(attempt)
+                logger.warning(
+                    "Groq transcription attempt %s/%s failed for %s with a retryable error; retrying in %.1fs.",
+                    attempt,
+                    attempts,
+                    media_path.name,
+                    delay_seconds,
+                    exc_info=True,
+                )
+                time.sleep(delay_seconds)
+                continue
+            break
+
+    raise RuntimeError(f"Groq transcription failed: {last_error}") from last_error
+
+
+def _save_groq_transcription_bundle(bundle: dict[str, Any], source_path: Path) -> Path:
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", source_path.stem or "upload")
+    output_path = UPLOADED_TRANSCRIPTION_STORE_DIR / f"{uuid4().hex}_{safe_stem}.json"
+    output_path.write_text(json.dumps(bundle, indent=2, ensure_ascii=False), encoding="utf-8")
+    return output_path
+
+
+def _transcribe_media_with_groq(media_path: Path) -> str:
+    bundle = _transcribe_media_with_groq_bundle(media_path)
+    return bundle["text"]
+
+
+def _transcribe_audio_with_groq_bundle(audio_path: Path) -> dict[str, Any]:
+    try:
+        return _transcribe_media_with_groq_bundle(audio_path)
+    finally:
+        audio_path.unlink(missing_ok=True)
+
+
 def _download_audio_file(video_id: str, source_url: str) -> Path:
     with tempfile.TemporaryDirectory(prefix="youtube-audio-") as temp_dir:
         output_template = str(Path(temp_dir) / f"{video_id}.%(ext)s")
@@ -267,25 +460,9 @@ def _download_audio_file(video_id: str, source_url: str) -> Path:
 
 def _transcribe_audio_with_groq(audio_path: Path) -> str:
     try:
-        with audio_path.open("rb") as audio_file:
-            transcription = groq_client.audio.transcriptions.create(
-                model=GROQ_TRANSCRIPTION_MODEL,
-                file=audio_file,
-                response_format="json",
-                temperature=0,
-            )
+        return _transcribe_media_with_groq(audio_path)
     finally:
         audio_path.unlink(missing_ok=True)
-
-    text = getattr(transcription, "text", None)
-    if text is None and isinstance(transcription, dict):
-        text = transcription.get("text", "")
-
-    text = str(text or "").strip()
-    if not text:
-        raise RuntimeError("Groq Whisper returned an empty transcript.")
-
-    return text
 
 
 def fetch_video_transcript(video_input: str) -> str:
@@ -294,6 +471,137 @@ def fetch_video_transcript(video_input: str) -> str:
 
 def fetch_video_transcript_with_fallback(video_input: str) -> str:
     return fetch_video_transcript(video_input)
+
+
+def transcribe_uploaded_video(video_file: UploadFile) -> str:
+    text, _, _, _ = transcribe_uploaded_video_with_artifacts(video_file)
+    return text
+
+
+def transcribe_uploaded_video_with_artifacts(video_file: UploadFile) -> tuple[str, Path, dict[str, Any], Path]:
+    """
+    Transcribe an uploaded video file using Groq Whisper.
+    The uploaded video is first sent directly to Whisper. If that fails, we
+    fall back to extracting audio from the local file and retrying.
+    """
+    # Validate file type
+    content_type = video_file.content_type or ""
+    if not content_type.startswith("video/"):
+        logger.warning(
+            "Uploaded video rejected: filename=%s content_type=%s",
+            video_file.filename,
+            content_type,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file type. Please upload a video file (MP4, MOV, AVI, etc.).",
+        )
+
+    logger.info(
+        "Uploaded video transcription started: filename=%s content_type=%s",
+        video_file.filename,
+        content_type,
+    )
+    stored_path = _store_uploaded_video(video_file)
+    logger.info("Uploaded video stored at %s", stored_path)
+
+    try:
+        logger.info("Trying direct Whisper transcription for uploaded video: %s", stored_path.name)
+        bundle = _transcribe_media_with_groq_bundle(stored_path)
+        saved_bundle_path = _save_groq_transcription_bundle(bundle, stored_path)
+        logger.info("Saved Groq transcription bundle to %s", saved_bundle_path)
+        return bundle["text"], saved_bundle_path, bundle, stored_path
+    except Exception as direct_error:
+        logger.warning(
+            "Direct transcription of uploaded video failed for %s; trying audio extraction fallback.",
+            stored_path.name,
+            exc_info=True,
+        )
+        try:
+            logger.info("Trying audio extraction fallback for uploaded video: %s", stored_path.name)
+            audio_path = _extract_audio_from_video(stored_path, stored_path.parent)
+            logger.info("Audio extracted for uploaded video: %s", audio_path)
+            bundle = _transcribe_audio_with_groq_bundle(audio_path)
+            bundle["source"] = "audio_fallback"
+            saved_bundle_path = _save_groq_transcription_bundle(bundle, stored_path)
+            logger.info("Saved fallback transcription bundle to %s", saved_bundle_path)
+            return bundle["text"], saved_bundle_path, bundle, stored_path
+        except Exception as fallback_error:
+            logger.exception(
+                "Uploaded video transcription failed after both paths: stored_path=%s",
+                stored_path,
+            )
+            raise RuntimeError(
+                f"Could not transcribe uploaded video. Direct transcription error: {direct_error}. "
+                f"Audio extraction error: {fallback_error}"
+            ) from fallback_error
+
+
+def _store_uploaded_video(video_file: UploadFile) -> Path:
+    safe_filename = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(video_file.filename or "upload.mp4").name)
+    stored_name = f"{uuid4().hex}_{safe_filename}"
+    stored_path = UPLOADED_VIDEO_STORE_DIR / stored_name
+    logger.info("Persisting uploaded video as %s", stored_path.name)
+    video_content = video_file.file.read()
+    stored_path.write_bytes(video_content)
+    return stored_path
+
+
+def resolve_uploaded_video_path(stored_path: str) -> Path:
+    candidate = Path(stored_path).expanduser().resolve(strict=False)
+    store_root = UPLOADED_VIDEO_STORE_DIR.resolve(strict=False)
+
+    try:
+        candidate.relative_to(store_root)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="Invalid uploaded video reference.") from error
+
+    if not candidate.exists() or not candidate.is_file():
+        raise HTTPException(status_code=404, detail="Uploaded video file not found.")
+
+    return candidate
+
+
+def _extract_audio_from_video(video_path: Path, temp_dir: Path) -> Path:
+    """
+    Extract audio from a local uploaded video file using yt-dlp.
+    Returns the path to the extracted audio file.
+    """
+    output_template = str(temp_dir / "audio.%(ext)s")
+    source_url = video_path.resolve().as_uri()
+
+    options = {
+        "format": "bestaudio/best",
+        "outtmpl": output_template,
+        "enable_file_urls": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    try:
+        logger.info("Starting yt-dlp audio extraction for uploaded file: %s", video_path)
+        with YoutubeDL(options) as ydl:
+            ydl.extract_info(source_url, download=False)
+            ydl.download([source_url])
+
+            # Find the extracted audio file
+            for file_path in temp_dir.glob("audio.*"):
+                if file_path.exists():
+                    # Create a copy in a temp file for processing
+                    file_descriptor, temp_copy_path = tempfile.mkstemp(
+                        prefix="audio-",
+                        suffix=file_path.suffix,
+                    )
+                    os.close(file_descriptor)
+                    temp_copy = Path(temp_copy_path)
+                    temp_copy.write_bytes(file_path.read_bytes())
+                    logger.info("yt-dlp audio extraction succeeded: source=%s output=%s", video_path, temp_copy)
+                    return temp_copy
+
+        raise RuntimeError("Failed to extract audio from video")
+    except Exception as error:
+        logger.exception("yt-dlp audio extraction failed for uploaded file: %s", video_path)
+        raise RuntimeError(f"Error extracting audio from video: {error}") from error
 
 
 def fetch_video_transcripts(video_inputs: Iterable[str]) -> list[str]:
