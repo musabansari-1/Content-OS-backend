@@ -83,13 +83,21 @@ def _get_allowed_origins() -> list[str]:
     return sorted(allowed_origins)
 
 
+def _get_allowed_origin_regex() -> str | None:
+    return r"^https://.*\.vercel\.app$|^https://.*\.onrender\.com$|^http://localhost:\d+$"
+
+
 app = FastAPI()
 creator_voice_profile_service = CreatorVoiceProfileService()
 app.mount("/generated-clips", StaticFiles(directory=str(GENERATED_CLIPS_DIR)), name="generated-clips")
 
+allowed_origins = _get_allowed_origins()
+logging.getLogger(__name__).info("CORS allowed origins: %s", allowed_origins)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_get_allowed_origins(),
+    allow_origins=allowed_origins,
+    allow_origin_regex=_get_allowed_origin_regex(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -133,6 +141,7 @@ def _run_generation_pipeline(
     target_assets: list[str],
     user_id: int,
     progress_callback=None,
+    skip_text_asset_types: set[str] | None = None,
 ):
     if progress_callback:
         progress_callback(
@@ -187,6 +196,7 @@ def _run_generation_pipeline(
         user_id=user_id,
         creator_voice_profile_service=creator_voice_profile_service,
         progress_callback=progress_callback,
+        skip_text_asset_types=skip_text_asset_types,
     )
 
     if progress_callback:
@@ -298,14 +308,15 @@ def _attach_generated_clips_to_results(
         next_result = dict(result)
         if result.get("asset_type") in requested_short_assets and short_asset_index < len(selected_clips):
             clip_payload = selected_clips[short_asset_index]
-            output_payload = _parse_result_output(result.get("output"))
-            output_payload["generated_clip"] = {
+            output_payload = {
+                "generated_clip": {
                 "title": clip_payload.get("clip", {}).get("title"),
                 "start": clip_payload.get("clip", {}).get("start"),
                 "end": clip_payload.get("clip", {}).get("end"),
                 "duration": clip_payload.get("clip", {}).get("duration"),
                 "score": clip_payload.get("clip", {}).get("score"),
                 "rationale": clip_payload.get("clip", {}).get("rationale"),
+                }
             }
             next_result["output"] = json.dumps(output_payload)
             next_result["media"] = _build_generated_clip_media(clip_result["run_id"], clip_payload)
@@ -352,6 +363,7 @@ def _generate_from_video(
         target_assets,
         user_id,
         progress_callback=progress_callback,
+        skip_text_asset_types=set(SHORT_VIDEO_ASSET_TYPES) if uploaded_video_path else None,
     )
 
     return _attach_generated_clips_to_results(
@@ -391,6 +403,7 @@ def _generate_from_transcript(
         target_assets,
         user_id,
         progress_callback=progress_callback,
+        skip_text_asset_types=set(SHORT_VIDEO_ASSET_TYPES) if uploaded_video_path else None,
     )
 
     return _attach_generated_clips_to_results(
