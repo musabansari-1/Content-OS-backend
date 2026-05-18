@@ -91,21 +91,15 @@ app = FastAPI()
 creator_voice_profile_service = CreatorVoiceProfileService()
 app.mount("/generated-clips", StaticFiles(directory=str(GENERATED_CLIPS_DIR)), name="generated-clips")
 
-allowed_origins = _get_allowed_origins()
-logging.getLogger(__name__).info("CORS allowed origins: %s", allowed_origins)
-
-disable_cors = os.getenv("DISABLE_CORS_MIDDLEWARE", "").strip().lower() in {"1", "true", "yes"}
-if not disable_cors:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=allowed_origins,
-        allow_origin_regex=_get_allowed_origin_regex(),
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-else:
-    logging.getLogger(__name__).warning("CORS middleware is disabled via DISABLE_CORS_MIDDLEWARE.")
+logging.getLogger(__name__).warning("CORS middleware is configured to allow all origins.")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_origin_regex=None,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")
