@@ -98,6 +98,7 @@ def run_execution_pipeline(
     user_id=None,
     creator_voice_profile_service=None,
     progress_callback=None,
+    skip_text_asset_types: Optional[set[str]] = None,
 ):
     results = []
     voice_profile_record = None
@@ -162,6 +163,30 @@ def run_execution_pipeline(
 
         current_task = base_task
         accumulated_feedback = []
+
+        if task["asset_type"] in (skip_text_asset_types or set()):
+            if progress_callback:
+                progress_callback(
+                    {
+                        "stage": "execution_polish",
+                        "message": "Skipping text generation for clip assets.",
+                        "detail": "This asset will be rendered directly as a video clip.",
+                        "progress_percent": 50 + int(((index + 1) / max(total_tasks, 1)) * 40),
+                        "steps": {"execution": "active"},
+                        "current_asset_type": task["asset_type"],
+                    }
+                )
+
+            results.append(
+                {
+                    "task_id": task["task_id"],
+                    "asset_type": task["asset_type"],
+                    "platform": task["platform"],
+                    "output": "",
+                    "text_skipped": True,
+                }
+            )
+            continue
 
         if progress_callback:
             progress_callback(
