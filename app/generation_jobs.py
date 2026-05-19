@@ -1,4 +1,5 @@
 import threading
+import logging
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -7,6 +8,9 @@ from typing import Any, Callable
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+logger = logging.getLogger(__name__)
 
 
 class GenerationJobStore:
@@ -76,6 +80,7 @@ class GenerationJobStore:
                 ],
             )
         except Exception as error:
+            logger.exception("Generation job failed: job_id=%s", job_id)
             self.update_job(
                 job_id,
                 status="failed",

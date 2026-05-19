@@ -144,6 +144,14 @@ def _run_generation_pipeline(
     progress_callback=None,
     skip_text_asset_types: set[str] | None = None,
 ):
+    logger = logging.getLogger(__name__)
+    logger.info(
+        "run_generation_pipeline started: user_id=%s target_assets=%s source_chars=%s skip_text_asset_types=%s",
+        user_id,
+        target_assets,
+        len(source_text or ""),
+        sorted(skip_text_asset_types) if skip_text_asset_types else [],
+    )
     if progress_callback:
         progress_callback(
             {
@@ -204,6 +212,7 @@ def _run_generation_pipeline(
         source_text,
         **execution_kwargs,
     )
+    logger.info("run_execution_pipeline completed: user_id=%s results=%s", user_id, len(results))
 
     if progress_callback:
         progress_callback(
@@ -270,19 +279,34 @@ def _attach_generated_clips_to_results(
     target_assets: list[str],
     progress_callback=None,
 ) -> dict[str, Any]:
+    logger = logging.getLogger(__name__)
     if not uploaded_video_path:
+        logger.info("Skipping clip attachment because no uploaded_video_path was provided.")
         return pipeline_result
 
     requested_short_assets = [
         asset_type for asset_type in target_assets if asset_type in SHORT_VIDEO_ASSET_TYPES
     ]
     if not requested_short_assets:
+        logger.info(
+            "Skipping clip attachment because no short-video assets were requested. target_assets=%s",
+            target_assets,
+        )
         return pipeline_result
 
     if not transcription_bundle:
+        logger.warning(
+            "Skipping clip attachment because transcription_bundle is missing. uploaded_video_path=%s",
+            uploaded_video_path,
+        )
         return pipeline_result
 
-    logger = logging.getLogger(__name__)
+    logger.info(
+        "Preparing clip attachment: uploaded_video_path=%s requested_short_assets=%s transcription_keys=%s",
+        uploaded_video_path,
+        requested_short_assets,
+        sorted(transcription_bundle.keys()),
+    )
 
     try:
         source_video_path = str(resolve_uploaded_video_path(uploaded_video_path))
@@ -304,6 +328,13 @@ def _attach_generated_clips_to_results(
             }
         )
 
+    logger.info(
+        "Starting generate_short_clips_from_groq: source_video_path=%s clip_count=%s output_dir=%s",
+        source_video_path,
+        len(requested_short_assets),
+        str(GENERATED_CLIPS_DIR),
+    )
+
     try:
         clip_result = generate_short_clips_from_groq(
             source_video_path=source_video_path,
@@ -321,8 +352,16 @@ def _attach_generated_clips_to_results(
         )
         raise
 
+    logger.info(
+        "Clip rendering finished: run_id=%s selected_clips=%s output_dir=%s",
+        clip_result.get("run_id"),
+        len(clip_result.get("selected_clips", [])),
+        clip_result.get("output_dir"),
+    )
+
     selected_clips = clip_result.get("selected_clips", [])
     if not selected_clips:
+        logger.warning("Clip rendering returned no selected_clips; returning original pipeline result.")
         return pipeline_result
 
     results = []
@@ -331,6 +370,12 @@ def _attach_generated_clips_to_results(
         next_result = dict(result)
         if result.get("asset_type") in requested_short_assets and short_asset_index < len(selected_clips):
             clip_payload = selected_clips[short_asset_index]
+            logger.info(
+                "Mapping rendered clip to asset_type=%s clip_id=%s video_path=%s",
+                result.get("asset_type"),
+                clip_payload.get("clip", {}).get("clip_id"),
+                clip_payload.get("video_path"),
+            )
             output_payload = {
                 "generated_clip": {
                     "title": clip_payload.get("clip", {}).get("title"),
@@ -363,6 +408,7 @@ def _generate_from_video(
     uploaded_video_path: Optional[str] = None,
     transcription_bundle: Optional[dict[str, Any]] = None,
 ):
+    logger = logging.getLogger(__name__)
     if progress_callback:
         progress_callback(
             {
@@ -376,9 +422,16 @@ def _generate_from_video(
 
     if uploaded_video:
         # Transcribe uploaded video
+        logger.info(
+            "_generate_from_video using uploaded video: filename=%s uploaded_video_path=%s transcription_bundle_present=%s",
+            getattr(uploaded_video, "filename", None),
+            uploaded_video_path,
+            bool(transcription_bundle),
+        )
         transcript = transcribe_uploaded_video(uploaded_video)
     else:
         # Fetch from YouTube URL
+        logger.info("_generate_from_video using video_input=%s", video_input)
         transcript = fetch_video_transcript(video_input)  # type: ignore[arg-type]
 
     pipeline_result = _run_generation_pipeline(
@@ -406,6 +459,7 @@ def _generate_from_transcript(
     uploaded_video_path: Optional[str] = None,
     transcription_bundle: Optional[dict[str, Any]] = None,
 ):
+    logger = logging.getLogger(__name__)
     normalized_transcript = transcript.strip()
     if not normalized_transcript:
         raise HTTPException(status_code=400, detail="A transcript is required.")
@@ -427,6 +481,13 @@ def _generate_from_transcript(
         user_id,
         progress_callback=progress_callback,
         skip_text_asset_types=set(SHORT_VIDEO_ASSET_TYPES) if uploaded_video_path else None,
+    )
+    logger.info(
+        "_generate_from_transcript completed: user_id=%s target_assets=%s uploaded_video_path=%s transcription_bundle_present=%s",
+        user_id,
+        target_assets,
+        uploaded_video_path,
+        bool(transcription_bundle),
     )
 
     return _attach_generated_clips_to_results(
