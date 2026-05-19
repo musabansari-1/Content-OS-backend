@@ -2,15 +2,18 @@ import json
 import inspect
 import logging
 import os
+import mimetypes
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Optional
 import subprocess
+from urllib.parse import quote
 
 
 from fastapi import Depends, FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+import requests
 
 from app.agents.execution_agent import run_execution_pipeline
 from app.agents.moment_agent import extract_moments
@@ -37,8 +40,7 @@ from app.voice_engine.types import (
 )
 
 
-# BACKEND_DIR = Path(__file__).resolve().parents[1]
-# GENERATED_CLIPS_DIR = BACKEND_DIR / "generated_clips"
+BACKEND_DIR = Path(__file__).resolve().parents[1]
 GENERATED_CLIPS_DIR = Path("/tmp/generated_clips")
 GENERATED_CLIPS_DIR.mkdir(parents=True, exist_ok=True)
 SHORT_VIDEO_ASSET_TYPES = {
@@ -46,6 +48,9 @@ SHORT_VIDEO_ASSET_TYPES = {
     for asset_type, asset in AVAILABLE_TARGET_ASSETS.items()
     if asset.get("output_type") == "short_video"
 }
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "clips").strip()
 
 
 def _load_env_file() -> None:
@@ -89,6 +94,43 @@ def _get_allowed_origins() -> list[str]:
 
 def _get_allowed_origin_regex() -> str | None:
     return r"^https://.*\.vercel\.app$|^https://.*\.onrender\.com$|^http://localhost:\d+$"
+
+
+def _build_supabase_public_url(object_path: str) -> str:
+    if not SUPABASE_URL:
+        raise RuntimeError("SUPABASE_URL is not set.")
+    bucket = SUPABASE_STORAGE_BUCKET.strip("/")
+    return f"{SUPABASE_URL}/storage/v1/object/public/{bucket}/{quote(object_path, safe='/')}"
+
+
+def _upload_file_to_supabase(local_path: Path, object_path: str, content_type: str | None = None) -> str:
+    if not SUPABASE_URL:
+        raise RuntimeError("SUPABASE_URL is not set.")
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY is not set.")
+
+    bucket = SUPABASE_STORAGE_BUCKET.strip("/")
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{quote(object_path, safe='/')}"
+    guessed_type = content_type or mimetypes.guess_type(local_path.name)[0] or "application/octet-stream"
+
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Content-Type": guessed_type,
+        "x-upsert": "true",
+    }
+
+    logger = logging.getLogger(__name__)
+    logger.info("Uploading file to Supabase: local_path=%s object_path=%s", local_path, object_path)
+    response = requests.put(upload_url, headers=headers, data=local_path.read_bytes(), timeout=120)
+    if not response.ok:
+        raise RuntimeError(
+            f"Supabase upload failed for {local_path.name}: {response.status_code} {response.text}"
+        )
+
+    public_url = _build_supabase_public_url(object_path)
+    logger.info("Uploaded file to Supabase: object_path=%s public_url=%s", object_path, public_url)
+    return public_url
 
 
 app = FastAPI()
@@ -247,14 +289,19 @@ def _parse_result_output(output: Any) -> dict[str, Any]:
     return {"raw": output}
 
 
-def _build_generated_clip_media(run_id: str, clip_payload: dict[str, Any]) -> dict[str, Any]:
+def _build_generated_clip_media(
+    run_id: str,
+    clip_payload: dict[str, Any],
+    video_url: str | None = None,
+    subtitle_url: str | None = None,
+) -> dict[str, Any]:
     clip_details = clip_payload.get("clip", {})
     video_path = Path(clip_payload["video_path"])
     media = {
         "kind": "video",
         "label": clip_details.get("title") or "Generated clip",
         "video_path": str(video_path),
-        "video_url": f"/generated-clips/{run_id}/clips/{video_path.name}",
+        "video_url": video_url or f"/generated-clips/{run_id}/clips/{video_path.name}",
         "clip_id": clip_details.get("clip_id"),
         "start": clip_details.get("start"),
         "end": clip_details.get("end"),
@@ -268,7 +315,7 @@ def _build_generated_clip_media(run_id: str, clip_payload: dict[str, Any]) -> di
     if subtitle_path:
         subtitle_file = Path(subtitle_path)
         media["subtitle_path"] = str(subtitle_file)
-        media["subtitle_url"] = f"/generated-clips/{run_id}/subtitles/{subtitle_file.name}"
+        media["subtitle_url"] = subtitle_url or f"/generated-clips/{run_id}/subtitles/{subtitle_file.name}"
 
     return media
 
@@ -371,11 +418,36 @@ def _attach_generated_clips_to_results(
         next_result = dict(result)
         if result.get("asset_type") in requested_short_assets and short_asset_index < len(selected_clips):
             clip_payload = selected_clips[short_asset_index]
+            clip_video_path = Path(clip_payload["video_path"])
+            clip_subtitle_path = clip_payload.get("subtitle_path")
+            try:
+                clip_public_url = _upload_file_to_supabase(
+                    clip_video_path,
+                    f"clips/{clip_result.get('run_id', 'run')}/{clip_video_path.name}",
+                    "video/mp4",
+                )
+                subtitle_public_url = None
+                if clip_subtitle_path:
+                    subtitle_file = Path(clip_subtitle_path)
+                    subtitle_public_url = _upload_file_to_supabase(
+                        subtitle_file,
+                        f"subtitles/{clip_result.get('run_id', 'run')}/{subtitle_file.name}",
+                        "text/plain",
+                    )
+            except Exception:
+                logger.exception(
+                    "Failed to upload rendered clip to Supabase: clip_path=%s subtitle_path=%s",
+                    clip_payload.get("video_path"),
+                    clip_subtitle_path,
+                )
+                raise
+
             logger.info(
-                "Mapping rendered clip to asset_type=%s clip_id=%s video_path=%s",
+                "Mapping rendered clip to asset_type=%s clip_id=%s video_path=%s supabase_url=%s",
                 result.get("asset_type"),
                 clip_payload.get("clip", {}).get("clip_id"),
                 clip_payload.get("video_path"),
+                clip_public_url,
             )
             output_payload = {
                 "generated_clip": {
@@ -388,7 +460,12 @@ def _attach_generated_clips_to_results(
                 }
             }
             next_result["output"] = json.dumps(output_payload)
-            next_result["media"] = _build_generated_clip_media(clip_result["run_id"], clip_payload)
+            next_result["media"] = _build_generated_clip_media(
+                clip_result["run_id"],
+                clip_payload,
+                video_url=clip_public_url,
+                subtitle_url=subtitle_public_url,
+            )
             short_asset_index += 1
 
         results.append(next_result)
