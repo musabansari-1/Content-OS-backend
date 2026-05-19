@@ -4716,8 +4716,8 @@ def generate_short_clips_from_groq(
     words_per_caption: int = 4,
     create_blur_background: bool = False,
     groq_api_key: str | None = None,
-    chunk_model: str = "llama-3.3-70b-versatile",
-    scorer_model: str = "llama-3.3-70b-versatile",
+    chunk_model: str = "openai/gpt-oss-120b",
+    scorer_model: str = "openai/gpt-oss-120b",
     debug: bool = True,
 ) -> dict[str, Any]:
     """
