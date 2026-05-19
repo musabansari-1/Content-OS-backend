@@ -37,8 +37,9 @@ from app.voice_engine.types import (
 )
 
 
-BACKEND_DIR = Path(__file__).resolve().parents[1]
-GENERATED_CLIPS_DIR = BACKEND_DIR / "generated_clips"
+# BACKEND_DIR = Path(__file__).resolve().parents[1]
+# GENERATED_CLIPS_DIR = BACKEND_DIR / "generated_clips"
+GENERATED_CLIPS_DIR = Path("/tmp/generated_clips")
 GENERATED_CLIPS_DIR.mkdir(parents=True, exist_ok=True)
 SHORT_VIDEO_ASSET_TYPES = {
     asset_type
