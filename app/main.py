@@ -715,3 +715,8 @@ def create_or_update_my_default_voice_profile_from_youtube(
 def check():
     ffmpeg = subprocess.check_output(["ffmpeg", "-version"], text=True).splitlines()[0]
     return {"ffmpeg": ffmpeg}
+
+@app.get("/check-ffprobe")
+def check_ffprobe():
+    out = subprocess.check_output(["ffprobe", "-version"], text=True)
+    return {"ffprobe": out.splitlines()[0]}
