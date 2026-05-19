@@ -122,7 +122,8 @@ def _upload_file_to_supabase(local_path: Path, object_path: str, content_type: s
 
     logger = logging.getLogger(__name__)
     logger.info("Uploading file to Supabase: local_path=%s object_path=%s", local_path, object_path)
-    response = requests.put(upload_url, headers=headers, data=local_path.read_bytes(), timeout=120)
+    with local_path.open("rb") as file_obj:
+        response = requests.put(upload_url, headers=headers, data=file_obj, timeout=120)
     if not response.ok:
         raise RuntimeError(
             f"Supabase upload failed for {local_path.name}: {response.status_code} {response.text}"
@@ -670,7 +671,8 @@ async def upload_video(
         file.content_type,
     )
     # Validate file size (limit to 100MB)
-    file_size = len(file.file.read())
+    file.file.seek(0, os.SEEK_END)
+    file_size = file.file.tell()
     file.file.seek(0)  # Reset file pointer
     max_size = 100 * 1024 * 1024  # 100MB
     if file_size > max_size:

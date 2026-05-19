@@ -1,3 +1,4 @@
+import os
 import threading
 import logging
 import uuid
@@ -17,7 +18,8 @@ class GenerationJobStore:
     def __init__(self) -> None:
         self._jobs: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
-        self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="generation-job")
+        max_workers = max(1, int(os.getenv("GENERATION_JOB_WORKERS", "1")))
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="generation-job")
 
     def create_job(self, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         job_id = uuid.uuid4().hex

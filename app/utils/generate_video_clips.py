@@ -4401,6 +4401,8 @@ class GroqShortsPipeline:
                 [
                     self.ffmpeg_bin,
                     "-y",
+                    "-threads", "1",
+                    "-filter_threads", "1",
                     "-ss", str(clip_start),
                     "-t",  str(duration),
                     "-i",  source_video_path,
@@ -4464,6 +4466,8 @@ class GroqShortsPipeline:
             [
                 self.ffmpeg_bin,
                 "-y",
+                "-threads", "1",
+                "-filter_threads", "1",
                 "-ss", str(clip_start),
                 "-t",  str(duration),
                 "-i",  source_video_path,
