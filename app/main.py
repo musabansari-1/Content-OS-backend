@@ -5,6 +5,8 @@ import os
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Optional
+import subprocess
+
 
 from fastapi import Depends, FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -707,3 +709,9 @@ def create_or_update_my_default_voice_profile_from_youtube(
         current_user.id,
         samples,
     )
+    
+    
+@app.get("/check")
+def check():
+    ffmpeg = subprocess.check_output(["ffmpeg", "-version"], text=True).splitlines()[0]
+    return {"ffmpeg": ffmpeg}
