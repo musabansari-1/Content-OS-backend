@@ -76,7 +76,6 @@ AVAILABLE_TARGET_ASSETS = {
 DEFAULT_TARGET_ASSETS = [
     "twitter_thread",
     "linkedin_post",
-    "tiktok_clip",
 ]
 
 
