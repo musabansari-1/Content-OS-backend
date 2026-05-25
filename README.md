@@ -1,13 +1,13 @@
 # ContentOS Backend
 
-A Fast API based content generation API that transforms YouTube transcripts into platform-optimized content using advanced AI and intelligent agent orchestration.
+A Fast API based content generation API that transforms YouTube transcripts into platform-optimized content using AI and intelligent agent orchestration.
 
 ## ✨ What It Does
 
 ContentOS Backend powers intelligent content repurposing:
 
 - **🎬 Multi-Platform Content** — Generate LinkedIn posts, Twitter threads, TikTok scripts, Instagram captions, blog posts, and more from a single source
-- **🧠 AI-Powered** — Uses Groq's advanced LLM with intelligent agent coordination
+- **🧠 AI-Powered** — Uses Groq's LLM with intelligent agent coordination
 - **💾 Smart Caching** — Optimized transcript caching for faster generation
 - **👤 Voice Profiling** — Extract and maintain consistent creator voice across all platforms
 - **⚡ Async Processing** — Long-running jobs with real-time progress tracking
@@ -69,35 +69,6 @@ TRANSCRIPTYT_API_KEY=your_transcript_api_key
 YTDLP_USER_AGENT=Mozilla/5.0...
 ```
 
-## 📡 Core API Endpoints
-
-### Authentication
-```
-POST   /auth/register         Create new account
-POST   /auth/login            Authenticate user
-GET    /me                    Get current user
-```
-
-### Content Generation
-```
-POST   /generation-jobs       Start content generation
-GET    /generation-jobs/{id}  Get job status & results
-GET    /target-assets         List supported platforms
-```
-
-### Creator Profile
-```
-GET    /me/voice-profile                    Get voice profile
-POST   /me/voice-profile                    Create from writing samples
-POST   /me/voice-profile/from-youtube       Extract from YouTube videos
-```
-
-### Integrations (Ready for Extension)
-```
-GET    /integrations                        List integrations
-POST   /integrations/{platform}/connect     Connect platform
-DELETE /integrations/{platform}             Disconnect platform
-```
 
 ## 🎯 Supported Platforms
 
