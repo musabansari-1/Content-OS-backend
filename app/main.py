@@ -7,13 +7,18 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Optional
 import subprocess
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
+import base64
+import hashlib
+import secrets
 
 
 from fastapi import Depends, FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+import httpx
 import requests
+from starlette.responses import JSONResponse, RedirectResponse
 
 from app.agents.execution_agent import run_execution_pipeline
 from app.agents.moment_agent import extract_moments
@@ -30,7 +35,7 @@ from app.youtube_transcripts import (
     transcribe_uploaded_video,
     transcribe_uploaded_video_with_artifacts,
 )
-from app.voice_engine.db import run_migrations
+from app.db import run_migrations
 from app.voice_engine.service import CreatorVoiceProfileService
 from app.voice_engine.types import (
     CreatorVoiceProfileRecord,
@@ -861,3 +866,175 @@ def check():
 def check_ffprobe():
     out = subprocess.check_output(["ffprobe", "-version"], text=True)
     return {"ffprobe": out.splitlines()[0]}
+
+LINKEDIN_CLIENT_ID = os.environ["LINKEDIN_CLIENT_ID"]
+LINKEDIN_REDIRECT_URI = os.environ["LINKEDIN_REDIRECT_URI"]
+FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "http://localhost:3000")
+
+
+@app.get("/auth/linkedin")
+def auth_linkedin():
+    # You can generate a real random state in prod
+    state = "12345"  
+
+    params = {
+        "response_type": "code",
+        "client_id": LINKEDIN_CLIENT_ID,
+        "redirect_uri": LINKEDIN_REDIRECT_URI,
+        "state": state,                 # for security
+        "scope": "openid profile email w_member_social"
+    }
+    # query = urlencode(params)
+    # url = f"https://www.linkedin.com/oauth/v2/authorization?{query}"
+    linkedin_url = (
+        "https://www.linkedin.com/oauth/v2/authorization?"
+        + urlencode(params)
+    )
+    return RedirectResponse(url=linkedin_url, status_code=302)
+
+
+LINKEDIN_CLIENT_SECRET = os.environ["LINKEDIN_CLIENT_SECRET"]
+LINKEDIN_TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
+
+# @app.get("/auth/linkedin/callback")
+# async def auth_linkedin_callback(code: str, state: str):
+#     # OPTIONAL: check state matches (for security)
+#     # if state != "12345": return 400
+
+#     # 1. Call LinkedIn to exchange code → token
+#     async with httpx.AsyncClient() as client:
+#         resp = await client.post(
+#             LINKEDIN_TOKEN_URL,
+#             data={
+#                 "grant_type": "authorization_code",
+#                 "code": code,
+#                 "redirect_uri": LINKEDIN_REDIRECT_URI,
+#                 "client_id": LINKEDIN_CLIENT_ID,
+#                 "client_secret": LINKEDIN_CLIENT_SECRET,
+#             }
+#         )
+
+#     data = resp.json()
+#     access_token = data["access_token"]
+    
+#     print(f"Received LinkedIn access token: {access_token}")
+
+#     # 2. Save this in your DB for this user
+#     # Example: connection = {
+#     #   user_id: xyz,
+#     #   platform: "linkedin",
+#     #   access_token: access_token,
+#     #   ...
+#     # }
+
+#     return RedirectResponse(
+#     url="http://localhost:5173/integrations?linkedin=connected",
+#     status_code=302
+# )
+
+@app.get("/auth/linkedin/callback")
+async def auth_linkedin_callback(code: str = None, state: str = None, error: str = None):
+    # OPTIONAL: check state matches (for security)
+    # if state != "12345": return 400
+
+    if error:
+        return RedirectResponse(
+            url=f"{FRONTEND_BASE_URL}/integrations?linkedin=error",
+            status_code=302
+        )
+
+    if not code:
+        return RedirectResponse(
+            url=f"{FRONTEND_BASE_URL}/integrations?linkedin=error",
+            status_code=302
+        )
+
+    try:
+        # 1. Call LinkedIn to exchange code → token
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                LINKEDIN_TOKEN_URL,
+                data={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": LINKEDIN_REDIRECT_URI,
+                    "client_id": LINKEDIN_CLIENT_ID,
+                    "client_secret": LINKEDIN_CLIENT_SECRET,
+                }
+            )
+
+        if resp.status_code >= 400:
+            return RedirectResponse(
+                url=f"{FRONTEND_BASE_URL}/integrations?linkedin=error",
+                status_code=302
+            )
+
+        data = resp.json()
+        access_token = data.get("access_token")
+
+        if not access_token:
+            return RedirectResponse(
+                url=f"{FRONTEND_BASE_URL}/integrations?linkedin=error",
+                status_code=302
+            )
+
+        print(f"Received LinkedIn access token: {access_token}")
+
+        # 2. Save this in your DB for this user
+        # Example: connection = {
+        #   user_id: xyz,
+        #   platform: "linkedin",
+        #   access_token: access_token,
+        #   ...
+        # }
+
+        return RedirectResponse(
+            url=f"{FRONTEND_BASE_URL}/integrations?linkedin=connected",
+            status_code=302
+        )
+
+    except Exception:
+        return RedirectResponse(
+            url=f"{FRONTEND_BASE_URL}/integrations?linkedin=error",
+            status_code=302
+        )
+
+LINKEDIN_USERINFO_URL = "https://api.linkedin.com/v2/userinfo"
+
+async def get_linkedin_user_id(access_token: str):
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            LINKEDIN_USERINFO_URL,
+            headers={"Authorization": f"Bearer {access_token}"}
+        )
+    profile = resp.json()
+    return profile["sub"]  # this is the member ID
+
+LINKEDIN_POST_URL = "https://api.linkedin.com/v2/ugcPosts"
+
+async def publish_linkedin_post(access_token: str, member_id: str, text: str):
+    payload = {
+        "author": f"urn:li:person:{member_id}",
+        "lifecycleState": "PUBLISHED",
+        "specificContent": {
+            "com.linkedin.ugc.ShareContent": {
+                "shareCommentary": {"text": text},
+                "shareMediaCategory": "NONE"
+            }
+        },
+        "visibility": {
+            "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"
+        }
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            LINKEDIN_POST_URL,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "X-Restli-Protocol-Version": "2.0.0"
+            }
+        )
+    return resp.status_code, resp.text
+
