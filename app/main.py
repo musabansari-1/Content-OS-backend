@@ -35,7 +35,8 @@ from app.youtube_transcripts import (
     transcribe_uploaded_video,
     transcribe_uploaded_video_with_artifacts,
 )
-from app.db import run_migrations
+# from app.db import run_migrations
+from app.voice_engine.db import get_connection, run_migrations
 from app.voice_engine.service import CreatorVoiceProfileService
 from app.voice_engine.types import (
     CreatorVoiceProfileRecord,
