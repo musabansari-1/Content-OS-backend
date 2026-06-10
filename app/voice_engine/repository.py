@@ -1,7 +1,7 @@
 import json
 from typing import Optional
 
-from app.core.db import get_connection, run_migrations
+from app.core.db import get_connection
 from app.voice_engine.types import CreatorVoiceProfileRecord, VoiceProfile
 
 
@@ -12,9 +12,6 @@ def _voice_profile_to_dict(voice_profile: VoiceProfile) -> dict:
 
 
 class CreatorVoiceProfileRepository:
-    def __init__(self) -> None:
-        run_migrations()
-
     def create_or_update(
         self,
         user_id: Optional[int],

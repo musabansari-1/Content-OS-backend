@@ -1,13 +1,10 @@
 from typing import Optional
 
 from app.auth.types import UserResponse
-from app.core.db import get_connection, run_migrations
+from app.core.db import get_connection
 
 
 class UserRepository:
-    def __init__(self) -> None:
-        run_migrations()
-
     def create_user(self, email: str, password_hash: str, display_name: str) -> UserResponse:
         connection = get_connection()
 

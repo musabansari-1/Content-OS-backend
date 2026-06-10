@@ -1,13 +1,10 @@
 import json
 from typing import Any, Optional
 
-from app.core.db import get_connection, run_migrations
+from app.core.db import get_connection
 
 
 class TranscriptCacheRepository:
-    def __init__(self) -> None:
-        run_migrations()
-
     def get_by_video_id(self, video_id: str) -> Optional[dict[str, Any]]:
         connection = get_connection()
 
