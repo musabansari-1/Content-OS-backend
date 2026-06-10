@@ -2,15 +2,16 @@ import base64
 import hashlib
 import hmac
 import json
-import os
 import secrets
 import time
 from typing import Optional
 
+from app.core.config import env
+
 
 PBKDF2_ITERATIONS = 200_000
 TOKEN_TTL_SECONDS = 60 * 60 * 24 * 7
-AUTH_SECRET = os.getenv("AUTH_SECRET", "dev-auth-secret-change-me")
+AUTH_SECRET = env("AUTH_SECRET", "dev-auth-secret-change-me") or "dev-auth-secret-change-me"
 
 
 def _b64url_encode(raw: bytes) -> str:

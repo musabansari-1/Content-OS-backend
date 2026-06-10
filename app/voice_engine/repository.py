@@ -1,7 +1,7 @@
 import json
 from typing import Optional
 
-from app.voice_engine.db import get_connection, run_migrations
+from app.core.db import get_connection, run_migrations
 from app.voice_engine.types import CreatorVoiceProfileRecord, VoiceProfile
 
 

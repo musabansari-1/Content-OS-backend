@@ -2,7 +2,6 @@ import inspect
 import json
 import logging
 import mimetypes
-import os
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Optional
@@ -18,6 +17,7 @@ from app.api.services import creator_voice_profile_service
 from app.assets import AVAILABLE_TARGET_ASSETS, build_asset_brief, get_asset_catalog, normalize_target_assets
 from app.auth.dependencies import require_current_user
 from app.auth.types import UserResponse
+from app.core.config import env
 from app.generation_jobs import generation_job_store
 from app.utils.generate_video_clips import generate_short_clips_from_groq
 from app.voice_engine.types import GenerateContentRequest
@@ -40,26 +40,9 @@ SHORT_VIDEO_ASSET_TYPES = {
     if asset.get("output_type") == "short_video"
 }
 
-
-def _load_env_file() -> None:
-    env_path = Path(__file__).resolve().parents[3] / ".env"
-    if not env_path.exists():
-        return
-
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip())
-
-
-_load_env_file()
-
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "clips").strip()
+SUPABASE_URL = (env("SUPABASE_URL", "") or "").strip().rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = (env("SUPABASE_SERVICE_ROLE_KEY", "") or "").strip()
+SUPABASE_STORAGE_BUCKET = (env("SUPABASE_STORAGE_BUCKET", "clips") or "clips").strip()
 
 
 def _build_supabase_public_url(object_path: str) -> str:
@@ -608,7 +591,7 @@ async def upload_video(
         file.content_type,
     )
 
-    file.file.seek(0, os.SEEK_END)
+    file.file.seek(0, 2)
     file_size = file.file.tell()
     file.file.seek(0)
     max_size = 100 * 1024 * 1024

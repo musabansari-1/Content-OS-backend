@@ -1,10 +1,11 @@
-import os
 import threading
 import logging
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Callable
+
+from app.core.config import env
 
 
 def _utcnow_iso() -> str:
@@ -18,7 +19,7 @@ class GenerationJobStore:
     def __init__(self) -> None:
         self._jobs: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
-        max_workers = max(1, int(os.getenv("GENERATION_JOB_WORKERS", "1")))
+        max_workers = max(1, int(env("GENERATION_JOB_WORKERS", "1") or "1"))
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="generation-job")
 
     def create_job(self, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:

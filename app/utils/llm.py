@@ -45,38 +45,15 @@
 #     return response.choices[0].message.content
 
 
-import os
-from pathlib import Path
-
 from openai import OpenAI
 
-
-UTILS_DIR = Path(__file__).resolve().parent
-APP_DIR = UTILS_DIR.parent
-BACKEND_DIR = APP_DIR.parent
+from app.core.config import require_env
 
 
-def _load_env_file() -> None:
-    env_path = BACKEND_DIR / ".env"
-    if not env_path.exists():
-        return
-
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip())
-
-
-_load_env_file()
-
-openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
-if not openrouter_api_key:
-    raise RuntimeError(
-        "OPENROUTER_API_KEY is not set. Add it to backend/.env or your environment."
-    )
+openrouter_api_key = require_env(
+    "OPENROUTER_API_KEY",
+    "OPENROUTER_API_KEY is not set. Add it to backend/.env or your environment."
+)
 
 client = OpenAI(
     api_key=openrouter_api_key,

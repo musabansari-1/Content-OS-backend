@@ -4764,7 +4764,9 @@ def generate_short_clips_from_groq(
         len(normalized.get("words", [])),
     )
 
-    api_key = groq_api_key or os.getenv("GROQ_API_KEY")
+    from app.core.config import env
+
+    api_key = groq_api_key or env("GROQ_API_KEY")
     client  = Groq(api_key=api_key) if (api_key and Groq is not None) else None
     logger.info("Groq client initialized: has_client=%s", bool(client))
 

@@ -1,7 +1,7 @@
 from typing import Optional
 
 from app.auth.types import UserResponse
-from app.voice_engine.db import get_connection, run_migrations
+from app.core.db import get_connection, run_migrations
 
 
 class UserRepository:

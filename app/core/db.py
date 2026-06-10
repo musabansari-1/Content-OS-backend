@@ -1,47 +1,21 @@
-import os
+from __future__ import annotations
+
 from pathlib import Path
 from threading import Lock
 
 from psycopg import Connection, connect
 from psycopg.rows import dict_row
 
+from app.core.config import get_database_url
 
-VOICE_ENGINE_DIR = Path(__file__).resolve().parent
-APP_DIR = VOICE_ENGINE_DIR.parent
-BACKEND_DIR = APP_DIR.parent
-MIGRATIONS_DIR = APP_DIR / "migrations"
 
+MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "migrations"
 _migration_lock = Lock()
-
-
-def _load_env_file() -> None:
-    env_path = BACKEND_DIR / ".env"
-    if not env_path.exists():
-        return
-
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip())
-
-
-def _get_database_url() -> str:
-    _load_env_file()
-    database_url = os.getenv("DATABASE_URL") or os.getenv("NEON_DATABASE_URL")
-    if not database_url:
-        raise RuntimeError(
-            "DATABASE_URL is not set. Add your Neon Postgres connection string to backend/.env."
-        )
-
-    return database_url
 
 
 def get_connection() -> Connection:
     return connect(
-        _get_database_url(),
+        get_database_url(),
         row_factory=dict_row,
     )
 

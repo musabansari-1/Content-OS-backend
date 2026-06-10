@@ -15,6 +15,7 @@ from fastapi import HTTPException, UploadFile
 from openai import OpenAI
 from yt_dlp import YoutubeDL
 
+from app.core.config import env, require_env
 from app.transcript_cache_repository import TranscriptCacheRepository
 from app.utils.transcript_conversion import normalize_transcript
 
@@ -25,11 +26,11 @@ except ImportError:
     Supadata = None
 
 
-GROQ_TRANSCRIPTION_MODEL = os.getenv("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3-turbo")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").strip()
-SUPADATA_API_KEY = os.getenv("SUPADATA_API_KEY", "").strip()
-SUPADATA_MODE = os.getenv("SUPADATA_MODE", "native")  # 'native', 'auto', or 'generate'
+GROQ_TRANSCRIPTION_MODEL = env("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3-turbo") or "whisper-large-v3-turbo"
+GROQ_API_KEY = (env("GROQ_API_KEY", "") or "").strip()
+GROQ_BASE_URL = (env("GROQ_BASE_URL", "https://api.groq.com/openai/v1") or "https://api.groq.com/openai/v1").strip()
+SUPADATA_API_KEY = (env("SUPADATA_API_KEY", "") or "").strip()
+SUPADATA_MODE = env("SUPADATA_MODE", "native") or "native"  # 'native', 'auto', or 'generate'
 SUPADATA_JOB_POLL_INTERVAL = 2  # seconds
 SUPADATA_JOB_POLL_TIMEOUT = 300  # 5 minutes
 logger = logging.getLogger(__name__)
@@ -49,23 +50,6 @@ _GROQ_TRANSCRIPTION_RETRYABLE_TYPES = {
     "TimeoutError",
 }
 _groq_transcription_client: OpenAI | None = None
-
-
-def _load_env_file() -> None:
-    env_path = Path(__file__).resolve().parents[1] / ".env"
-    if not env_path.exists():
-        return
-
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip())
-
-
-_load_env_file()
 
 
 def clean_transcript(text):
@@ -111,13 +95,13 @@ def _build_ytdlp_option_candidates(output_template: str) -> list[dict]:
         "noplaylist": True,
     }
 
-    user_agent = os.getenv("YTDLP_USER_AGENT", "").strip()
+    user_agent = (env("YTDLP_USER_AGENT", "") or "").strip()
     if user_agent:
         base_options["http_headers"] = {"User-Agent": user_agent}
 
     candidates: list[dict] = []
 
-    cookie_file = os.getenv("YTDLP_COOKIES_FILE", "").strip()
+    cookie_file = (env("YTDLP_COOKIES_FILE", "") or "").strip()
     if cookie_file:
         cookie_file_path = Path(cookie_file).expanduser()
         if cookie_file_path.exists():
@@ -125,7 +109,7 @@ def _build_ytdlp_option_candidates(output_template: str) -> list[dict]:
         else:
             logger.warning("YTDLP_COOKIES_FILE was set but the file does not exist: %s", cookie_file)
 
-    cookies_from_browser = os.getenv("YTDLP_COOKIES_FROM_BROWSER", "").strip()
+    cookies_from_browser = (env("YTDLP_COOKIES_FROM_BROWSER", "") or "").strip()
     if cookies_from_browser:
         browser_parts = tuple(
             part.strip() for part in cookies_from_browser.split(",") if part.strip()
@@ -250,11 +234,10 @@ def _get_groq_transcription_client() -> OpenAI:
     if _groq_transcription_client is not None:
         return _groq_transcription_client
 
-    api_key = os.getenv("GROQ_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError(
-            "GROQ_API_KEY is not set. Add it to backend/.env or your environment."
-        )
+    api_key = require_env(
+        "GROQ_API_KEY",
+        "GROQ_API_KEY is not set. Add it to backend/.env or your environment."
+    )
 
     _groq_transcription_client = OpenAI(
         api_key=api_key,

@@ -1,34 +1,18 @@
-import os
-from pathlib import Path
 from urllib.parse import urlencode
 
 import httpx
 from fastapi import APIRouter
 from starlette.responses import RedirectResponse
 
+from app.core.config import env, require_env
+
 
 router = APIRouter()
 
-
-def _load_env_file() -> None:
-    env_path = Path(__file__).resolve().parents[3] / ".env"
-    if not env_path.exists():
-        return
-
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip())
-
-_load_env_file()
-
-LINKEDIN_CLIENT_ID = os.environ["LINKEDIN_CLIENT_ID"]
-LINKEDIN_REDIRECT_URI = os.environ["LINKEDIN_REDIRECT_URI"]
-LINKEDIN_CLIENT_SECRET = os.environ["LINKEDIN_CLIENT_SECRET"]
-FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "http://localhost:3000")
+LINKEDIN_CLIENT_ID = require_env("LINKEDIN_CLIENT_ID")
+LINKEDIN_REDIRECT_URI = require_env("LINKEDIN_REDIRECT_URI")
+LINKEDIN_CLIENT_SECRET = require_env("LINKEDIN_CLIENT_SECRET")
+FRONTEND_BASE_URL = env("FRONTEND_BASE_URL", "http://localhost:3000") or "http://localhost:3000"
 LINKEDIN_TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
 LINKEDIN_USERINFO_URL = "https://api.linkedin.com/v2/userinfo"
 LINKEDIN_POST_URL = "https://api.linkedin.com/v2/ugcPosts"
