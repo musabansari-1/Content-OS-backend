@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends
 
+from app.auth.domain import AuthUser
 from app.auth.dependencies import require_current_user
 from app.auth.types import AuthResponse, LoginRequest, RegisterRequest, UserResponse
 from app.services.auth_workflows import (
@@ -13,7 +14,7 @@ router = APIRouter()
 
 
 @router.get("/me", response_model=UserResponse)
-def get_me(current_user: UserResponse = Depends(require_current_user)):
+def get_me(current_user: AuthUser = Depends(require_current_user)):
     return get_current_user_profile(current_user)
 
 

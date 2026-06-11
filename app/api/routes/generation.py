@@ -2,8 +2,8 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, UploadFile
 
+from app.auth.domain import AuthUser
 from app.auth.dependencies import require_current_user
-from app.auth.types import UserResponse
 from app.services.generation_service import (
     GENERATED_CLIPS_DIR,
     create_generation_job as create_generation_job_service,
@@ -23,7 +23,7 @@ def generate(
     video_id: Optional[str] = None,
     video_url: Optional[str] = None,
     target_assets: Optional[str] = None,
-    current_user: UserResponse = Depends(require_current_user),
+    current_user: AuthUser = Depends(require_current_user),
 ):
     return generate_from_query_service(
         video_id=video_id,
@@ -37,7 +37,7 @@ def generate(
 def generate_from_video(
     request: GenerateContentRequest,
     uploaded_video: Optional[UploadFile] = None,
-    current_user: UserResponse = Depends(require_current_user),
+    current_user: AuthUser = Depends(require_current_user),
 ):
     return generate_from_request_service(
         request=request,
@@ -49,7 +49,7 @@ def generate_from_video(
 @router.post("/upload-video")
 async def upload_video(
     file: UploadFile,
-    current_user: UserResponse = Depends(require_current_user),
+    current_user: AuthUser = Depends(require_current_user),
 ):
     return process_uploaded_video_service(file, current_user.id)
 
@@ -57,7 +57,7 @@ async def upload_video(
 @router.post("/generation-jobs")
 def create_generation_job(
     request: GenerateContentRequest,
-    current_user: UserResponse = Depends(require_current_user),
+    current_user: AuthUser = Depends(require_current_user),
 ):
     return create_generation_job_service(request, current_user.id)
 
@@ -65,7 +65,7 @@ def create_generation_job(
 @router.get("/generation-jobs/{job_id}")
 def get_generation_job(
     job_id: str,
-    current_user: UserResponse = Depends(require_current_user),
+    current_user: AuthUser = Depends(require_current_user),
 ):
     return get_generation_job_service(job_id, current_user.id)
 

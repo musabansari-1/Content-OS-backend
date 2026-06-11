@@ -1,11 +1,11 @@
 from typing import Optional
 
-from app.auth.types import UserResponse
+from app.auth.domain import AuthUser, AuthUserCredentials
 from app.core.db import get_connection
 
 
 class UserRepository:
-    def create_user(self, email: str, password_hash: str, display_name: str) -> UserResponse:
+    def create_user(self, email: str, password_hash: str, display_name: str) -> AuthUser:
         connection = get_connection()
 
         try:
@@ -22,7 +22,7 @@ class UserRepository:
         finally:
             connection.close()
 
-    def get_by_email(self, email: str) -> Optional[dict]:
+    def get_by_email(self, email: str) -> Optional[AuthUserCredentials]:
         connection = get_connection()
 
         try:
@@ -40,15 +40,15 @@ class UserRepository:
         if not row:
             return None
 
-        return {
-            "id": int(row["id"]),
-            "email": row["email"],
-            "password_hash": row["password_hash"],
-            "display_name": row["display_name"],
-            "created_at": row["created_at"],
-        }
+        return AuthUserCredentials(
+            id=int(row["id"]),
+            email=row["email"],
+            password_hash=row["password_hash"],
+            display_name=row["display_name"],
+            created_at=row["created_at"],
+        )
 
-    def get_by_id(self, user_id: int) -> Optional[UserResponse]:
+    def get_by_id(self, user_id: int) -> Optional[AuthUser]:
         connection = get_connection()
 
         try:
@@ -66,7 +66,7 @@ class UserRepository:
         if not row:
             return None
 
-        return UserResponse(
+        return AuthUser(
             id=int(row["id"]),
             email=row["email"],
             display_name=row["display_name"],
