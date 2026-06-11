@@ -15,6 +15,7 @@ from app.agents.moment_agent import extract_moments
 from app.agents.strategy_agent import generate_strategy
 from app.api.services import creator_voice_profile_service
 from app.assets import AVAILABLE_TARGET_ASSETS, build_asset_brief, get_asset_catalog, normalize_target_assets
+from app.billing.service import ensure_can_generate_assets, record_generated_assets
 from app.core.config import env
 from app.generation_jobs import generation_job_store
 from app.utils.generate_video_clips import generate_short_clips_from_groq
@@ -64,11 +65,15 @@ def generate_from_query(
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error))
 
-    return _generate_from_video(
+    ensure_can_generate_assets(user_id, len(selected_target_assets))
+
+    result = _generate_from_video(
         video_input,
         user_id,
         selected_target_assets,
     )
+    record_generated_assets(user_id, len(result.get("results", [])))
+    return result
 
 
 def generate_from_request(
@@ -91,17 +96,21 @@ def generate_from_request(
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error))
 
+    ensure_can_generate_assets(user_id, len(selected_target_assets))
+
     if transcript:
-        return _generate_from_transcript(
+        result = _generate_from_transcript(
             transcript,
             user_id,
             selected_target_assets,
             uploaded_video_path=request.uploaded_video_path,
             transcription_bundle=request.transcription_bundle,
         )
+        record_generated_assets(user_id, len(result.get("results", [])))
+        return result
 
     if uploaded_video:
-        return _generate_from_video(
+        result = _generate_from_video(
             None,
             user_id,
             selected_target_assets,
@@ -109,14 +118,18 @@ def generate_from_request(
             uploaded_video_path=request.uploaded_video_path,
             transcription_bundle=request.transcription_bundle,
         )
+        record_generated_assets(user_id, len(result.get("results", [])))
+        return result
 
-    return _generate_from_video(
+    result = _generate_from_video(
         video_input,
         user_id,
         selected_target_assets,
         uploaded_video_path=request.uploaded_video_path,
         transcription_bundle=request.transcription_bundle,
     )
+    record_generated_assets(user_id, len(result.get("results", [])))
+    return result
 
 
 def process_uploaded_video(file: UploadFile, user_id: int) -> dict[str, Any]:
@@ -181,6 +194,8 @@ def create_generation_job(request: GenerateContentRequest, user_id: int) -> dict
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error))
 
+    ensure_can_generate_assets(user_id, len(selected_target_assets))
+
     payload = {
         "video_id": request.video_id,
         "video_url": request.video_url,
@@ -197,7 +212,7 @@ def create_generation_job(request: GenerateContentRequest, user_id: int) -> dict
 
     def runner():
         if transcript:
-            return _generate_from_transcript(
+            result = _generate_from_transcript(
                 transcript,
                 user_id,
                 selected_target_assets,
@@ -205,8 +220,10 @@ def create_generation_job(request: GenerateContentRequest, user_id: int) -> dict
                 uploaded_video_path=request.uploaded_video_path,
                 transcription_bundle=request.transcription_bundle,
             )
+            record_generated_assets(user_id, len(result.get("results", [])))
+            return result
 
-        return _generate_from_video(
+        result = _generate_from_video(
             video_input,
             user_id,
             selected_target_assets,
@@ -214,6 +231,8 @@ def create_generation_job(request: GenerateContentRequest, user_id: int) -> dict
             uploaded_video_path=request.uploaded_video_path,
             transcription_bundle=request.transcription_bundle,
         )
+        record_generated_assets(user_id, len(result.get("results", [])))
+        return result
 
     generation_job_store.start_job(job["id"], runner)
     return job

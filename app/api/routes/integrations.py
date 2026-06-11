@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field
 
 from app.auth.dependencies import require_current_user
 from app.auth.domain import AuthUser
+from app.billing.service import ensure_can_direct_publish, record_direct_publish
 from app.services.integration_service import (
     get_connected_platforms_for_user,
     handle_linkedin_callback,
@@ -57,6 +58,7 @@ async def publish_linkedin(
             detail="LinkedIn post text is required.",
         )
 
+    ensure_can_direct_publish(current_user.id, 1)
     result = await publish_linkedin_post_for_user(user_id=current_user.id, text=text)
     if not result.get("ok"):
         error = result.get("error")
@@ -69,6 +71,7 @@ async def publish_linkedin(
             detail=result.get("message", "LinkedIn publish failed."),
         )
 
+    record_direct_publish(current_user.id, 1)
     return {
         "message": "LinkedIn post published.",
         "platform": result["platform"],
