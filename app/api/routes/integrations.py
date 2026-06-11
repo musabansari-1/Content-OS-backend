@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 from app.auth.dependencies import require_current_user
 from app.auth.domain import AuthUser
 from app.services.integration_service import (
+    get_connected_platforms_for_user,
     handle_linkedin_callback,
     handle_x_callback,
     publish_linkedin_post_for_user,
@@ -17,6 +18,11 @@ router = APIRouter()
 
 class LinkedInPublishRequest(BaseModel):
     text: str = Field(..., description="The LinkedIn post text to publish.")
+
+
+@router.get("/status")
+def get_status(current_user: AuthUser = Depends(require_current_user)):
+    return get_connected_platforms_for_user(user_id=current_user.id)
 
 
 @router.get("/auth/linkedin")

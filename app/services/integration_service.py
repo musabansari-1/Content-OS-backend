@@ -377,3 +377,14 @@ async def publish_linkedin_post_for_user(*, user_id: int, text: str) -> dict:
             "error": "linkedin_publish_failed",
             "message": "LinkedIn publish failed unexpectedly.",
         }
+
+
+def get_connected_platforms_for_user(*, user_id: int) -> dict:
+    platforms = social_integration_repository.list_connected_platforms(user_id=user_id)
+    platform_ids = ["twitter" if platform == "x" else platform for platform in platforms]
+    return {
+        "connected_platforms": platforms,
+        "connected_platform_ids": platform_ids,
+        "linkedin_connected": "linkedin" in platforms,
+        "x_connected": "x" in platforms,
+    }

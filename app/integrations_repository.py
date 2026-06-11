@@ -142,3 +142,20 @@ class SocialIntegrationRepository:
 
     def get_linkedin_connection(self, *, user_id: int) -> Optional[SocialIntegrationRecord]:
         return self.get_by_user_and_platform(user_id=user_id, platform="linkedin")
+
+    def list_connected_platforms(self, *, user_id: int) -> list[str]:
+        connection = get_connection()
+        try:
+            rows = connection.execute(
+                """
+                SELECT platform
+                FROM social_integrations
+                WHERE user_id = %s
+                ORDER BY platform
+                """,
+                (user_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        return [str(row["platform"]) for row in rows]
