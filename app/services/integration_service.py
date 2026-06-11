@@ -328,4 +328,52 @@ async def publish_linkedin_post(access_token: str, member_id: str, text: str):
                 "X-Restli-Protocol-Version": "2.0.0",
             },
         )
-    return resp.status_code, resp.text
+        resp.raise_for_status()
+    return resp.status_code, resp.text, resp.headers.get("x-restli-id") or resp.headers.get("location")
+
+
+async def publish_linkedin_post_for_user(*, user_id: int, text: str) -> dict:
+    connection = social_integration_repository.get_linkedin_connection(user_id=user_id)
+    if connection is None:
+        return {
+            "ok": False,
+            "error": "linkedin_not_connected",
+            "message": "Connect LinkedIn before publishing.",
+        }
+
+    if not connection.access_token or not connection.platform_user_id:
+        return {
+            "ok": False,
+            "error": "linkedin_connection_incomplete",
+            "message": "Your LinkedIn connection is missing token data.",
+        }
+
+    try:
+        status_code, response_text, linkedin_post_id = await publish_linkedin_post(
+            connection.access_token,
+            connection.platform_user_id,
+            text,
+        )
+        return {
+            "ok": True,
+            "platform": "linkedin",
+            "status_code": status_code,
+            "linkedin_user_id": connection.platform_user_id,
+            "linkedin_post_id": linkedin_post_id,
+            "response_text": response_text,
+        }
+    except httpx.HTTPStatusError as error:
+        response = error.response
+        return {
+            "ok": False,
+            "error": "linkedin_publish_failed",
+            "message": "LinkedIn rejected the post request.",
+            "status_code": response.status_code,
+            "response_text": response.text,
+        }
+    except Exception:
+        return {
+            "ok": False,
+            "error": "linkedin_publish_failed",
+            "message": "LinkedIn publish failed unexpectedly.",
+        }

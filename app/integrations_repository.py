@@ -139,3 +139,6 @@ class SocialIntegrationRepository:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
+
+    def get_linkedin_connection(self, *, user_id: int) -> Optional[SocialIntegrationRecord]:
+        return self.get_by_user_and_platform(user_id=user_id, platform="linkedin")

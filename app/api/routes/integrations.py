@@ -1,16 +1,22 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
 
 from app.auth.dependencies import require_current_user
 from app.auth.domain import AuthUser
 from app.services.integration_service import (
     handle_linkedin_callback,
     handle_x_callback,
+    publish_linkedin_post_for_user,
     start_linkedin_auth,
     start_x_auth,
 )
 
 
 router = APIRouter()
+
+
+class LinkedInPublishRequest(BaseModel):
+    text: str = Field(..., description="The LinkedIn post text to publish.")
 
 
 @router.get("/auth/linkedin")
@@ -31,3 +37,35 @@ def auth_x(current_user: AuthUser = Depends(require_current_user)):
 @router.get("/auth/x/callback")
 async def auth_x_callback(code: str = None, state: str = None, error: str = None):
     return await handle_x_callback(code=code, state=state, error=error)
+
+
+@router.post("/linkedin/publish")
+async def publish_linkedin(
+    request: LinkedInPublishRequest,
+    current_user: AuthUser = Depends(require_current_user),
+):
+    text = request.text.strip()
+    if not text:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="LinkedIn post text is required.",
+        )
+
+    result = await publish_linkedin_post_for_user(user_id=current_user.id, text=text)
+    if not result.get("ok"):
+        error = result.get("error")
+        if error == "linkedin_not_connected":
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=result["message"])
+        if error == "linkedin_connection_incomplete":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result["message"])
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=result.get("message", "LinkedIn publish failed."),
+        )
+
+    return {
+        "message": "LinkedIn post published.",
+        "platform": result["platform"],
+        "linkedin_post_id": result.get("linkedin_post_id"),
+        "status_code": result.get("status_code"),
+    }
