@@ -1,8 +1,9 @@
 from typing import Iterable, List, Optional
 
+from app.voice_engine.domain import VoiceProfileRecord
 from app.voice_engine.extractor import VoiceProfileExtractorService
 from app.voice_engine.repository import CreatorVoiceProfileRepository
-from app.voice_engine.types import CreatorVoiceProfileRecord, VoiceProfile
+from app.voice_engine.types import VoiceProfile
 
 
 class CreatorVoiceProfileService:
@@ -18,9 +19,9 @@ class CreatorVoiceProfileService:
         self,
         userId: Optional[int],
         samples: List[str],
-    ) -> CreatorVoiceProfileRecord:
+    ) -> VoiceProfileRecord:
         existing_record = self.repository.get_by_user_id(userId)
-        existing_profile = existing_record.voice_profile_json if existing_record else None
+        existing_profile = existing_record.voice_profile if existing_record else None
         extracted_profile = self.extractor.extractVoiceProfile(samples, existing_profile)
         merged_profile = self._merge_voice_profiles(existing_profile, extracted_profile)
         return self.repository.create_or_update(userId, merged_profile)
@@ -28,21 +29,21 @@ class CreatorVoiceProfileService:
     def getVoiceProfile(
         self,
         userId: Optional[int],
-    ) -> Optional[CreatorVoiceProfileRecord]:
+    ) -> Optional[VoiceProfileRecord]:
         return self.repository.get_by_user_id(userId)
 
-    def listVoiceProfiles(self, userId: int) -> list[CreatorVoiceProfileRecord]:
+    def listVoiceProfiles(self, userId: int) -> list[VoiceProfileRecord]:
         return self.repository.list_all(userId)
 
-    def repairStoredPreferredDevices(self) -> list[CreatorVoiceProfileRecord]:
+    def repairStoredPreferredDevices(self) -> list[VoiceProfileRecord]:
         repaired_records = []
 
         for record in self.repository.list_all():
             normalized_profile = VoiceProfile.parse_obj(
-                self._voice_profile_to_payload(record.voice_profile_json)
+                self._voice_profile_to_payload(record.voice_profile)
             )
 
-            if normalized_profile.preferred_devices == record.voice_profile_json.preferred_devices:
+            if normalized_profile.preferred_devices == record.voice_profile.preferred_devices:
                 continue
 
             repaired_records.append(

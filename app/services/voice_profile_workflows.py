@@ -1,6 +1,7 @@
 from fastapi import HTTPException
 
 from app.api.services import creator_voice_profile_service
+from app.voice_engine.domain import VoiceProfileRecord
 from app.voice_engine.types import (
     CreatorVoiceProfileRecord,
     SaveMyVoiceProfileFromYoutubeRequest,
@@ -9,22 +10,36 @@ from app.voice_engine.types import (
 from app.youtube_transcripts import fetch_video_transcripts
 
 
+def _to_voice_profile_response(record: VoiceProfileRecord) -> CreatorVoiceProfileRecord:
+    return CreatorVoiceProfileRecord(
+        id=record.id,
+        user_id=record.user_id,
+        voice_profile_json=record.voice_profile,
+        style_summary=record.style_summary,
+        version=record.version,
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+    )
+
+
 def get_my_voice_profile(user_id: int) -> CreatorVoiceProfileRecord:
     profile = creator_voice_profile_service.getVoiceProfile(user_id)
 
     if not profile:
         raise HTTPException(status_code=404, detail="Creator voice profile not found.")
 
-    return profile
+    return _to_voice_profile_response(profile)
 
 
 def save_my_voice_profile(
     request: SaveMyVoiceProfileRequest,
     user_id: int,
 ) -> CreatorVoiceProfileRecord:
-    return creator_voice_profile_service.createOrUpdateVoiceProfile(
-        user_id,
-        request.samples,
+    return _to_voice_profile_response(
+        creator_voice_profile_service.createOrUpdateVoiceProfile(
+            user_id,
+            request.samples,
+        )
     )
 
 
@@ -51,7 +66,9 @@ def save_my_voice_profile_from_youtube(
     if video_inputs:
         samples.extend(fetch_video_transcripts(video_inputs))
 
-    return creator_voice_profile_service.createOrUpdateVoiceProfile(
-        user_id,
-        samples,
+    return _to_voice_profile_response(
+        creator_voice_profile_service.createOrUpdateVoiceProfile(
+            user_id,
+            samples,
+        )
     )

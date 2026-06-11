@@ -2,7 +2,8 @@ import json
 from typing import Optional
 
 from app.core.db import get_connection
-from app.voice_engine.types import CreatorVoiceProfileRecord, VoiceProfile
+from app.voice_engine.domain import VoiceProfileRecord
+from app.voice_engine.types import VoiceProfile
 
 
 def _voice_profile_to_dict(voice_profile: VoiceProfile) -> dict:
@@ -16,7 +17,7 @@ class CreatorVoiceProfileRepository:
         self,
         user_id: Optional[int],
         voice_profile: VoiceProfile,
-    ) -> CreatorVoiceProfileRecord:
+    ) -> VoiceProfileRecord:
         payload = json.dumps(_voice_profile_to_dict(voice_profile), ensure_ascii=True)
         connection = get_connection()
 
@@ -74,7 +75,7 @@ class CreatorVoiceProfileRepository:
     def get_by_user_id(
         self,
         user_id: Optional[int],
-    ) -> Optional[CreatorVoiceProfileRecord]:
+    ) -> Optional[VoiceProfileRecord]:
         connection = get_connection()
 
         try:
@@ -100,17 +101,17 @@ class CreatorVoiceProfileRepository:
             return None
 
         profile_payload = json.loads(row["voice_profile_json"])
-        return CreatorVoiceProfileRecord(
+        return VoiceProfileRecord(
             id=int(row["id"]),
             user_id=int(row["user_id"]) if row["user_id"] is not None else None,
-            voice_profile_json=VoiceProfile.parse_obj(profile_payload),
+            voice_profile=VoiceProfile.parse_obj(profile_payload),
             style_summary=row["style_summary"],
             version=int(row["version"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
 
-    def list_all(self, user_id: Optional[int] = None) -> list[CreatorVoiceProfileRecord]:
+    def list_all(self, user_id: Optional[int] = None) -> list[VoiceProfileRecord]:
         connection = get_connection()
 
         try:
@@ -153,10 +154,10 @@ class CreatorVoiceProfileRepository:
         for row in rows:
             profile_payload = json.loads(row["voice_profile_json"])
             records.append(
-                CreatorVoiceProfileRecord(
+                VoiceProfileRecord(
                     id=int(row["id"]),
                     user_id=int(row["user_id"]) if row["user_id"] is not None else None,
-                    voice_profile_json=VoiceProfile.parse_obj(profile_payload),
+                    voice_profile=VoiceProfile.parse_obj(profile_payload),
                     style_summary=row["style_summary"],
                     version=int(row["version"]),
                     created_at=row["created_at"],
