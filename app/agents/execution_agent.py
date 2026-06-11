@@ -111,7 +111,7 @@ def run_execution_pipeline(
     creator_voice_profile = None
     if voice_profile_record:
         creator_voice_profile = _voice_profile_to_dict(
-            voice_profile_record.voice_profile_json
+            voice_profile_record.voice_profile
         )
         creator_voice_profile["profile_version"] = voice_profile_record.version
 
