@@ -63,7 +63,7 @@ client = OpenAI(
 
 def call_llm(system_prompt, user_prompt):
     response = client.chat.completions.create(
-        model="openrouter/free",
+        model="openai/gpt-oss-120b:free",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
