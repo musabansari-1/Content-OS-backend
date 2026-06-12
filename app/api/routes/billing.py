@@ -1,11 +1,17 @@
 from datetime import datetime
 
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, Header, Request
+from pydantic import BaseModel, Field
 
 from app.auth.dependencies import require_current_user
 from app.auth.domain import AuthUser
-from app.billing.service import get_billing_summary
+from app.billing.service import (
+    get_billing_summary,
+    get_checkout_settings,
+    list_billing_plans,
+    process_paddle_webhook,
+    verify_paddle_webhook_signature,
+)
 
 
 router = APIRouter()
@@ -39,6 +45,29 @@ class BillingSummaryResponse(BaseModel):
     remaining: BillingRemainingResponse
 
 
+class BillingCheckoutRequest(BaseModel):
+    plan_code: str = Field(..., description="Target paid plan code.")
+
+
+class BillingCheckoutResponse(BaseModel):
+    plan_code: str
+    price_id: str
+    paddle_environment: str
+    paddle_client_token: str
+    customer_email: str
+    success_url: str
+    custom_data: dict
+
+
+class BillingPlanResponse(BaseModel):
+    code: str
+    label: str
+    assets_per_month: int
+    direct_publishes_per_month: int
+    checkout_enabled: bool
+    price_id: str | None = None
+
+
 @router.get("/billing/me", response_model=BillingSummaryResponse)
 def get_my_billing(current_user: AuthUser = Depends(require_current_user)) -> BillingSummaryResponse:
     summary = get_billing_summary(current_user.id)
@@ -67,3 +96,30 @@ def get_my_billing(current_user: AuthUser = Depends(require_current_user)) -> Bi
         ),
     )
 
+
+@router.get("/billing/plans", response_model=list[BillingPlanResponse])
+def get_billing_plans() -> list[BillingPlanResponse]:
+    return [BillingPlanResponse(**plan) for plan in list_billing_plans()]
+
+
+@router.post("/billing/checkout", response_model=BillingCheckoutResponse)
+def create_billing_checkout(
+    request: BillingCheckoutRequest,
+    current_user: AuthUser = Depends(require_current_user),
+) -> BillingCheckoutResponse:
+    settings = get_checkout_settings(
+        user_id=current_user.id,
+        user_email=current_user.email,
+        plan_code=request.plan_code,
+    )
+    return BillingCheckoutResponse(**settings)
+
+
+@router.post("/billing/webhooks/paddle")
+async def handle_paddle_webhook(
+    request: Request,
+    paddle_signature: str | None = Header(default=None, alias="Paddle-Signature"),
+):
+    raw_body = await request.body()
+    verify_paddle_webhook_signature(raw_body, paddle_signature)
+    return process_paddle_webhook(raw_body)
