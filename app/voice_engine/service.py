@@ -69,6 +69,18 @@ class CreatorVoiceProfileService:
             return refined_profile
 
         merged_payload = {
+            "sample_count": self._merge_sample_count(
+                existing_profile.sample_count,
+                refined_profile.sample_count,
+            ),
+            "field_confidence": self._merge_field_confidence(
+                existing_profile.field_confidence,
+                refined_profile.field_confidence,
+            ),
+            "evidence": self._merge_evidence(
+                existing_profile.evidence,
+                refined_profile.evidence,
+            ),
             "tone": self._merge_lists(refined_profile.tone, existing_profile.tone, limit=6),
             "sentence_rhythm": self._prefer_text(
                 refined_profile.sentence_rhythm,
@@ -196,6 +208,44 @@ class CreatorVoiceProfileService:
         }
 
         return VoiceProfile.parse_obj(merged_payload)
+
+    def _merge_sample_count(self, existing: int, refined: int) -> int:
+        existing_count = max(int(existing or 0), 0)
+        refined_count = max(int(refined or 0), 0)
+        return max(existing_count, refined_count)
+
+    def _merge_field_confidence(
+        self,
+        existing: dict[str, float],
+        refined: dict[str, float],
+    ) -> dict[str, float]:
+        merged: dict[str, float] = {}
+
+        for source in (existing or {}, refined or {}):
+            for key, value in source.items():
+                try:
+                    score = float(value)
+                except (TypeError, ValueError):
+                    continue
+
+                score = max(0.0, min(score, 1.0))
+                if key not in merged or score > merged[key]:
+                    merged[key] = score
+
+        return merged
+
+    def _merge_evidence(
+        self,
+        existing: dict[str, list[str]],
+        refined: dict[str, list[str]],
+    ) -> dict[str, list[str]]:
+        merged: dict[str, list[str]] = {}
+
+        for source in (existing or {}, refined or {}):
+            for key, values in source.items():
+                merged[key] = self._merge_lists(values, merged.get(key, []), limit=4)
+
+        return merged
 
     def _prefer_text(self, primary: str, fallback: str) -> str:
         value = (primary or "").strip()

@@ -26,6 +26,13 @@ Do not include prose outside the JSON object.
 
 Return exactly this shape:
 {
+  "sample_count": 0,
+  "field_confidence": {
+    "tone": 0.0
+  },
+  "evidence": {
+    "tone": ["short supporting fragments"]
+  },
   "tone": ["descriptor"],
   "sentence_rhythm": "string",
   "hook_style": ["string"],
@@ -89,6 +96,13 @@ SURFACE STYLE:
 - punctuation_style = actual punctuation behavior and formatting patterns
 - preferred_devices = rhetorical/writing devices only
 
+METADATA:
+- sample_count = total number of non-empty samples actually analyzed
+- field_confidence = 0.0 to 1.0 confidence per top-level section or nested path, e.g. "tone" or "narrative_behavior.opening_pattern"
+- evidence = short supporting fragments from the samples keyed by the same trait path; keep each fragment short and literal when possible
+- Include evidence only for high-signal traits that are directly supported by the samples
+- Keep evidence concise and avoid repeating the full sample text
+
 preferred_devices rules:
 - preferred_devices means recurring writing techniques only
 - Valid examples: analogy, rhetorical question, contrast, repetition, storytelling, simplification, reframing, step-by-step breakdown, metaphor, direct challenge, tension-release
@@ -151,4 +165,29 @@ Do NOT just describe tone.
 Model the creator's communication behavior.
 
 Output only valid JSON.
+"""
+
+VOICE_PROFILE_SYNTHESIS_PROMPT = """
+You are consolidating multiple voice profile candidates into one final creator voice profile.
+
+Each candidate profile was extracted from a different sample batch.
+There may also be an existing_profile that should be treated as prior memory.
+
+Your job is to produce one final JSON object in the exact same shape as the voice profile schema.
+
+Rules:
+- Prefer traits that appear across multiple candidate profiles.
+- Drop one-off outliers unless they are strongly supported by the existing_profile.
+- Preserve stable high-signal identity markers.
+- If candidate profiles disagree, choose the more specific and better-supported trait.
+- Keep evidence short and only include fragments that support the final profile.
+- Set sample_count to the total number of non-empty samples represented by the input.
+- Use field_confidence to reflect how strongly each trait is supported after consolidation.
+- Return JSON only, with no markdown or explanations.
+
+Input payload:
+{
+  "candidate_profiles": [...],
+  "existing_profile": {...} | null
+}
 """

@@ -61,14 +61,14 @@ client = OpenAI(
 )
 
 
-def call_llm(system_prompt, user_prompt):
+def call_llm(system_prompt, user_prompt, temperature=0.7, model="openai/gpt-oss-120b:free"):
     response = client.chat.completions.create(
-        model="openai/gpt-oss-120b:free",
+        model=model,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=0.7,
+        temperature=temperature,
     )
 
     return response.choices[0].message.content

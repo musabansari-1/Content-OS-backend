@@ -73,6 +73,7 @@ RULES:
 VOICE RULES:
 - Treat CREATOR_VOICE_PROFILE as a writing brief, not as source facts.
 - Use the profile to shape tone, rhythm, hooks, CTA style, punctuation, and phrase choices.
+- If sample_count, field_confidence, or evidence are present, trust stronger evidence more and do not overfit to weakly supported traits.
 - Use narrative_behavior to mirror how the creator opens, sequences ideas, teaches, builds authority, and closes.
 - Use cognitive_style to preserve how the creator reasons, reframes, and solves problems.
 - Use constraint_profile to avoid patterns that break the creator's identity.

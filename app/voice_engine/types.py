@@ -47,6 +47,9 @@ def _normalize_preferred_devices(values: List[str]) -> List[str]:
 
 
 class VoiceProfile(BaseModel):
+    sample_count: int = 0
+    field_confidence: Dict[str, float] = Field(default_factory=dict)
+    evidence: Dict[str, List[str]] = Field(default_factory=dict)
     tone: List[str] = Field(default_factory=list)
     sentence_rhythm: str = ""
     hook_style: List[str] = Field(default_factory=list)
@@ -63,6 +66,51 @@ class VoiceProfile(BaseModel):
     constraint_profile: "ConstraintProfile" = Field(default_factory=lambda: ConstraintProfile())
     voice_anchors: List[str] = Field(default_factory=list)
     style_summary: str = ""
+
+    @validator("sample_count", pre=True, always=True)
+    def validate_sample_count(cls, value):
+        try:
+            return max(int(value or 0), 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @validator("field_confidence", pre=True, always=True)
+    def validate_field_confidence(cls, value):
+        if not isinstance(value, dict):
+            return {}
+
+        normalized = {}
+        for key, raw_value in value.items():
+            try:
+                normalized[str(key)] = min(max(float(raw_value), 0.0), 1.0)
+            except (TypeError, ValueError):
+                continue
+
+        return normalized
+
+    @validator("evidence", pre=True, always=True)
+    def validate_evidence(cls, value):
+        if not isinstance(value, dict):
+            return {}
+
+        normalized = {}
+        for key, raw_values in value.items():
+            if isinstance(raw_values, str):
+                raw_values = [raw_values]
+
+            if not isinstance(raw_values, list):
+                continue
+
+            cleaned = []
+            for raw_value in raw_values:
+                text = (raw_value or "").strip()
+                if text:
+                    cleaned.append(text)
+
+            if cleaned:
+                normalized[str(key)] = cleaned
+
+        return normalized
 
     @validator("preferred_devices", pre=True, always=True)
     def validate_preferred_devices(cls, value):
