@@ -56,6 +56,7 @@ class BillingCheckoutResponse(BaseModel):
     paddle_client_token: str
     customer_email: str
     success_url: str
+    cancel_url: str
     custom_data: dict
 
 

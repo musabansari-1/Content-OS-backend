@@ -10,11 +10,22 @@ from fastapi import HTTPException
 from app.billing.domain import BillingSummary, BillingSubscription, BillingUsageCounter
 from app.billing.plans import DEFAULT_PLAN_CODE, PLAN_DEFINITIONS, get_plan_definition
 from app.billing.repository import BillingRepository
-from app.core.config import env, require_env
+from app.core.config import env
 
 
 billing_repository = BillingRepository()
-FRONTEND_BASE_URL = (env("FRONTEND_BASE_URL", "http://localhost:3000") or "http://localhost:3000").rstrip("/")
+
+
+def _resolve_frontend_base_url() -> str:
+    configured_url = (
+        env("FRONTEND_BASE_URL", None)
+        or env("FRONTEND_URL", None)
+        or "http://localhost:5173"
+    )
+    return configured_url.rstrip("/")
+
+
+FRONTEND_BASE_URL = _resolve_frontend_base_url()
 PADDLE_ENVIRONMENT = (env("PADDLE_ENVIRONMENT", "sandbox") or "sandbox").strip().lower()
 PADDLE_CLIENT_TOKEN = env("PADDLE_CLIENT_TOKEN", "") or ""
 PADDLE_WEBHOOK_SECRET = env("PADDLE_WEBHOOK_SECRET", "") or ""
@@ -121,6 +132,7 @@ def get_checkout_settings(user_id: int, user_email: str, plan_code: str) -> dict
         "paddle_client_token": PADDLE_CLIENT_TOKEN,
         "customer_email": user_email,
         "success_url": f"{FRONTEND_BASE_URL}/billing?checkout=success",
+        "cancel_url": f"{FRONTEND_BASE_URL}/billing?checkout=canceled",
         "custom_data": {
             "user_id": user_id,
             "plan_code": normalized_plan,
