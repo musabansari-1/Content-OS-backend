@@ -2,6 +2,7 @@ import inspect
 import json
 import logging
 import mimetypes
+import os
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Optional
@@ -28,8 +29,16 @@ from app.youtube_transcripts import (
 )
 
 
-GENERATED_CLIPS_DIR = Path("/tmp/generated_clips")
-GENERATED_CLIPS_DIR.mkdir(parents=True, exist_ok=True)
+def _resolve_generated_clips_dir() -> Path:
+    configured = (env("GENERATED_CLIPS_DIR", "/tmp/generated_clips") or "/tmp/generated_clips").strip()
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+GENERATED_CLIPS_DIR = _resolve_generated_clips_dir()
 
 SHORT_VIDEO_ASSET_TYPES = {
     asset_type
@@ -40,6 +49,18 @@ SHORT_VIDEO_ASSET_TYPES = {
 SUPABASE_URL = (env("SUPABASE_URL", "") or "").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = (env("SUPABASE_SERVICE_ROLE_KEY", "") or "").strip()
 SUPABASE_STORAGE_BUCKET = (env("SUPABASE_STORAGE_BUCKET", "clips") or "clips").strip()
+
+S3_BUCKET = (env("S3_BUCKET", "") or "").strip()
+S3_REGION = (env("AWS_REGION", env("AWS_DEFAULT_REGION", "")) or "").strip()
+S3_ENDPOINT_URL = (env("S3_ENDPOINT_URL", "") or "").strip()
+S3_PUBLIC_BASE_URL = (env("S3_PUBLIC_BASE_URL", "") or "").strip().rstrip("/")
+
+try:
+    import boto3
+    from botocore.exceptions import BotoCoreError, ClientError
+except ImportError:
+    boto3 = None  # type: ignore
+    BotoCoreError = ClientError = Exception  # type: ignore[misc,assignment]
 
 
 def list_target_assets() -> dict[str, Any]:
@@ -252,6 +273,41 @@ def _build_supabase_public_url(object_path: str) -> str:
     return f"{SUPABASE_URL}/storage/v1/object/public/{bucket}/{quote(object_path, safe='/')}"
 
 
+def _build_s3_public_url(object_path: str) -> str:
+    if S3_PUBLIC_BASE_URL:
+        return f"{S3_PUBLIC_BASE_URL}/{quote(object_path, safe='/')}"
+    if not S3_BUCKET:
+        raise RuntimeError("S3_BUCKET is not set.")
+    if not S3_REGION:
+        raise RuntimeError("AWS_REGION or AWS_DEFAULT_REGION is not set.")
+    return f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{quote(object_path, safe='/')}"
+
+
+def _upload_file_to_s3(local_path: Path, object_path: str, content_type: str | None = None) -> str:
+    if boto3 is None:
+        raise RuntimeError("boto3 is not installed. Add boto3 to requirements to use S3 uploads.")
+    if not S3_BUCKET:
+        raise RuntimeError("S3_BUCKET is not set.")
+
+    session = boto3.session.Session(region_name=S3_REGION or None)
+    client = session.client("s3", endpoint_url=S3_ENDPOINT_URL or None)
+    extra_args: dict[str, Any] = {}
+    guessed_type = content_type or mimetypes.guess_type(local_path.name)[0]
+    if guessed_type:
+        extra_args["ContentType"] = guessed_type
+
+    logger = logging.getLogger(__name__)
+    logger.info("Uploading file to S3: local_path=%s object_path=%s bucket=%s", local_path, object_path, S3_BUCKET)
+    try:
+        client.upload_file(str(local_path), S3_BUCKET, object_path, ExtraArgs=extra_args or None)
+    except (BotoCoreError, ClientError) as error:
+        raise RuntimeError(f"S3 upload failed for {local_path.name}: {error}") from error
+
+    public_url = _build_s3_public_url(object_path)
+    logger.info("Uploaded file to S3: object_path=%s public_url=%s", object_path, public_url)
+    return public_url
+
+
 def _upload_file_to_supabase(local_path: Path, object_path: str, content_type: str | None = None) -> str:
     if not SUPABASE_URL:
         raise RuntimeError("SUPABASE_URL is not set.")
@@ -281,6 +337,16 @@ def _upload_file_to_supabase(local_path: Path, object_path: str, content_type: s
     public_url = _build_supabase_public_url(object_path)
     logger.info("Uploaded file to Supabase: object_path=%s public_url=%s", object_path, public_url)
     return public_url
+
+
+def _upload_generated_clip(
+    local_path: Path,
+    object_path: str,
+    content_type: str | None = None,
+) -> str:
+    if S3_BUCKET:
+        return _upload_file_to_s3(local_path, object_path, content_type)
+    return _upload_file_to_supabase(local_path, object_path, content_type)
 
 
 def _merge_steps(current_steps, updates):
@@ -535,7 +601,7 @@ def _attach_generated_clips_to_results(
             clip_video_path = Path(clip_payload["video_path"])
             clip_subtitle_path = clip_payload.get("subtitle_path")
             try:
-                clip_public_url = _upload_file_to_supabase(
+                clip_public_url = _upload_generated_clip(
                     clip_video_path,
                     f"clips/{clip_result.get('run_id', 'run')}/{clip_video_path.name}",
                     "video/mp4",
@@ -543,7 +609,7 @@ def _attach_generated_clips_to_results(
                 subtitle_public_url = None
                 if clip_subtitle_path:
                     subtitle_file = Path(clip_subtitle_path)
-                    subtitle_public_url = _upload_file_to_supabase(
+                    subtitle_public_url = _upload_generated_clip(
                         subtitle_file,
                         f"subtitles/{clip_result.get('run_id', 'run')}/{subtitle_file.name}",
                         "text/plain",
