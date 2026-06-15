@@ -489,6 +489,8 @@ def _build_generated_clip_media(
         "score": clip_details.get("score"),
         "rationale": clip_details.get("rationale"),
         "transcript_text": clip_details.get("transcript_text"),
+        "target_asset_type": clip_payload.get("target_asset_type") or clip_details.get("target_asset_type"),
+        "platform_profile": clip_payload.get("platform_profile") or clip_details.get("platform_profile"),
     }
 
     subtitle_path = clip_payload.get("subtitle_path")
@@ -571,6 +573,7 @@ def _attach_generated_clips_to_results(
             output_dir=str(GENERATED_CLIPS_DIR),
             create_blur_background=True,
             debug=True,
+            target_asset_types=requested_short_assets,
         )
     except Exception:
         logger.exception(
@@ -592,12 +595,25 @@ def _attach_generated_clips_to_results(
         logger.warning("Clip rendering returned no selected_clips; returning original pipeline result.")
         return pipeline_result
 
+    clips_by_asset_type = {
+        clip.get("target_asset_type") or clip.get("clip", {}).get("target_asset_type"): clip
+        for clip in selected_clips
+        if clip.get("target_asset_type") or clip.get("clip", {}).get("target_asset_type")
+    }
+
     results = []
     short_asset_index = 0
     for result in pipeline_result["results"]:
         next_result = dict(result)
-        if result.get("asset_type") in requested_short_assets and short_asset_index < len(selected_clips):
-            clip_payload = selected_clips[short_asset_index]
+        asset_type = result.get("asset_type")
+        if asset_type in requested_short_assets:
+            clip_payload = clips_by_asset_type.get(asset_type)
+            if clip_payload is None and short_asset_index < len(selected_clips):
+                clip_payload = selected_clips[short_asset_index]
+            if clip_payload is None:
+                results.append(next_result)
+                continue
+
             clip_video_path = Path(clip_payload["video_path"])
             clip_subtitle_path = clip_payload.get("subtitle_path")
             try:
@@ -616,16 +632,17 @@ def _attach_generated_clips_to_results(
                     )
             except Exception:
                 logger.exception(
-                    "Failed to upload rendered clip to Supabase: clip_path=%s subtitle_path=%s",
+                    "Failed to upload rendered clip: clip_path=%s subtitle_path=%s",
                     clip_payload.get("video_path"),
                     clip_subtitle_path,
                 )
                 raise
 
             logger.info(
-                "Mapping rendered clip to asset_type=%s clip_id=%s video_path=%s supabase_url=%s",
-                result.get("asset_type"),
+                "Mapping rendered clip to asset_type=%s clip_id=%s platform_profile=%s video_path=%s clip_url=%s",
+                asset_type,
                 clip_payload.get("clip", {}).get("clip_id"),
+                clip_payload.get("platform_profile") or clip_payload.get("clip", {}).get("platform_profile"),
                 clip_payload.get("video_path"),
                 clip_public_url,
             )
@@ -637,6 +654,7 @@ def _attach_generated_clips_to_results(
                     "duration": clip_payload.get("clip", {}).get("duration"),
                     "score": clip_payload.get("clip", {}).get("score"),
                     "rationale": clip_payload.get("clip", {}).get("rationale"),
+                    "platform_profile": clip_payload.get("platform_profile") or clip_payload.get("clip", {}).get("platform_profile"),
                 }
             }
             next_result["output"] = json.dumps(output_payload)

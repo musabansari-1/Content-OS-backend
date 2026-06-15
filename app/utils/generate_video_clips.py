@@ -86,6 +86,8 @@ class ClipCandidate:
     title: str
     rationale: str
     transcript_text: str
+    target_asset_type: str | None = None
+    platform_profile: str | None = None
 
 
 #
@@ -657,15 +659,19 @@ class GroqShortsPipeline:
         words_per_caption: int = 4,
         create_blur_background: bool = False,
         debug: bool = True,
+        target_asset_types: list[str] | None = None,
     ) -> dict[str, Any]:
         source_video = Path(source_video_path)
         self._validate_process_inputs(source_video, clip_count, words_per_caption)
         self._ensure_media_tools()
+        target_asset_types = self._normalize_target_asset_types(target_asset_types, clip_count)
+        clip_count = max(clip_count, len(target_asset_types))
 
         logger.info(
-            "Clip pipeline started: source_video_path=%s clip_count=%s add_captions=%s create_blur_background=%s",
+            "Clip pipeline started: source_video_path=%s clip_count=%s target_asset_types=%s add_captions=%s create_blur_background=%s",
             source_video_path,
             clip_count,
+            target_asset_types,
             add_captions,
             create_blur_background,
         )
@@ -747,7 +753,10 @@ class GroqShortsPipeline:
                 if debug:
                     self._write_json(debug_dir / "scorer_error.json", {"error": str(e)})
 
-        candidate_dicts = self._select_diverse_candidates(candidate_dicts, clip_count)
+        if target_asset_types:
+            candidate_dicts = self._select_platform_candidates(candidate_dicts, target_asset_types)
+        else:
+            candidate_dicts = self._select_diverse_candidates(candidate_dicts, clip_count)
         logger.info("Selected %s diverse candidates", len(candidate_dicts))
 
         if debug:
@@ -834,6 +843,8 @@ class GroqShortsPipeline:
                     "clip":          asdict(candidate),
                     "video_path":    str(clip_path.resolve()),
                     "subtitle_path": str(sub_path.resolve()) if sub_path else None,
+                    "target_asset_type": candidate.target_asset_type,
+                    "platform_profile": candidate.platform_profile,
                 }
             )
 
@@ -856,6 +867,15 @@ class GroqShortsPipeline:
         if not rendered and render_errors:
             raise RuntimeError(f"All selected clip renders failed. See debug output in {run_dir}.")
         return result
+
+    def _normalize_target_asset_types(
+        self,
+        target_asset_types: list[str] | None,
+        clip_count: int,
+    ) -> list[str]:
+        if target_asset_types:
+            return [asset for asset in target_asset_types if asset]
+        return [f"short_video_{idx + 1}" for idx in range(max(0, clip_count))]
 
     def _validate_process_inputs(
         self,
@@ -1747,6 +1767,174 @@ class GroqShortsPipeline:
 
         return selected
 
+    def _select_platform_candidates(
+        self,
+        candidates: list[dict[str, Any]],
+        target_asset_types: list[str],
+    ) -> list[dict[str, Any]]:
+        selected: list[dict[str, Any]] = []
+        remaining = list(candidates)
+
+        for asset_type in target_asset_types:
+            ranked = sorted(
+                remaining,
+                key=lambda candidate: self._platform_fit_score(candidate, asset_type),
+                reverse=True,
+            )
+
+            chosen: dict[str, Any] | None = None
+            for candidate in ranked:
+                if self._too_similar_to_selected(candidate, selected, max_similarity=0.62):
+                    continue
+                chosen = candidate
+                break
+
+            if chosen is None:
+                for candidate in ranked:
+                    if not self._same_time_window(candidate, selected):
+                        chosen = candidate
+                        break
+
+            if chosen is None:
+                logger.warning("No distinct platform-specific clip available for asset_type=%s", asset_type)
+                continue
+
+            selected_candidate = dict(chosen)
+            profile = self._platform_profile_for_asset(asset_type)
+            selected_candidate["target_asset_type"] = asset_type
+            selected_candidate["platform_profile"] = profile
+            selected_candidate["platform_score"] = round(self._platform_fit_score(chosen, asset_type), 4)
+            selected_candidate["final_score"] = max(
+                float(selected_candidate.get("final_score", 0.0)),
+                float(selected_candidate["platform_score"]),
+            )
+            selected.append(selected_candidate)
+            remaining = [candidate for candidate in remaining if candidate is not chosen]
+
+        return selected
+
+    def _too_similar_to_selected(
+        self,
+        candidate: dict[str, Any],
+        selected: list[dict[str, Any]],
+        max_similarity: float,
+    ) -> bool:
+        return any(
+            self._time_overlap_ratio(
+                float(candidate["start"]),
+                float(candidate["end"]),
+                float(chosen["start"]),
+                float(chosen["end"]),
+            ) > max_similarity
+            or self._jaccard_similarity(
+                candidate.get("transcript_text", ""),
+                chosen.get("transcript_text", ""),
+            ) > max_similarity
+            for chosen in selected
+        )
+
+    def _same_time_window(self, candidate: dict[str, Any], selected: list[dict[str, Any]]) -> bool:
+        return any(
+            abs(float(candidate["start"]) - float(chosen["start"])) < 0.5
+            and abs(float(candidate["end"]) - float(chosen["end"])) < 0.5
+            for chosen in selected
+        )
+
+    def _platform_profile_for_asset(self, asset_type: str) -> str:
+        if asset_type == "tiktok_clip":
+            return "tiktok"
+        if asset_type == "instagram_reel":
+            return "instagram_reel"
+        return "generic_short_video"
+
+    def _platform_fit_score(self, candidate: dict[str, Any], asset_type: str) -> float:
+        profile = self._platform_profile_for_asset(asset_type)
+        text = candidate.get("transcript_text", "")
+        duration = float(candidate.get("duration", 0.0))
+        base = float(candidate.get("final_score", candidate.get("editorial_score", candidate.get("base_score", 0.0))))
+        boundary = float(candidate.get("boundary_score", self._boundary_score(text)))
+        hook = float(candidate.get("hook_score", self._hook_score(text)))
+        payoff = float(candidate.get("payoff_score", self._payoff_score(text)))
+        density = float(candidate.get("density_score", self._information_density_score(text, duration)))
+        retention = float(candidate.get("retention_score", self._retention_score(text)))
+        self_contained = float(candidate.get("self_contained_score", self._self_contained_score(text)))
+
+        if profile == "tiktok":
+            platform = (
+                0.28 * hook
+                + 0.22 * retention
+                + 0.18 * density
+                + 0.14 * boundary
+                + 0.10 * payoff
+                + 0.08 * self._duration_preference(duration, 12.0, 44.0, 68.0)
+            )
+            platform += self._pattern_bonus(
+                text,
+                [
+                    r"\byou\b",
+                    r"\bwhy\b",
+                    r"\bmistake\b",
+                    r"\bproblem\b",
+                    r"\bnever\b",
+                    r"\bmost people\b",
+                    r"\bwhat happens\b",
+                ],
+                0.035,
+                0.14,
+            )
+        elif profile == "instagram_reel":
+            platform = (
+                0.23 * payoff
+                + 0.20 * self_contained
+                + 0.18 * boundary
+                + 0.15 * hook
+                + 0.14 * retention
+                + 0.10 * self._duration_preference(duration, 18.0, 62.0, 88.0)
+            )
+            platform += self._pattern_bonus(
+                text,
+                [
+                    r"\bhere'?s\b",
+                    r"\bhow to\b",
+                    r"\bthe lesson\b",
+                    r"\bremember\b",
+                    r"\bthe point\b",
+                    r"\bthis is how\b",
+                    r"\byou can\b",
+                ],
+                0.03,
+                0.12,
+            )
+        else:
+            platform = base
+
+        return round(0.55 * base + 0.45 * min(1.0, platform), 4)
+
+    def _duration_preference(
+        self,
+        duration: float,
+        ideal_min: float,
+        ideal_max: float,
+        soft_max: float,
+    ) -> float:
+        if ideal_min <= duration <= ideal_max:
+            return 1.0
+        if duration < ideal_min:
+            return max(0.25, duration / max(ideal_min, 1.0))
+        if duration <= soft_max:
+            return max(0.35, 1.0 - ((duration - ideal_max) / max(soft_max - ideal_max, 1.0)) * 0.45)
+        return 0.25
+
+    def _pattern_bonus(
+        self,
+        text: str,
+        patterns: list[str],
+        per_match: float,
+        max_bonus: float,
+    ) -> float:
+        lowered = text.lower()
+        return min(max_bonus, sum(1 for pattern in patterns if re.search(pattern, lowered)) * per_match)
+
     def _dicts_to_clip_candidates(self, items: list[dict[str, Any]]) -> list[ClipCandidate]:
         return [
             ClipCandidate(
@@ -1758,6 +1946,8 @@ class GroqShortsPipeline:
                 title           = item["title"],
                 rationale       = item.get("rationale", ""),
                 transcript_text = item["transcript_text"],
+                target_asset_type = item.get("target_asset_type"),
+                platform_profile = item.get("platform_profile"),
             )
             for item in items
         ]
@@ -2216,6 +2406,7 @@ def generate_short_clips_from_groq(
     chunk_model: str = "openai/gpt-oss-120b",
     scorer_model: str = "openai/gpt-oss-120b",
     debug: bool = True,
+    target_asset_types: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     High-level entry point.  Accepts a Groq transcription object or plain dict.
@@ -2281,6 +2472,7 @@ def generate_short_clips_from_groq(
         words_per_caption      = words_per_caption,
         create_blur_background = create_blur_background,
         debug                  = debug,
+        target_asset_types     = target_asset_types,
     )
 
 
@@ -2297,6 +2489,7 @@ def generate_short_clips_from_youtube(
     chunk_model: str = "llama-3.3-70b-versatile",
     scorer_model: str = "llama-3.3-70b-versatile",
     debug: bool = True,
+    target_asset_types: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Convenience wrapper:  YouTube URL -> download -> clip generation.
@@ -2320,4 +2513,5 @@ def generate_short_clips_from_youtube(
         chunk_model            = chunk_model,
         scorer_model           = scorer_model,
         debug                  = debug,
+        target_asset_types     = target_asset_types,
     )
