@@ -392,14 +392,21 @@ Dimensions (0-10 each):
 4. clarity         - is it easy to follow without prior context?
 5. shareability    - would someone share this unprompted?
 6. platform_fit    - does the pacing/length suit short-form?
+7. boundary_integrity   - does the clip begin and end at natural topic boundaries?
+8. context_independence - would the clip still make sense with no surrounding video?
+9. story_arc            - does it have a setup, development, and resolved takeaway?
+10. first_three_seconds - are the first few seconds specific, clear, and compelling?
 
 Rules:
 - Completeness is the single most important factor.
+- Boundary integrity and context independence are nearly as important.
 - Duration is NOT a hard constraint; a longer complete clip beats a shorter incomplete one.
 - composite_score must reflect a weighted blend (weight completeness most heavily).
 - Penalize any clip that starts with context-dependent language like "this", "that", "so that's why", "the next thing".
 - Penalize any clip that ends with a setup but not the payoff.
+- Use context_before/context_after only to detect whether the selected clip has missing setup/payoff. Do not reward a clip for good content outside the selected boundaries.
 - Reward clips that contain a clear setup, turn, and resolved takeaway.
+- Reward clips that can be understood, captioned, and published without manual editing.
 
 Return ONLY valid JSON:
 {
@@ -412,6 +419,10 @@ Return ONLY valid JSON:
       "clarity": 0,
       "shareability": 0,
       "platform_fit": 0,
+      "boundary_integrity": 0,
+      "context_independence": 0,
+      "story_arc": 0,
+      "first_three_seconds": 0,
       "composite_score": 0.0,
       "reason": "short reason"
     }
@@ -458,13 +469,19 @@ Return ONLY valid JSON:
                                             "clarity":        {"type": "number"},
                                             "shareability":   {"type": "number"},
                                             "platform_fit":   {"type": "number"},
+                                            "boundary_integrity": {"type": "number"},
+                                            "context_independence": {"type": "number"},
+                                            "story_arc": {"type": "number"},
+                                            "first_three_seconds": {"type": "number"},
                                             "composite_score":{"type": "number"},
                                             "reason":         {"type": "string"},
                                         },
                                         "required": [
                                             "clip_id", "completeness", "hook_strength",
                                             "payoff", "clarity", "shareability",
-                                            "platform_fit", "composite_score", "reason",
+                                            "platform_fit", "boundary_integrity",
+                                            "context_independence", "story_arc",
+                                            "first_three_seconds", "composite_score", "reason",
                                         ],
                                         "additionalProperties": False,
                                     },
@@ -493,6 +510,9 @@ Return ONLY valid JSON:
                                         "hook_score": c.get("hook_score"),
                                         "payoff_score": c.get("payoff_score"),
                                         "self_contained_score": c.get("self_contained_score"),
+                                        "arc_score": c.get("arc_score"),
+                                        "context_before": c.get("context_before", ""),
+                                        "context_after": c.get("context_after", ""),
                                         "text":     c["transcript_text"],
                                     }
                                     for c in batch
@@ -539,6 +559,28 @@ Return ONLY valid JSON:
             if completeness_raw < 5.0:
                 final *= 0.60
             elif completeness_raw < 7.0:
+                final *= 0.82
+
+            boundary_integrity_raw = float(llm.get("boundary_integrity", 7.0))
+            if boundary_integrity_raw < 5.0:
+                final *= 0.52
+            elif boundary_integrity_raw < 7.0:
+                final *= 0.78
+
+            context_independence_raw = float(llm.get("context_independence", llm.get("clarity", 7.0)))
+            if context_independence_raw < 5.0:
+                final *= 0.56
+            elif context_independence_raw < 7.0:
+                final *= 0.80
+
+            story_arc_raw = float(llm.get("story_arc", 7.0))
+            if story_arc_raw < 4.5:
+                final *= 0.72
+            elif story_arc_raw < 6.5:
+                final *= 0.88
+
+            first_three_raw = float(llm.get("first_three_seconds", llm.get("hook_strength", 7.0)))
+            if first_three_raw < 4.5:
                 final *= 0.82
 
             boundary_score = float(c.get("boundary_score", 1.0))
@@ -1277,6 +1319,8 @@ class GroqShortsPipeline:
         if not text:
             return None
 
+        context_before = self._candidate_context_text(units, max(0, start_idx - 2), start_idx - 1)
+        context_after = self._candidate_context_text(units, end_idx + 1, min(len(units) - 1, end_idx + 2))
         generated_title = " ".join(text.split()[:8]).strip() or "Generated Clip"
         candidate = {
             "clip_id": str(uuid.uuid4()),
@@ -1288,6 +1332,8 @@ class GroqShortsPipeline:
             "rationale": rationale,
             "summary": summary,
             "transcript_text": text,
+            "context_before": context_before,
+            "context_after": context_after,
             "start_unit": start_idx,
             "end_unit": end_idx,
             "source": source,
@@ -1296,6 +1342,11 @@ class GroqShortsPipeline:
 
     def _candidate_text(self, units: list[dict[str, Any]], start_idx: int, end_idx: int) -> str:
         return self._clean_text(" ".join(units[i]["text"] for i in range(start_idx, end_idx + 1)))
+
+    def _candidate_context_text(self, units: list[dict[str, Any]], start_idx: int, end_idx: int) -> str:
+        if not units or start_idx < 0 or end_idx >= len(units) or start_idx > end_idx:
+            return ""
+        return self._candidate_text(units, start_idx, end_idx)
 
     def _unit_can_start_clip(self, unit: dict[str, Any]) -> bool:
         text = unit.get("text", "")
@@ -1389,7 +1440,17 @@ class GroqShortsPipeline:
         preserved = {
             key: value
             for key, value in candidate.items()
-            if key not in {"start", "end", "duration", "transcript_text", "start_unit", "end_unit", "base_score"}
+            if key not in {
+                "start",
+                "end",
+                "duration",
+                "transcript_text",
+                "context_before",
+                "context_after",
+                "start_unit",
+                "end_unit",
+                "base_score",
+            }
         }
         best.update(preserved)
         best["base_score"] = max(
@@ -1438,6 +1499,10 @@ class GroqShortsPipeline:
                 final *= 0.72
             if metrics["self_contained_score"] < 0.50:
                 final *= 0.78
+            if metrics["arc_score"] < 0.42:
+                final *= 0.82
+            if metrics["context_leak_score"] < 0.55:
+                final *= 0.76
 
             scored.append(
                 {
@@ -1458,15 +1523,23 @@ class GroqShortsPipeline:
         density = self._information_density_score(text, duration)
         self_contained = self._self_contained_score(text)
         retention = self._retention_score(text)
+        arc = self._arc_score(text)
+        novelty = self._novelty_score(text)
+        actionability = self._actionability_score(text)
+        context_leak = self._context_leak_score(text)
         duration_score = self._soft_duration_score(duration)
         editorial = (
-            0.24 * boundary
-            + 0.18 * hook
-            + 0.20 * payoff
-            + 0.13 * density
-            + 0.13 * self_contained
-            + 0.07 * retention
-            + 0.05 * duration_score
+            0.18 * boundary
+            + 0.14 * hook
+            + 0.16 * payoff
+            + 0.10 * density
+            + 0.11 * self_contained
+            + 0.08 * retention
+            + 0.09 * arc
+            + 0.05 * actionability
+            + 0.03 * novelty
+            + 0.03 * context_leak
+            + 0.03 * duration_score
         )
         return {
             "boundary_score": round(boundary, 4),
@@ -1475,6 +1548,11 @@ class GroqShortsPipeline:
             "density_score": round(density, 4),
             "self_contained_score": round(self_contained, 4),
             "retention_score": round(retention, 4),
+            "arc_score": round(arc, 4),
+            "novelty_score": round(novelty, 4),
+            "actionability_score": round(actionability, 4),
+            "context_leak_score": round(context_leak, 4),
+            "duration_score": round(duration_score, 4),
             "editorial_score": round(editorial, 4),
         }
 
@@ -1560,6 +1638,56 @@ class GroqShortsPipeline:
         ]
         return min(1.0, 0.25 + sum(1 for p in patterns if re.search(p, t)) * 0.10)
 
+    def _arc_score(self, text: str) -> float:
+        t = text.lower()
+        setup = bool(re.search(r"\b(problem|question|mistake|challenge|why|how|what if|imagine|when you)\b", t))
+        development = bool(re.search(r"\b(because|but|however|instead|then|first|second|for example|what happens)\b", t))
+        resolution = bool(re.search(r"\b(that means|that's why|the point is|so you|you can|the lesson|ultimately|remember|as a result)\b", t))
+        score = 0.18 + (0.26 if setup else 0.0) + (0.26 if development else 0.0) + (0.30 if resolution else 0.0)
+        if len(text.split()) >= 45:
+            score += 0.08
+        if self.validator.has_mid_topic_start(text) or self.validator.has_mid_topic_end(text):
+            score -= 0.22
+        return max(0.0, min(1.0, score))
+
+    def _novelty_score(self, text: str) -> float:
+        t = text.lower()
+        patterns = [
+            r"\b(counterintuitive|surprising|nobody|most people|secret|hidden|unexpected)\b",
+            r"\b(the truth|what nobody tells you|turns out|myth|mistake)\b",
+            r"\b\d+[%x]?\b",
+        ]
+        score = 0.34 + sum(1 for pattern in patterns if re.search(pattern, t)) * 0.18
+        tokens = self._tokenize(text)
+        if tokens:
+            score += min(0.18, len(set(tokens)) / max(len(tokens), 1) * 0.20)
+        return max(0.0, min(1.0, score))
+
+    def _actionability_score(self, text: str) -> float:
+        t = text.lower()
+        patterns = [
+            r"\b(here'?s how|how to|step|framework|use this|try this|do this)\b",
+            r"\b(you should|you can|you need to|start by|instead of|remember)\b",
+            r"\b(rule|lesson|takeaway|checklist|template|strategy)\b",
+        ]
+        return min(1.0, 0.30 + sum(1 for pattern in patterns if re.search(pattern, t)) * 0.18)
+
+    def _context_leak_score(self, text: str) -> float:
+        score = 1.0
+        lead = self.validator.first_words(text, 16).lower()
+        tail = self.validator.last_words(text, 16).lower()
+        if re.search(r"^(so|and|but|because|then|this|that|these|those|it|they|he|she|we)\b", lead):
+            score -= 0.28
+        if re.search(r"\b(as i said|like i said|earlier|previously|before this|next thing|the other one)\b", text.lower()):
+            score -= 0.32
+        if re.search(r"\b(and|but|because|if|when|which|so)$", tail):
+            score -= 0.30
+        if self.validator.has_mid_topic_start(text):
+            score -= 0.20
+        if self.validator.has_mid_topic_end(text) or self.validator.has_unfinished_tail(text):
+            score -= 0.24
+        return max(0.0, min(1.0, score))
+
     def _heuristic_text_score(self, text: str, duration: float) -> float:
         t = text.lower()
         hook_pats = [
@@ -1572,8 +1700,19 @@ class GroqShortsPipeline:
         ]
         hook_score   = min(1.0, sum(1 for p in hook_pats   if re.search(p, t)) * 0.22)
         payoff_score = min(1.0, sum(1 for p in payoff_pats if re.search(p, t)) * 0.20)
+        arc_score    = self._arc_score(text)
+        action_score = self._actionability_score(text)
+        context_score = self._context_leak_score(text)
         dur_score    = self._soft_duration_score(duration)
-        return round(0.45 * hook_score + 0.35 * payoff_score + 0.20 * dur_score, 4)
+        return round(
+            0.28 * hook_score
+            + 0.24 * payoff_score
+            + 0.18 * arc_score
+            + 0.12 * action_score
+            + 0.10 * context_score
+            + 0.08 * dur_score,
+            4,
+        )
 
     #
 
@@ -1653,6 +1792,8 @@ class GroqShortsPipeline:
         if self.validator.has_weak_lead(text):             reasons.append("weak_lead")
         if self.validator.has_mid_topic_start(text):       reasons.append("mid_topic_start")
         if self.validator.has_mid_topic_end(text):         reasons.append("mid_topic_end")
+        if float(c.get("context_leak_score", 1.0)) < 0.55: reasons.append("context_leak")
+        if float(c.get("arc_score", 1.0)) < 0.35:          reasons.append("weak_story_arc")
 
         # We trust LLM's has_clean_start and is_self_contained assessments,
         # but NOT has_clean_end - our text-based validators above are more
@@ -1680,6 +1821,8 @@ class GroqShortsPipeline:
             reasons.append("cta_or_outro")
         if self.validator.has_unfinished_tail(text):
             reasons.append("unfinished_tail")
+        if float(c.get("context_leak_score", 1.0)) < 0.35:
+            reasons.append("context_leak")
 
         return (len(reasons) == 0, reasons)
 
@@ -1858,15 +2001,22 @@ class GroqShortsPipeline:
         density = float(candidate.get("density_score", self._information_density_score(text, duration)))
         retention = float(candidate.get("retention_score", self._retention_score(text)))
         self_contained = float(candidate.get("self_contained_score", self._self_contained_score(text)))
+        arc = float(candidate.get("arc_score", self._arc_score(text)))
+        novelty = float(candidate.get("novelty_score", self._novelty_score(text)))
+        actionability = float(candidate.get("actionability_score", self._actionability_score(text)))
+        context_leak = float(candidate.get("context_leak_score", self._context_leak_score(text)))
 
         if profile == "tiktok":
             platform = (
-                0.28 * hook
-                + 0.22 * retention
-                + 0.18 * density
-                + 0.14 * boundary
-                + 0.10 * payoff
-                + 0.08 * self._duration_preference(duration, 12.0, 44.0, 68.0)
+                0.22 * hook
+                + 0.19 * retention
+                + 0.15 * novelty
+                + 0.13 * density
+                + 0.10 * boundary
+                + 0.08 * payoff
+                + 0.05 * context_leak
+                + 0.04 * arc
+                + 0.04 * self._duration_preference(duration, 12.0, 44.0, 68.0)
             )
             platform += self._pattern_bonus(
                 text,
@@ -1884,12 +2034,15 @@ class GroqShortsPipeline:
             )
         elif profile == "instagram_reel":
             platform = (
-                0.23 * payoff
-                + 0.20 * self_contained
-                + 0.18 * boundary
-                + 0.15 * hook
-                + 0.14 * retention
-                + 0.10 * self._duration_preference(duration, 18.0, 62.0, 88.0)
+                0.19 * payoff
+                + 0.17 * self_contained
+                + 0.14 * boundary
+                + 0.13 * actionability
+                + 0.11 * arc
+                + 0.10 * hook
+                + 0.08 * retention
+                + 0.04 * context_leak
+                + 0.04 * self._duration_preference(duration, 18.0, 62.0, 88.0)
             )
             platform += self._pattern_bonus(
                 text,
