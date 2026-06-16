@@ -45,7 +45,14 @@ You must return ONLY this JSON structure:
       "format": "string from asset_catalog",
       "input": "single atomic content idea",
       "output_type": "string from asset_catalog",
-      "goal": "clear engagement objective"
+      "goal": "clear engagement objective",
+      "source_moment": "the exact real moment this asset should be built around",
+      "evidence_quote": "short exact quote copied from transcript or moments",
+      "emotional_angle": "specific emotional tension, desire, fear, contradiction, or surprise",
+      "open_loop": "specific unanswered question the asset should create",
+      "cta_angle": "natural reason to watch the full video",
+      "must_use_details": ["specific source details that must appear if format allows"],
+      "must_avoid_claims": ["claims, assumptions, or angles that would overstate the source"]
     }
   ]
 }
@@ -63,6 +70,11 @@ PLANNING RULES:
 8. Use ONLY asset_type values present in target_assets
 9. Do NOT invent asset types, platforms, formats, or output types beyond asset_catalog
 10. Do NOT create multiple alternative tasks for the same asset_type
+11. For every task, choose ONE primary source moment and build the whole brief around it
+12. evidence_quote must be copied from the transcript or moments, not rewritten as a claim
+13. must_use_details must contain concrete source details only: names, numbers, timeframes, actions, stakes, or exact situations
+14. must_avoid_claims must name likely hallucinations or overstatements the writer should avoid
+15. open_loop must be specific to the source moment, not a vague "find out what happened"
 
 ---
 

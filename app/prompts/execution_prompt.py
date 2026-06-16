@@ -25,6 +25,9 @@ INPUT:
 GOAL:
 {goal}
 
+STRATEGY_BRIEF:
+{strategy_brief}
+
 FEEDBACK:
 {feedback}
 
@@ -90,8 +93,13 @@ CRITICAL CONSTRAINT:
 - Specificity > creativity
 
 CONTENT STRATEGY:
-- Identify the most emotional / surprising / painful moment
-- Build the hook around THAT moment
+- Treat STRATEGY_BRIEF as the primary creative brief for this asset.
+- Build around the selected source_moment and evidence_quote.
+- Use emotional_angle to shape the hook and opening tension.
+- Use open_loop to decide what to leave unresolved.
+- Use cta_angle for a natural transition to the full video.
+- Include must_use_details when the format allows.
+- Avoid anything listed in must_avoid_claims.
 - Do NOT generalize into abstract ideas
 
 STRICT REQUIREMENTS:
@@ -131,6 +139,15 @@ def build_execution_user_prompt(
         "status": "not_available",
         "style_summary": "No persisted creator voice profile is stored for this creator yet.",
     }
+    strategy_brief = task.get("strategy_brief") or {
+        "source_moment": task.get("source_moment", ""),
+        "evidence_quote": task.get("evidence_quote", ""),
+        "emotional_angle": task.get("emotional_angle", ""),
+        "open_loop": task.get("open_loop", ""),
+        "cta_angle": task.get("cta_angle", ""),
+        "must_use_details": task.get("must_use_details", []),
+        "must_avoid_claims": task.get("must_avoid_claims", []),
+    }
 
     return EXECUTION_PROMPT.format(
         platform=task["platform"],
@@ -138,6 +155,11 @@ def build_execution_user_prompt(
         format=task.get("format", task.get("output_type", "")),
         input=task["input"],
         goal=task["goal"],
+        strategy_brief=json.dumps(
+            strategy_brief,
+            indent=2,
+            ensure_ascii=False,
+        ),
         feedback=json.dumps(task.get("feedback", []), ensure_ascii=False),
         source=source,
         creator_voice_profile=json.dumps(
