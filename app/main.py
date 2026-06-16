@@ -8,6 +8,7 @@ from app.api.routes.auth import router as auth_router
 from app.api.routes.billing import router as billing_router
 from app.api.routes.generation import GENERATED_CLIPS_DIR, router as generation_router
 from app.api.routes.integrations import router as integrations_router
+from app.api.routes.scheduled_posts import router as scheduled_posts_router
 from app.api.routes.system import router as system_router
 from app.api.routes.voice_profiles import router as voice_profiles_router
 from app.api.services import creator_voice_profile_service
@@ -32,6 +33,7 @@ app.include_router(billing_router)
 app.include_router(generation_router)
 app.include_router(voice_profiles_router)
 app.include_router(integrations_router)
+app.include_router(scheduled_posts_router)
 app.include_router(system_router)
 
 
