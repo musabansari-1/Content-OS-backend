@@ -181,6 +181,7 @@ Voice drift must reduce score significantly.
 - Does the formatting suit the asset?
 
 mandatory Checks to be made for each asset type:
+- x_post -> single post only, under 280 characters, concrete source-grounded hook, one clear tension or insight, no thread formatting
 - twitter_thread → strong hook, progression across tweets, open loop, reply bait
 - linkedin_post → professional narrative, insight-led, scannable structure
 - instagram_carousel → slide-by-slide progression, each slide earns the next swipe
@@ -227,6 +228,17 @@ mandatory Checks to be made for each asset type:
   - CTA is present:
       * natural, low-friction, non-salesy
       * feels like continuation, not promotion
+- x_post ->
+  - output contains one publishable post, not multiple posts or a thread
+  - post is 280 characters or fewer
+  - hook starts from a concrete source detail, tension, or firsthand moment
+  - preserves one specific source detail without overstating it
+  - makes one clear point; no listicle, mini-essay, or generic advice
+  - leaves a specific open loop tied to the source
+  - sounds like the creator's natural thought compressed for X
+  - avoids engagement bait, forced hot takes, fake certainty, and generic viral-account phrasing
+  - hashtags are absent unless directly justified by the source
+  - CTA is natural and does not invent a URL
 - youtube_video_idea → strong title, thumbnail angle, retention-driven outline
 - instagram_reel →
 

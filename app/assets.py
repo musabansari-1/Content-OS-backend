@@ -1,4 +1,12 @@
 AVAILABLE_TARGET_ASSETS = {
+    "x_post": {
+        "asset_type": "x_post",
+        "platform": "x",
+        "format": "single_post",
+        "output_type": "post",
+        "label": "X Post",
+        "description": "A concise, source-grounded single post tailored for X.",
+    },
     "twitter_thread": {
         "asset_type": "twitter_thread",
         "platform": "twitter",

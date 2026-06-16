@@ -34,6 +34,13 @@ If platform == "twitter":
 - DO NOT resolve story fully
 - Last tweet = curiosity CTA
 
+If platform == "x":
+- Single post only; do not turn it into a thread
+- Keep the post under 280 characters
+- Lead with one concrete, source-grounded tension
+- Leave one specific open loop
+- CTA must feel like a natural continuation, not an ad
+
 If platform == "linkedin":
 - Start with a strong personal insight or tension
 - Keep authority tone but emotional undertone

@@ -15,6 +15,7 @@ from app.prompts.newsletter_prompt import NEWSLETTER_PROMPT
 from app.prompts.reddit_post_prompt import REDDIT_POST_PROMPT
 from app.prompts.tiktok_prompt import TIKTOK_PROMPT
 from app.prompts.twitter_prompt import TWITTER_PROMPT
+from app.prompts.x_post_prompt import X_POST_PROMPT
 from app.prompts.youtube_prompt import YOUTUBE_PROMPT
 from app.utils.llm import call_llm
 from app.voice_engine.service import CreatorVoiceProfileService
@@ -64,6 +65,9 @@ def execute_task(task, source, creator_voice_profile=None):
 
     if asset_type == "twitter_thread":
         return call_llm(TWITTER_PROMPT, user_prompt)
+
+    if asset_type == "x_post":
+        return call_llm(X_POST_PROMPT, user_prompt)
 
     if asset_type == "tiktok_clip":
         return call_llm(TIKTOK_PROMPT, user_prompt)
