@@ -35,7 +35,7 @@ SOURCE:
 {source}
 """
 
-    response = call_llm(CRITIC_PROMPT, user_prompt)
+    response = call_llm(CRITIC_PROMPT, user_prompt, stage="critic")
 
     try:
         return json.loads(response)

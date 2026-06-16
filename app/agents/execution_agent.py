@@ -31,7 +31,7 @@ def optimize_for_conversion(output, platform, critique):
         }
     )
 
-    return call_llm(CONVERSION_PROMPT, payload)
+    return call_llm(CONVERSION_PROMPT, payload, stage="conversion")
 
 
 def parse_llm_output(response):
@@ -64,34 +64,34 @@ def execute_task(task, source, creator_voice_profile=None):
     user_prompt = build_execution_user_prompt(task, source, creator_voice_profile)
 
     if asset_type == "twitter_thread":
-        return call_llm(TWITTER_PROMPT, user_prompt)
+        return call_llm(TWITTER_PROMPT, user_prompt, stage="writer")
 
     if asset_type == "x_post":
-        return call_llm(X_POST_PROMPT, user_prompt)
+        return call_llm(X_POST_PROMPT, user_prompt, stage="writer")
 
     if asset_type == "tiktok_clip":
-        return call_llm(TIKTOK_PROMPT, user_prompt)
+        return call_llm(TIKTOK_PROMPT, user_prompt, stage="writer")
 
     if asset_type == "linkedin_post":
-        return call_llm(LINKEDIN_PROMPT, user_prompt)
+        return call_llm(LINKEDIN_PROMPT, user_prompt, stage="writer")
 
     if asset_type == "youtube_video_idea":
-        return call_llm(YOUTUBE_PROMPT, user_prompt)
+        return call_llm(YOUTUBE_PROMPT, user_prompt, stage="writer")
 
     if asset_type == "instagram_carousel":
-        return call_llm(INSTAGRAM_CAROUSEL_PROMPT, user_prompt)
+        return call_llm(INSTAGRAM_CAROUSEL_PROMPT, user_prompt, stage="writer")
 
     if asset_type == "instagram_reel":
-        return call_llm(INSTAGRAM_REEL_PROMPT, user_prompt)
+        return call_llm(INSTAGRAM_REEL_PROMPT, user_prompt, stage="writer")
 
     if asset_type == "blog_post":
-        return call_llm(BLOG_POST_PROMPT, user_prompt)
+        return call_llm(BLOG_POST_PROMPT, user_prompt, stage="writer")
 
     if asset_type == "reddit_post":
-        return call_llm(REDDIT_POST_PROMPT, user_prompt)
+        return call_llm(REDDIT_POST_PROMPT, user_prompt, stage="writer")
 
     if asset_type == "newsletter":
-        return call_llm(NEWSLETTER_PROMPT, user_prompt)
+        return call_llm(NEWSLETTER_PROMPT, user_prompt, stage="writer")
 
     raise ValueError(f"Unsupported asset type: {asset_type}")
 

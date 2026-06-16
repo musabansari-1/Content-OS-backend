@@ -73,6 +73,7 @@ def generate_strategy(input_data):
     response = call_llm(
         STRATEGY_PROMPT,
         json.dumps(input_data),
+        stage="strategy",
     )
 
     return json.dumps(_normalize_execution_plan(response, input_data))
