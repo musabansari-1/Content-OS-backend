@@ -61,7 +61,7 @@ client = OpenAI(
 )
 
 
-DEFAULT_LLM_MODEL = "openai/gpt-oss-120b:free"
+DEFAULT_LLM_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 
 LLM_STAGE_SETTINGS = {
     "default": {"temperature": 0.7, "model": DEFAULT_LLM_MODEL},
