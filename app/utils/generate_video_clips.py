@@ -38,6 +38,12 @@ Quality upgrades (v5):
   - Repairs clip boundaries before scoring so clips start/end on complete thoughts
   - Adds editorial scoring for hook, payoff, density, boundary quality, and self-containment
   - Uses MMR-style selection for quality plus diversity instead of simple top-N
+
+Completeness upgrades (v6):
+  - Boundary repair expands starts backward and ends forward until the whole
+    selected text is standalone, not just grammatically punctuated
+  - Relaxed/lenient fallbacks still reject mid-topic starts and unresolved ends
+  - Final FFmpeg render bounds snap outward to word timestamps when available
 """
 
 from __future__ import annotations
@@ -230,7 +236,32 @@ class BoundaryValidator:
     def has_mid_topic_end(self, text: str) -> bool:
         """Catches endings that set up a 'what comes next', making the clip feel unresolved."""
         tail = self.last_words(text, 12).lower()
-        return any(re.search(p, tail) for p in self.MID_TOPIC_END_PATTERNS)
+        return any(re.search(p, tail) for p in self.MID_TOPIC_END_PATTERNS) or self.has_unfulfilled_list_setup(text)
+
+    def has_unfulfilled_list_setup(self, text: str) -> bool:
+        t = self.normalize(text).lower()
+        match = re.search(
+            r"\bthere (?:are|is) (two|three|four|five|2|3|4|5)\s+"
+            r"(reasons|things|ways|steps|parts|points)\b",
+            t,
+        )
+        if not match:
+            return False
+
+        count_map = {"two": 2, "three": 3, "four": 4, "five": 5, "2": 2, "3": 3, "4": 4, "5": 5}
+        expected_count = count_map.get(match.group(1), 0)
+        if expected_count <= 1:
+            return False
+
+        after_setup = t[match.end() :]
+        ordinal_patterns = {
+            2: r"\b(second|number two|2nd)\b",
+            3: r"\b(third|number three|3rd)\b",
+            4: r"\b(fourth|number four|4th)\b",
+            5: r"\b(fifth|number five|5th)\b",
+        }
+        required_pattern = ordinal_patterns.get(expected_count)
+        return bool(required_pattern and not re.search(required_pattern, after_setup))
 
     def complete_enough(self, text: str) -> bool:
         return (
@@ -241,6 +272,7 @@ class BoundaryValidator:
             and not self.has_weak_lead(text)
             and not self.has_mid_topic_start(text)
             and not self.has_mid_topic_end(text)
+            and not self.has_unfulfilled_list_setup(text)
         )
 
 
@@ -673,6 +705,10 @@ class GroqShortsPipeline:
     IDEAL_MAX_DURATION = 72.0
     MAX_CLIP_DURATION = 135.0
     MAX_POOL_SIZE = 90
+    MAX_BOUNDARY_REPAIR_SECONDS = 32.0
+    MAX_BOUNDARY_REPAIR_UNITS = 6
+    RENDER_LEAD_PAD_SECONDS = 0.35
+    RENDER_TRAIL_PAD_SECONDS = 0.65
 
     def __init__(
         self,
@@ -747,7 +783,7 @@ class GroqShortsPipeline:
 
         video_meta = self._probe_video(str(source_video))
         logger.info("Video metadata: %s", video_meta)
-        units      = self._build_units(transcript["segments"])
+        units      = self._build_units(transcript["segments"], transcript["words"])
         logger.info("Built transcript units: count=%s", len(units))
         if not units:
             raise ValueError("Transcription did not produce any usable clip units.")
@@ -815,11 +851,11 @@ class GroqShortsPipeline:
             clip_path  = clips_dir / f"{idx:02d}-{safe_name}.mp4"
             sub_path   = subs_dir  / f"{idx:02d}-{safe_name}.ass"
             video_duration = float(video_meta.get("duration") or 0.0)
-            clip_start = max(0.0, candidate.start - 0.12)
-            clip_end = candidate.end + 0.22
-            if video_duration > 0:
-                clip_start = min(clip_start, video_duration)
-                clip_end = min(clip_end, video_duration)
+            clip_start, clip_end = self._render_bounds_for_candidate(
+                candidate=candidate,
+                words=transcript["words"],
+                video_duration=video_duration,
+            )
             if clip_end <= clip_start:
                 error = {
                     "clip_id": candidate.clip_id,
@@ -1039,35 +1075,18 @@ class GroqShortsPipeline:
 
     #
 
-    def _build_units(self, segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _build_units(
+        self,
+        segments: list[dict[str, Any]],
+        words: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
         """
         Build sentence/thought units that are small enough for precise clipping
         and large enough for the LLM to reason about complete ideas.
         """
-        atoms: list[dict[str, Any]] = []
-        for seg in segments:
-            text  = seg["text"].strip()
-            start = float(seg["start"])
-            end   = float(seg["end"])
-            if not text:
-                continue
-
-            parts = self._split_text_sentences(text)
-            total_words = sum(max(1, len(part.split())) for part in parts)
-            cursor = start
-            duration = max(0.01, end - start)
-            for idx, part in enumerate(parts):
-                part_words = max(1, len(part.split()))
-                part_duration = duration * (part_words / max(1, total_words))
-                part_end = end if idx == len(parts) - 1 else min(end, cursor + part_duration)
-                atoms.append(
-                    {
-                        "start": round(cursor, 2),
-                        "end": round(part_end, 2),
-                        "text": part.strip(),
-                    }
-                )
-                cursor = part_end
+        atoms = self._sentence_atoms_from_words(words or [])
+        if not atoms:
+            atoms = self._sentence_atoms_from_segments(segments)
 
         if not atoms:
             return []
@@ -1129,6 +1148,76 @@ class GroqShortsPipeline:
 
         return units
 
+    def _sentence_atoms_from_segments(self, segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        atoms: list[dict[str, Any]] = []
+        for seg in segments:
+            text = seg["text"].strip()
+            start = float(seg["start"])
+            end = float(seg["end"])
+            if not text:
+                continue
+
+            parts = self._split_text_sentences(text)
+            total_words = sum(max(1, len(part.split())) for part in parts)
+            cursor = start
+            duration = max(0.01, end - start)
+            for idx, part in enumerate(parts):
+                part_words = max(1, len(part.split()))
+                part_duration = duration * (part_words / max(1, total_words))
+                part_end = end if idx == len(parts) - 1 else min(end, cursor + part_duration)
+                atoms.append(
+                    {
+                        "start": round(cursor, 2),
+                        "end": round(part_end, 2),
+                        "text": part.strip(),
+                    }
+                )
+                cursor = part_end
+        return atoms
+
+    def _sentence_atoms_from_words(self, words: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        timed_words = [
+            word
+            for word in sorted(words, key=self._word_start)
+            if str(word.get("word") or "").strip() and self._word_end(word) > self._word_start(word)
+        ]
+        if not timed_words:
+            return []
+
+        atoms: list[dict[str, Any]] = []
+        current: list[dict[str, Any]] = []
+
+        for word in timed_words:
+            if current:
+                gap = self._word_start(word) - self._word_end(current[-1])
+                current_duration = self._word_end(current[-1]) - self._word_start(current[0])
+                previous_token = str(current[-1].get("word") or "")
+                if gap >= 1.15 and current_duration >= 4.0 and self._word_ends_sentence(previous_token):
+                    atoms.append(self._word_group_to_atom(current))
+                    current = []
+
+            current.append(word)
+            token = str(word.get("word") or "")
+            if self._word_ends_sentence(token):
+                atoms.append(self._word_group_to_atom(current))
+                current = []
+
+        if current:
+            atoms.append(self._word_group_to_atom(current))
+
+        return atoms
+
+    def _word_group_to_atom(self, words: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "start": round(self._word_start(words[0]), 2),
+            "end": round(self._word_end(words[-1]), 2),
+            "text": self._clean_text(" ".join(str(word.get("word") or "") for word in words)),
+        }
+
+    @staticmethod
+    def _word_ends_sentence(token: str) -> bool:
+        return bool(re.search(r"[.?!][\"')\]]*$", (token or "").strip()))
+
     def _split_text_sentences(self, text: str) -> list[str]:
         text = self._clean_text(text)
         if not text:
@@ -1178,9 +1267,9 @@ class GroqShortsPipeline:
             if start_idx < 0 or end_idx >= len(units) or start_idx > end_idx:
                 continue
 
-            # Extend end_idx forward to the next clean sentence boundary if the
-            # LLM-chosen end unit doesn't end with sentence-final punctuation.
-            end_idx = self._extend_to_clean_end(end_idx, units)
+            # Extend the LLM boundary to a resolved ending for the whole clip,
+            # not merely to the next punctuation mark.
+            end_idx = self._extend_to_clean_end(start_idx, end_idx, units)
 
             candidate = self._candidate_from_units(
                 units=units,
@@ -1222,30 +1311,28 @@ class GroqShortsPipeline:
 
     def _extend_to_clean_end(
         self,
+        start_idx: int,
         end_idx: int,
         units: list[dict[str, Any]],
-        max_extra_seconds: float = 15.0,
-        max_extra_units: int = 3,
+        max_extra_seconds: float | None = None,
+        max_extra_units: int | None = None,
     ) -> int:
         """
-        If the clip's last unit does not end with sentence-final punctuation,
-        scan forward up to max_extra_units to find a unit that does.
+        Scan forward until the selected window has a resolved ending.
 
-        This fixes the most common case of mid-topic endings: the LLM picks
-        a clean-ish boundary but the last unit ran up against the 20s hard cap
-        mid-sentence, so the clip sounds cut off.
-
-        Never extends by more than max_extra_seconds.
-        Never extends into a unit that itself ends mid-topic.
+        A punctuation-only check is not enough: "there are three reasons." is
+        grammatical, but still needs the reasons before the clip can stand alone.
         Returns the original end_idx if no better boundary is found.
         """
-        # Already ends cleanly - nothing to do
-        if re.search(r"[.?!]\s*$", units[end_idx]["text"].strip()):
+        if start_idx < 0 or end_idx >= len(units) or start_idx > end_idx:
             return end_idx
 
+        max_extra_seconds = self.MAX_BOUNDARY_REPAIR_SECONDS if max_extra_seconds is None else max_extra_seconds
+        max_extra_units = self.MAX_BOUNDARY_REPAIR_UNITS if max_extra_units is None else max_extra_units
         base_end_time = float(units[end_idx]["end"])
+        best_idx: int | None = None
 
-        for lookahead in range(1, max_extra_units + 1):
+        for lookahead in range(0, max_extra_units + 1):
             next_idx = end_idx + lookahead
             if next_idx >= len(units):
                 break
@@ -1253,17 +1340,15 @@ class GroqShortsPipeline:
             extra_seconds = float(units[next_idx]["end"]) - base_end_time
             if extra_seconds > max_extra_seconds:
                 break
+            if float(units[next_idx]["end"]) - float(units[start_idx]["start"]) > self.MAX_CLIP_DURATION:
+                break
 
-            unit_text = units[next_idx]["text"].strip()
-
-            # This unit ends with sentence-final punctuation
-            if re.search(r"[.?!]\s*$", unit_text):
-                # Make sure extending here doesn't introduce a mid-topic ending
-                if not self.validator.has_mid_topic_end(unit_text):
+            if self._candidate_end_is_resolved(units, start_idx, next_idx):
+                best_idx = next_idx
+                if self._candidate_is_standalone_window(units, start_idx, next_idx):
                     return next_idx
 
-        # No cleaner boundary found - return original
-        return end_idx
+        return best_idx if best_idx is not None else end_idx
 
     #
 
@@ -1348,6 +1433,53 @@ class GroqShortsPipeline:
             return ""
         return self._candidate_text(units, start_idx, end_idx)
 
+    def _candidate_start_is_standalone(self, units: list[dict[str, Any]], start_idx: int, end_idx: int) -> bool:
+        if start_idx < 0 or end_idx >= len(units) or start_idx > end_idx:
+            return False
+        text = self._candidate_text(units, start_idx, end_idx)
+        unit_text = units[start_idx].get("text", "")
+        return (
+            self._unit_can_start_clip(units[start_idx])
+            and self.validator.is_valid_start(text)
+            and not self.validator.has_mid_topic_start(text)
+            and not self.validator.has_weak_lead(text)
+            and not re.search(
+                r"^(this|that|these|those|it|they|he|she|we)\b",
+                self.validator.first_words(text, 14).lower(),
+            )
+            and not re.search(
+                r"^(this|that|these|those|it|they|he|she|we)\b",
+                self.validator.first_words(unit_text, 14).lower(),
+            )
+        )
+
+    def _candidate_end_is_resolved(self, units: list[dict[str, Any]], start_idx: int, end_idx: int) -> bool:
+        if start_idx < 0 or end_idx >= len(units) or start_idx > end_idx:
+            return False
+        text = self._candidate_text(units, start_idx, end_idx)
+        return (
+            self._unit_can_end_clip(units[end_idx])
+            and self.validator.is_valid_end(text)
+            and not self.validator.has_unfinished_tail(text)
+            and not self.validator.has_mid_topic_end(text)
+            and self._payoff_score(text) >= 0.55
+        )
+
+    def _candidate_is_standalone_window(self, units: list[dict[str, Any]], start_idx: int, end_idx: int) -> bool:
+        if start_idx < 0 or end_idx >= len(units) or start_idx > end_idx:
+            return False
+        duration = float(units[end_idx]["end"]) - float(units[start_idx]["start"])
+        if duration < self.MIN_CLIP_DURATION or duration > self.MAX_CLIP_DURATION:
+            return False
+        text = self._candidate_text(units, start_idx, end_idx)
+        return (
+            self._candidate_start_is_standalone(units, start_idx, end_idx)
+            and self._candidate_end_is_resolved(units, start_idx, end_idx)
+            and not self.validator.looks_like_cta_or_outro(text)
+            and self._self_contained_score(text) >= 0.62
+            and self._context_leak_score(text) >= 0.62
+        )
+
     def _unit_can_start_clip(self, unit: dict[str, Any]) -> bool:
         text = unit.get("text", "")
         if (
@@ -1409,33 +1541,75 @@ class GroqShortsPipeline:
 
         best: dict[str, Any] | None = None
         best_score = -1.0
-        for s in range(max(0, start_idx - 2), min(len(units), start_idx + 3)):
+        standalone_best: dict[str, Any] | None = None
+        standalone_best_score = -1.0
+
+        search_start_min = max(0, start_idx - self.MAX_BOUNDARY_REPAIR_UNITS)
+        search_start_max = min(len(units), start_idx + 1)
+        search_end_max = min(len(units), end_idx + self.MAX_BOUNDARY_REPAIR_UNITS + 1)
+
+        for s in range(search_start_min, search_start_max):
             if s > end_idx:
                 break
-            for e in range(max(s, end_idx), min(len(units), end_idx + 4)):
+            for e in range(max(s, end_idx), search_end_max):
                 duration = float(units[e]["end"]) - float(units[s]["start"])
                 if duration < self.MIN_CLIP_DURATION or duration > self.MAX_CLIP_DURATION:
                     continue
+                if float(units[e]["end"]) - float(units[end_idx]["end"]) > self.MAX_BOUNDARY_REPAIR_SECONDS:
+                    break
+                if float(units[start_idx]["start"]) - float(units[s]["start"]) > self.MAX_BOUNDARY_REPAIR_SECONDS:
+                    continue
+
                 text = self._candidate_text(units, s, e)
                 boundary_score = self._boundary_score(text)
-                end_bonus = 0.08 if self._unit_can_end_clip(units[e]) else 0.0
-                start_bonus = 0.08 if self._unit_can_start_clip(units[s]) else 0.0
+                start_ok = self._candidate_start_is_standalone(units, s, e)
+                end_ok = self._candidate_end_is_resolved(units, s, e)
+                standalone = self._candidate_is_standalone_window(units, s, e)
+                end_bonus = 0.14 if end_ok else -0.18
+                start_bonus = 0.14 if start_ok else -0.18
                 duration_bonus = self._soft_duration_score(duration) * 0.08
-                score = boundary_score + start_bonus + end_bonus + duration_bonus
+                self_contained_bonus = self._self_contained_score(text) * 0.08
+                context_bonus = self._context_leak_score(text) * 0.08
+                repair_penalty = abs(start_idx - s) * 0.012 + abs(e - end_idx) * 0.008
+                score = (
+                    boundary_score
+                    + start_bonus
+                    + end_bonus
+                    + duration_bonus
+                    + self_contained_bonus
+                    + context_bonus
+                    - repair_penalty
+                )
+                if standalone:
+                    score += 0.40
+
+                built = self._candidate_from_units(
+                    units=units,
+                    start_idx=s,
+                    end_idx=e,
+                    source=candidate.get("source", "candidate"),
+                    title=candidate.get("title"),
+                    rationale=candidate.get("rationale", ""),
+                    summary=candidate.get("summary", ""),
+                )
+                if not built:
+                    continue
+
                 if score > best_score:
                     best_score = score
-                    best = self._candidate_from_units(
-                        units=units,
-                        start_idx=s,
-                        end_idx=e,
-                        source=candidate.get("source", "candidate"),
-                        title=candidate.get("title"),
-                        rationale=candidate.get("rationale", ""),
-                        summary=candidate.get("summary", ""),
-                    )
+                    best = built
+                if standalone and score > standalone_best_score:
+                    standalone_best_score = score
+                    standalone_best = built
 
+        best = standalone_best or best
         if not best:
             return None
+
+        if not standalone_best:
+            relaxed_ok, _ = self._passes_relaxed(best)
+            if not relaxed_ok:
+                return None
 
         preserved = {
             key: value
@@ -1450,6 +1624,7 @@ class GroqShortsPipeline:
                 "start_unit",
                 "end_unit",
                 "base_score",
+                "llm_boundary_flags",
             }
         }
         best.update(preserved)
@@ -1457,6 +1632,23 @@ class GroqShortsPipeline:
             float(candidate.get("base_score", 0.0)),
             self._heuristic_text_score(best["transcript_text"], float(best["duration"])),
         )
+        best["llm_boundary_flags"] = {
+            "has_clean_start": self._candidate_start_is_standalone(
+                units,
+                int(best["start_unit"]),
+                int(best["end_unit"]),
+            ),
+            "has_clean_end": self._candidate_end_is_resolved(
+                units,
+                int(best["start_unit"]),
+                int(best["end_unit"]),
+            ),
+            "is_self_contained": self._candidate_is_standalone_window(
+                units,
+                int(best["start_unit"]),
+                int(best["end_unit"]),
+            ),
+        }
         if int(best["start_unit"]) != start_idx or int(best["end_unit"]) != end_idx:
             best["boundary_repaired"] = True
             best["original_start_unit"] = start_idx
@@ -1596,6 +1788,7 @@ class GroqShortsPipeline:
             r"\btherefore\b", r"\bultimately\b", r"\bin the end\b",
             r"\bwhat matters\b", r"\bthe lesson\b", r"\bthat means\b",
             r"\bas a result\b", r"\bin reality\b", r"\bremember\b",
+            r"\b(the fix|the answer|the solution|here'?s the fix)\b",
         ]
         score += min(0.45, sum(1 for p in patterns if re.search(p, tail)) * 0.15)
         if not self.validator.has_mid_topic_end(text) and not self.validator.has_unfinished_tail(text):
@@ -1642,7 +1835,7 @@ class GroqShortsPipeline:
         t = text.lower()
         setup = bool(re.search(r"\b(problem|question|mistake|challenge|why|how|what if|imagine|when you)\b", t))
         development = bool(re.search(r"\b(because|but|however|instead|then|first|second|for example|what happens)\b", t))
-        resolution = bool(re.search(r"\b(that means|that's why|the point is|so you|you can|the lesson|ultimately|remember|as a result)\b", t))
+        resolution = bool(re.search(r"\b(that means|that's why|the point is|so you|you can|the lesson|ultimately|remember|as a result|the fix|the answer|the solution)\b", t))
         score = 0.18 + (0.26 if setup else 0.0) + (0.26 if development else 0.0) + (0.30 if resolution else 0.0)
         if len(text.split()) >= 45:
             score += 0.08
@@ -1668,7 +1861,7 @@ class GroqShortsPipeline:
         patterns = [
             r"\b(here'?s how|how to|step|framework|use this|try this|do this)\b",
             r"\b(you should|you can|you need to|start by|instead of|remember)\b",
-            r"\b(rule|lesson|takeaway|checklist|template|strategy)\b",
+            r"\b(rule|lesson|takeaway|checklist|template|strategy|fix|solution)\b",
         ]
         return min(1.0, 0.30 + sum(1 for pattern in patterns if re.search(pattern, t)) * 0.18)
 
@@ -1697,6 +1890,7 @@ class GroqShortsPipeline:
         payoff_pats = [
             r"\bthe point is\b", r"\bthat's because\b", r"\bin reality\b",
             r"\bhere's how\b", r"\bthis is called\b", r"\bthat means\b", r"\bas a result\b",
+            r"\b(the fix|the answer|the solution)\b",
         ]
         hook_score   = min(1.0, sum(1 for p in hook_pats   if re.search(p, t)) * 0.22)
         payoff_score = min(1.0, sum(1 for p in payoff_pats if re.search(p, t)) * 0.20)
@@ -1817,11 +2011,21 @@ class GroqShortsPipeline:
             reasons.append("bad_start")
         if not self._has_reasonable_end(text):
             reasons.append("bad_end")
+        if self.validator.has_weak_lead(text):
+            reasons.append("weak_lead")
+        if self.validator.has_mid_topic_start(text):
+            reasons.append("mid_topic_start")
+        if self.validator.has_mid_topic_end(text):
+            reasons.append("mid_topic_end")
         if self.validator.looks_like_cta_or_outro(text):
             reasons.append("cta_or_outro")
         if self.validator.has_unfinished_tail(text):
             reasons.append("unfinished_tail")
-        if float(c.get("context_leak_score", 1.0)) < 0.35:
+        if float(c.get("self_contained_score", self._self_contained_score(text))) < 0.55:
+            reasons.append("not_self_contained")
+        if float(c.get("payoff_score", self._payoff_score(text))) < 0.55:
+            reasons.append("weak_payoff")
+        if float(c.get("context_leak_score", self._context_leak_score(text))) < 0.55:
             reasons.append("context_leak")
 
         return (len(reasons) == 0, reasons)
@@ -1837,9 +2041,21 @@ class GroqShortsPipeline:
             reasons.append("too_short_text")
         if not re.search(r"[.?!]$", text):
             reasons.append("no_terminal_punctuation")
+        if self.validator.has_mid_topic_start(text):
+            reasons.append("mid_topic_start")
+        if self.validator.has_mid_topic_end(text):
+            reasons.append("mid_topic_end")
+        if self.validator.has_unfinished_tail(text):
+            reasons.append("unfinished_tail")
+        if self.validator.looks_like_cta_or_outro(text):
+            reasons.append("cta_or_outro")
+        if self._context_leak_score(text) < 0.50:
+            reasons.append("context_leak")
+        if self._payoff_score(text) < 0.50:
+            reasons.append("weak_payoff")
 
         lead = self.validator.first_words(text, 8).lower()
-        if re.search(r"^(and|but|because|which)\b", lead):
+        if re.search(r"^(and|but|because|which|this|that|these|those|it|they|he|she|we)\b", lead):
             reasons.append("fragment_start")
 
         tail = self.validator.last_words(text, 8).lower()
@@ -2104,6 +2320,88 @@ class GroqShortsPipeline:
             )
             for item in items
         ]
+
+    def _render_bounds_for_candidate(
+        self,
+        candidate: ClipCandidate,
+        words: list[dict[str, Any]],
+        video_duration: float,
+    ) -> tuple[float, float]:
+        clip_start = max(0.0, candidate.start)
+        clip_end = candidate.end
+
+        if words:
+            boundary_tolerance = 0.06
+            matching_words = [
+                word
+                for word in words
+                if self._word_start(word) >= candidate.start - boundary_tolerance
+                and self._word_start(word) < candidate.end + boundary_tolerance
+            ]
+            if matching_words:
+                first_word_start = self._word_start(matching_words[0])
+                last_word_end = self._word_end(matching_words[-1])
+                previous_word_end = self._previous_word_end(words, first_word_start)
+                next_word_start = self._next_word_start(words, last_word_end)
+
+                lead_pad = self._safe_lead_pad(first_word_start, previous_word_end)
+                trail_pad = self._safe_trail_pad(last_word_end, next_word_start)
+                clip_start = max(0.0, first_word_start - lead_pad)
+                clip_end = max(candidate.end, last_word_end + trail_pad)
+        else:
+            clip_start = max(0.0, candidate.start - 0.04)
+            clip_end = candidate.end + 0.08
+
+        if video_duration > 0:
+            clip_start = min(clip_start, video_duration)
+            clip_end = min(clip_end, video_duration)
+        return round(clip_start, 3), round(clip_end, 3)
+
+    def _previous_word_end(self, words: list[dict[str, Any]], first_word_start: float) -> float | None:
+        previous_ends = [
+            self._word_end(word)
+            for word in words
+            if self._word_end(word) <= first_word_start
+        ]
+        return max(previous_ends) if previous_ends else None
+
+    def _next_word_start(self, words: list[dict[str, Any]], last_word_end: float) -> float | None:
+        next_starts = [
+            self._word_start(word)
+            for word in words
+            if self._word_start(word) >= last_word_end
+        ]
+        return min(next_starts) if next_starts else None
+
+    def _safe_lead_pad(self, first_word_start: float, previous_word_end: float | None) -> float:
+        if previous_word_end is None:
+            return min(self.RENDER_LEAD_PAD_SECONDS, first_word_start)
+        gap = max(0.0, first_word_start - previous_word_end)
+        if gap < 0.18:
+            return 0.0
+        return min(self.RENDER_LEAD_PAD_SECONDS, max(0.0, gap - 0.08))
+
+    def _safe_trail_pad(self, last_word_end: float, next_word_start: float | None) -> float:
+        if next_word_start is None:
+            return self.RENDER_TRAIL_PAD_SECONDS
+        gap = max(0.0, next_word_start - last_word_end)
+        if gap < 0.18:
+            return 0.04
+        return min(self.RENDER_TRAIL_PAD_SECONDS, max(0.04, gap - 0.08))
+
+    @staticmethod
+    def _word_start(word: dict[str, Any]) -> float:
+        try:
+            return float(word.get("start", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _word_end(word: dict[str, Any]) -> float:
+        try:
+            return float(word.get("end", word.get("start", 0.0)))
+        except (TypeError, ValueError):
+            return 0.0
 
     #
 
