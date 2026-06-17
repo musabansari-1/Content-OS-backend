@@ -386,6 +386,8 @@ def get_connected_platforms_for_user(*, user_id: int) -> dict:
         "connected_platforms": platforms,
         "connected_platform_ids": platform_ids,
         "linkedin_connected": "linkedin" in platforms,
+        "instagram_connected": "instagram" in platforms,
         "x_connected": "x" in platforms,
         "tiktok_connected": "tiktok" in platforms,
+        "ghost_connected": "ghost" in platforms,
     }

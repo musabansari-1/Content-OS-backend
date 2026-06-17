@@ -1,9 +1,15 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+import httpx
 from pydantic import BaseModel, Field
 
 from app.auth.dependencies import require_current_user
 from app.auth.domain import AuthUser
 from app.billing.service import ensure_can_direct_publish, record_direct_publish
+from app.services.ghost_service import (
+    connect_ghost_site_for_user,
+    list_ghost_newsletters_for_user,
+    publish_ghost_asset_for_user,
+)
 from app.services.instagram_service import (
     handle_instagram_callback,
     publish_instagram_asset_for_user,
@@ -50,6 +56,23 @@ class TikTokStatusRequest(BaseModel):
     publish_id: str = Field(..., description="The TikTok publish id returned by /tiktok/publish.")
 
 
+class GhostConnectRequest(BaseModel):
+    admin_api_url: str = Field(..., description="Exact Ghost Admin API base URL, e.g. https://site.com/ghost/api/admin/")
+    admin_api_key: str = Field(..., description="Ghost custom integration Admin API key.")
+    default_newsletter_slug: str | None = Field(
+        None,
+        description="Optional default Ghost newsletter slug for newsletter assets.",
+    )
+
+
+class GhostPublishRequest(BaseModel):
+    asset: dict = Field(..., description="The blog or newsletter asset payload to publish to Ghost.")
+    newsletter_slug: str | None = Field(
+        None,
+        description="Optional Ghost newsletter slug override for newsletter assets.",
+    )
+
+
 @router.get("/status")
 def get_status(current_user: AuthUser = Depends(require_current_user)):
     return get_connected_platforms_for_user(user_id=current_user.id)
@@ -93,6 +116,51 @@ def auth_tiktok(current_user: AuthUser = Depends(require_current_user)):
 @router.get("/auth/tiktok/callback")
 async def auth_tiktok_callback(code: str = None, state: str = None, error: str = None):
     return await handle_tiktok_callback(code=code, state=state, error=error)
+
+
+@router.post("/ghost/connect")
+async def connect_ghost(
+    request: GhostConnectRequest,
+    current_user: AuthUser = Depends(require_current_user),
+):
+    try:
+        result = await connect_ghost_site_for_user(
+            user_id=current_user.id,
+            admin_api_url=request.admin_api_url,
+            admin_api_key=request.admin_api_key,
+            default_newsletter_slug=request.default_newsletter_slug,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error))
+    except httpx.HTTPStatusError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Ghost rejected the connection test ({error.response.status_code}).",
+        )
+    except httpx.HTTPError:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Ghost connection test failed.")
+
+    return result
+
+
+@router.get("/ghost/newsletters")
+async def get_ghost_newsletters(current_user: AuthUser = Depends(require_current_user)):
+    try:
+        result = await list_ghost_newsletters_for_user(user_id=current_user.id)
+    except httpx.HTTPStatusError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Ghost newsletter lookup failed ({error.response.status_code}).",
+        )
+    except httpx.HTTPError:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Ghost newsletter lookup failed.")
+
+    if not result.get("ok"):
+        error = result.get("error")
+        if error == "ghost_not_connected":
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=result["message"])
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=result.get("message", "Ghost request failed."))
+    return result
 
 
 @router.post("/linkedin/publish")
@@ -158,6 +226,47 @@ async def publish_instagram(
         "asset_type": result.get("asset_type"),
         "instagram_post_id": result.get("instagram_post_id"),
         "creation_id": result.get("creation_id"),
+    }
+
+
+@router.post("/ghost/publish")
+async def publish_ghost(
+    request: GhostPublishRequest,
+    current_user: AuthUser = Depends(require_current_user),
+):
+    ensure_can_direct_publish(current_user.id, 1)
+
+    asset = request.asset if isinstance(request.asset, dict) else {}
+    result = await publish_ghost_asset_for_user(
+        user_id=current_user.id,
+        asset=asset,
+        newsletter_slug=request.newsletter_slug,
+    )
+    if not result.get("ok"):
+        error = result.get("error")
+        if error == "ghost_not_connected":
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=result["message"])
+        if error == "ghost_connection_incomplete":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result["message"])
+        if error in {"ghost_unsupported_asset", "ghost_invalid_asset", "ghost_newsletter_missing"}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result["message"])
+        raise HTTPException(
+            status_code=result.get("status_code") or status.HTTP_502_BAD_GATEWAY,
+            detail=result.get("message", "Ghost publish failed."),
+        )
+
+    record_direct_publish(current_user.id, 1)
+    return {
+        "message": "Ghost post published.",
+        "platform": result["platform"],
+        "asset_type": result.get("asset_type"),
+        "ghost_post_id": result.get("ghost_post_id"),
+        "ghost_post_uuid": result.get("ghost_post_uuid"),
+        "ghost_post_url": result.get("ghost_post_url"),
+        "ghost_post_status": result.get("ghost_post_status"),
+        "newsletter_slug": result.get("newsletter_slug"),
+        "email_only": result.get("email_only"),
+        "ghost_email_status": result.get("ghost_email_status"),
     }
 
 
