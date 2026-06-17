@@ -7,6 +7,8 @@ from typing import Any
 from fastapi import HTTPException, status
 
 from app.billing.service import ensure_can_direct_publish, record_direct_publish
+from app.integrations_repository import SocialIntegrationRepository
+from app.services.ghost_service import publish_ghost_asset_for_user
 from app.scheduling.domain import ScheduledPostRecord
 from app.scheduling.repository import ScheduledPostRepository
 from app.services.instagram_service import publish_instagram_asset_for_user
@@ -14,13 +16,14 @@ from app.services.integration_service import publish_linkedin_post_for_user
 from app.services.tiktok_service import publish_tiktok_asset_for_user
 
 
-VALID_PLATFORMS = {"linkedin", "instagram", "tiktok"}
+VALID_PLATFORMS = {"linkedin", "instagram", "tiktok", "ghost"}
 VALID_STATUSES = {"scheduled", "publishing", "published", "failed", "canceled"}
 MINIMUM_SCHEDULE_DELAY_SECONDS = 30
 DEFAULT_MAX_ATTEMPTS = 3
 BASE_RETRY_DELAY_SECONDS = 120
 
 scheduled_post_repository = ScheduledPostRepository()
+social_integration_repository = SocialIntegrationRepository()
 
 
 def create_scheduled_post(
@@ -41,6 +44,7 @@ def create_scheduled_post(
         )
 
     normalized_payload = _normalize_payload(normalized_platform, payload)
+    _ensure_platform_connected(user_id=user_id, platform=normalized_platform)
     client_asset_id = _client_asset_id(normalized_payload)
     if client_asset_id:
         existing = scheduled_post_repository.find_active_for_asset(
@@ -159,6 +163,12 @@ async def _publish_claimed_post(post: ScheduledPostRecord) -> dict[str, Any]:
             disable_stitch=post.payload.get("disable_stitch"),
             video_cover_timestamp_ms=post.payload.get("video_cover_timestamp_ms"),
         )
+    elif post.platform == "ghost":
+        result = await publish_ghost_asset_for_user(
+            user_id=post.user_id,
+            asset=post.payload["asset"],
+            newsletter_slug=post.payload.get("newsletter_slug"),
+        )
     else:
         result = {
             "ok": False,
@@ -172,11 +182,33 @@ async def _publish_claimed_post(post: ScheduledPostRecord) -> dict[str, Any]:
     return result
 
 
+def _ensure_platform_connected(*, user_id: int, platform: str) -> None:
+    connection = social_integration_repository.get_by_user_and_platform(
+        user_id=user_id,
+        platform=platform,
+    )
+    if connection is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Connect {_platform_label(platform)} before scheduling this asset.",
+        )
+
+
 def _normalize_platform(platform: str) -> str:
     normalized = platform.strip().lower()
     if normalized not in VALID_PLATFORMS:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported scheduling platform.")
     return normalized
+
+
+def _platform_label(platform: str) -> str:
+    labels = {
+        "linkedin": "LinkedIn",
+        "instagram": "Instagram",
+        "tiktok": "TikTok",
+        "ghost": "Ghost",
+    }
+    return labels.get(platform, platform.title())
 
 
 def _normalize_payload(platform: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -194,7 +226,7 @@ def _normalize_payload(platform: str, payload: dict[str, Any]) -> dict[str, Any]
             normalized_payload["metadata"] = metadata
         return normalized_payload
 
-    if platform in {"instagram", "tiktok"}:
+    if platform in {"instagram", "tiktok", "ghost"}:
         asset = payload.get("asset")
         if not isinstance(asset, dict):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{platform.title()} scheduled posts require an asset.")
@@ -211,6 +243,10 @@ def _normalize_payload(platform: str, payload: dict[str, Any]) -> dict[str, Any]
             ):
                 if key in payload:
                     normalized_payload[key] = payload[key]
+        if platform == "ghost":
+            newsletter_slug = str(payload.get("newsletter_slug") or "").strip()
+            if newsletter_slug:
+                normalized_payload["newsletter_slug"] = newsletter_slug
         return normalized_payload
 
     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported scheduling platform.")
@@ -261,7 +297,7 @@ def _client_asset_id(payload: dict[str, Any]) -> str:
 
 
 def _external_post_id(result: dict[str, Any]) -> str | None:
-    for key in ("linkedin_post_id", "instagram_post_id", "publish_id"):
+    for key in ("linkedin_post_id", "instagram_post_id", "publish_id", "ghost_post_id"):
         value = result.get(key)
         if value:
             return str(value)
