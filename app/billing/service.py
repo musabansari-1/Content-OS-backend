@@ -4,6 +4,9 @@ import hashlib
 import hmac
 import json
 from datetime import datetime, timezone
+from urllib import error as urllib_error
+from urllib import request as urllib_request
+from urllib.parse import urlparse
 
 from fastapi import HTTPException
 
@@ -25,16 +28,32 @@ def _resolve_frontend_base_url() -> str:
     return configured_url.rstrip("/")
 
 
-FRONTEND_BASE_URL = _resolve_frontend_base_url()
-PADDLE_ENVIRONMENT = (env("PADDLE_ENVIRONMENT", "sandbox") or "sandbox").strip().lower()
-PADDLE_CLIENT_TOKEN = env("PADDLE_CLIENT_TOKEN", "") or ""
-PADDLE_WEBHOOK_SECRET = env("PADDLE_WEBHOOK_SECRET", "") or ""
-PADDLE_PRICE_ID_PRO = env("PADDLE_PRICE_ID_PRO", "") or ""
-PADDLE_PRICE_ID_MAX = env("PADDLE_PRICE_ID_MAX", "") or ""
+def _is_truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
-PLAN_PRICE_IDS = {
-    "pro": PADDLE_PRICE_ID_PRO,
-    "max": PADDLE_PRICE_ID_MAX,
+
+FRONTEND_BASE_URL = _resolve_frontend_base_url()
+CREEM_API_KEY = env("CREEM_API_KEY", "") or ""
+CREEM_TEST_MODE = _is_truthy(env("CREEM_TEST_MODE", "")) or CREEM_API_KEY.startswith("creem_test_")
+CREEM_API_BASE_URL = (
+    env(
+        "CREEM_API_BASE_URL",
+        "https://test-api.creem.io" if CREEM_TEST_MODE else "https://api.creem.io",
+    )
+    or ("https://test-api.creem.io" if CREEM_TEST_MODE else "https://api.creem.io")
+).rstrip("/")
+CREEM_CHECKOUT_PATH = (env("CREEM_CHECKOUT_PATH", "/v1/checkouts") or "/v1/checkouts").strip() or "/v1/checkouts"
+CREEM_WEBHOOK_SECRET = env("CREEM_WEBHOOK_SECRET", "") or ""
+CREEM_PRODUCT_ID_PRO = env("CREEM_PRODUCT_ID_PRO", "") or ""
+CREEM_PRODUCT_ID_MAX = env("CREEM_PRODUCT_ID_MAX", "") or ""
+CREEM_LOCAL_TEST_MODE = (not CREEM_API_KEY) and (
+    FRONTEND_BASE_URL.startswith("http://localhost")
+    or FRONTEND_BASE_URL.startswith("http://127.0.0.1")
+)
+
+PLAN_PRODUCT_IDS = {
+    "pro": CREEM_PRODUCT_ID_PRO,
+    "max": CREEM_PRODUCT_ID_MAX,
 }
 
 
@@ -48,8 +67,14 @@ def list_billing_plans() -> list[dict]:
                 "label": plan.label,
                 "assets_per_month": plan.assets_per_month,
                 "direct_publishes_per_month": plan.direct_publishes_per_month,
-                "checkout_enabled": bool(PLAN_PRICE_IDS.get(plan.code)),
-                "price_id": PLAN_PRICE_IDS.get(plan.code) or None,
+                "checkout_enabled": (
+                    plan.code in ("pro", "max")
+                    and (
+                        (bool(CREEM_API_KEY) and bool(PLAN_PRODUCT_IDS.get(plan.code)))
+                        or CREEM_LOCAL_TEST_MODE
+                    )
+                ),
+                "checkout_url": None,
             }
         )
     return plans
@@ -115,71 +140,102 @@ def get_checkout_settings(user_id: int, user_email: str, plan_code: str) -> dict
     if normalized_plan not in ("pro", "max"):
         raise HTTPException(status_code=400, detail="Only paid plans can be purchased through checkout.")
 
-    price_id = PLAN_PRICE_IDS.get(normalized_plan, "")
-    if not price_id:
+    if not CREEM_API_KEY:
+        if not CREEM_LOCAL_TEST_MODE:
+            raise HTTPException(status_code=500, detail="CREEM_API_KEY is not configured.")
+        return _create_local_test_checkout(user_id=user_id, user_email=user_email, plan_code=normalized_plan)
+
+    product_id = PLAN_PRODUCT_IDS.get(normalized_plan, "").strip()
+    if not product_id:
         raise HTTPException(
             status_code=500,
-            detail=f"Paddle price ID is not configured for the {normalized_plan} plan.",
+            detail=f"CREEM_PRODUCT_ID_{normalized_plan.upper()} is not configured.",
         )
 
-    if not PADDLE_CLIENT_TOKEN:
-        raise HTTPException(status_code=500, detail="PADDLE_CLIENT_TOKEN is not configured.")
+    checkout_session = _create_creem_checkout_session(
+        user_id=user_id,
+        user_email=user_email,
+        plan_code=normalized_plan,
+        product_id=product_id,
+    )
 
     return {
+        "provider": "creem",
         "plan_code": normalized_plan,
-        "price_id": price_id,
-        "paddle_environment": PADDLE_ENVIRONMENT,
-        "paddle_client_token": PADDLE_CLIENT_TOKEN,
+        "checkout_url": checkout_session["checkout_url"],
+        "checkout_mode": "redirect",
+        "creem_mode": "test" if CREEM_TEST_MODE else "live",
+        "provider_checkout_id": checkout_session.get("provider_checkout_id"),
         "customer_email": user_email,
         "success_url": f"{FRONTEND_BASE_URL}/billing?checkout=success",
         "cancel_url": f"{FRONTEND_BASE_URL}/billing?checkout=canceled",
-        "custom_data": {
+        "metadata": {
             "user_id": user_id,
             "plan_code": normalized_plan,
+            "product_id": product_id,
         },
     }
 
 
-def verify_paddle_webhook_signature(raw_body: bytes, signature_header: str | None) -> None:
-    if not PADDLE_WEBHOOK_SECRET:
-        raise HTTPException(status_code=500, detail="PADDLE_WEBHOOK_SECRET is not configured.")
+def _create_local_test_checkout(user_id: int, user_email: str, plan_code: str) -> dict:
+    period_start, period_end = _get_current_period_bounds()
+    billing_repository.upsert_subscription(
+        user_id=user_id,
+        plan_code=plan_code,
+        provider="creem_test",
+        subscription_status="active",
+        current_period_start=period_start,
+        current_period_end=period_end,
+        provider_customer_id=f"test-customer-{user_id}",
+        provider_subscription_id=f"test-subscription-{user_id}-{plan_code}",
+        cancel_at_period_end=False,
+    )
+
+    return {
+        "provider": "creem_test",
+        "plan_code": plan_code,
+        "checkout_url": f"{FRONTEND_BASE_URL}/billing?checkout=success&mode=local-test&plan={plan_code}",
+        "checkout_mode": "redirect",
+        "creem_mode": "local-test",
+        "provider_checkout_id": f"local-test-{user_id}-{plan_code}",
+        "customer_email": user_email,
+        "success_url": f"{FRONTEND_BASE_URL}/billing?checkout=success&mode=local-test&plan={plan_code}",
+        "cancel_url": f"{FRONTEND_BASE_URL}/billing?checkout=canceled&mode=local-test&plan={plan_code}",
+        "metadata": {
+            "user_id": user_id,
+            "plan_code": plan_code,
+            "mode": "local-test",
+        },
+    }
+
+
+def verify_creem_webhook_signature(raw_body: bytes, signature_header: str | None) -> None:
+    if not CREEM_WEBHOOK_SECRET:
+        return
 
     if not signature_header:
-        raise HTTPException(status_code=400, detail="Missing Paddle-Signature header.")
+        raise HTTPException(status_code=400, detail="Missing creem-signature header.")
 
-    parsed_header = _parse_paddle_signature_header(signature_header)
-    timestamp = parsed_header.get("ts", "")
-    expected_signature = parsed_header.get("h1", "")
-
-    if not timestamp or not expected_signature:
-        raise HTTPException(status_code=400, detail="Malformed Paddle-Signature header.")
-
-    signed_payload = timestamp.encode("utf-8") + b":" + raw_body
     computed_signature = hmac.new(
-        PADDLE_WEBHOOK_SECRET.encode("utf-8"),
-        signed_payload,
+        CREEM_WEBHOOK_SECRET.encode("utf-8"),
+        raw_body,
         hashlib.sha256,
     ).hexdigest()
 
-    if not hmac.compare_digest(computed_signature, expected_signature):
-        raise HTTPException(status_code=400, detail="Invalid Paddle webhook signature.")
+    if not hmac.compare_digest(computed_signature, signature_header.strip()):
+        raise HTTPException(status_code=400, detail="Invalid Creem webhook signature.")
 
 
-def process_paddle_webhook(raw_body: bytes) -> dict:
+def process_creem_webhook(raw_body: bytes) -> dict:
     payload = json.loads(raw_body.decode("utf-8"))
-    event_id = str(
-        payload.get("event_id")
-        or payload.get("notification_id")
-        or payload.get("id")
-        or ""
-    ).strip()
-    event_type = str(payload.get("event_type") or payload.get("type") or "").strip()
+    event_id = str(payload.get("id") or "").strip()
+    event_type = str(payload.get("eventType") or payload.get("event_type") or payload.get("type") or "").strip()
 
     if not event_id or not event_type:
         raise HTTPException(status_code=400, detail="Webhook payload is missing event metadata.")
 
     is_new_event = billing_repository.record_webhook_event(
-        provider="paddle",
+        provider="creem",
         event_id=event_id,
         event_type=event_type,
         payload=raw_body.decode("utf-8"),
@@ -189,12 +245,12 @@ def process_paddle_webhook(raw_body: bytes) -> dict:
         return {"ok": True, "duplicate": True, "event_id": event_id, "event_type": event_type}
 
     try:
-        data = payload.get("data", {}) if isinstance(payload.get("data"), dict) else {}
-        if event_type.startswith("subscription."):
-            _sync_subscription_from_paddle_event(event_type, data)
+        data = payload.get("object", {}) if isinstance(payload.get("object"), dict) else {}
+        if _is_creem_subscription_event(event_type):
+            _sync_subscription_from_creem_event(event_type, data)
 
         billing_repository.update_webhook_event_status(
-            provider="paddle",
+            provider="creem",
             event_id=event_id,
             processing_status="processed",
             processed_at=datetime.now(timezone.utc),
@@ -202,7 +258,7 @@ def process_paddle_webhook(raw_body: bytes) -> dict:
         return {"ok": True, "duplicate": False, "event_id": event_id, "event_type": event_type}
     except Exception:
         billing_repository.update_webhook_event_status(
-            provider="paddle",
+            provider="creem",
             event_id=event_id,
             processing_status="failed",
             processed_at=datetime.now(timezone.utc),
@@ -264,40 +320,33 @@ def _get_current_period_bounds() -> tuple[datetime, datetime]:
     return period_start, period_end
 
 
-def _parse_paddle_signature_header(signature_header: str) -> dict[str, str]:
-    values: dict[str, str] = {}
-    for raw_part in signature_header.split(";"):
-        part = raw_part.strip()
-        if "=" not in part:
-            continue
-        key, value = part.split("=", 1)
-        values[key.strip()] = value.strip()
-    return values
-
-
-def _sync_subscription_from_paddle_event(event_type: str, data: dict) -> None:
-    provider_subscription_id = str(data.get("id") or "").strip()
-    custom_data = data.get("custom_data", {}) if isinstance(data.get("custom_data"), dict) else {}
-    user_id = _extract_user_id_from_paddle_payload(custom_data, provider_subscription_id)
+def _sync_subscription_from_creem_event(event_type: str, data: dict) -> None:
+    subscription_data, metadata = _extract_creem_subscription_payload(data)
+    provider_subscription_id = str(subscription_data.get("id") or "").strip()
+    user_id = _extract_user_id_from_creem_payload(metadata, provider_subscription_id)
     if user_id is None:
         return
 
-    plan_code = _resolve_plan_code_from_paddle_payload(custom_data, data)
-    subscription_status = str(data.get("status") or "active").strip() or "active"
-    current_period = data.get("current_billing_period", {}) if isinstance(data.get("current_billing_period"), dict) else {}
-    current_period_start = _parse_paddle_datetime(current_period.get("starts_at")) or _parse_paddle_datetime(
-        data.get("started_at")
-    ) or datetime.now(timezone.utc)
-    current_period_end = _parse_paddle_datetime(current_period.get("ends_at")) or _get_current_period_bounds()[1]
-    cancel_at_period_end = bool(data.get("scheduled_change"))
-    if event_type == "subscription.canceled":
-        cancel_at_period_end = True
+    plan_code = _resolve_plan_code_from_creem_payload(metadata, data, subscription_data)
+    subscription_status = str(subscription_data.get("status") or data.get("status") or "active").strip() or "active"
+    current_period_start = (
+        _parse_provider_datetime(subscription_data.get("current_period_start_date"))
+        or _parse_provider_datetime(subscription_data.get("created_at"))
+        or _parse_provider_datetime(data.get("created_at"))
+        or datetime.now(timezone.utc)
+    )
+    current_period_end = (
+        _parse_provider_datetime(subscription_data.get("current_period_end_date"))
+        or _parse_provider_datetime(subscription_data.get("next_transaction_date"))
+        or _get_current_period_bounds()[1]
+    )
+    cancel_at_period_end = event_type == "subscription.scheduled_cancel" or subscription_status == "scheduled_cancel"
 
     billing_repository.upsert_subscription(
         user_id=user_id,
         plan_code=plan_code,
-        provider="paddle",
-        provider_customer_id=str(data.get("customer_id") or "") or None,
+        provider="creem",
+        provider_customer_id=_extract_creem_customer_id(data, subscription_data),
         provider_subscription_id=provider_subscription_id or None,
         subscription_status=subscription_status,
         current_period_start=current_period_start,
@@ -306,16 +355,25 @@ def _sync_subscription_from_paddle_event(event_type: str, data: dict) -> None:
     )
 
 
-def _extract_user_id_from_paddle_payload(
-    custom_data: dict,
-    provider_subscription_id: str,
-) -> int | None:
-    custom_user_id = custom_data.get("user_id")
+def _extract_creem_subscription_payload(data: dict) -> tuple[dict, dict]:
+    if isinstance(data.get("subscription"), dict):
+        subscription_data = data["subscription"]
+        metadata = subscription_data.get("metadata", {}) if isinstance(subscription_data.get("metadata"), dict) else {}
+        if not metadata and isinstance(data.get("metadata"), dict):
+            metadata = data["metadata"]
+        return subscription_data, metadata
+
+    metadata = data.get("metadata", {}) if isinstance(data.get("metadata"), dict) else {}
+    return data, metadata
+
+
+def _extract_user_id_from_creem_payload(metadata: dict, provider_subscription_id: str) -> int | None:
+    custom_user_id = metadata.get("user_id") or metadata.get("referenceId")
     if custom_user_id is not None:
         try:
             return int(custom_user_id)
         except (TypeError, ValueError):
-            return None
+            pass
 
     if provider_subscription_id:
         existing_subscription = billing_repository.get_subscription_by_provider_subscription_id(
@@ -327,26 +385,68 @@ def _extract_user_id_from_paddle_payload(
     return None
 
 
-def _resolve_plan_code_from_paddle_payload(custom_data: dict, data: dict) -> str:
-    custom_plan_code = str(custom_data.get("plan_code") or "").strip().lower()
+def _resolve_plan_code_from_creem_payload(metadata: dict, data: dict, subscription_data: dict) -> str:
+    custom_plan_code = str(metadata.get("plan_code") or "").strip().lower()
     if custom_plan_code in ("free", "pro", "max"):
         return custom_plan_code
 
-    items = data.get("items", [])
-    if isinstance(items, list):
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            price = item.get("price", {}) if isinstance(item.get("price"), dict) else {}
-            price_id = str(price.get("id") or item.get("price_id") or "").strip()
-            for plan_code, configured_price_id in PLAN_PRICE_IDS.items():
-                if configured_price_id and price_id == configured_price_id:
-                    return plan_code
+    product_id = _extract_creem_product_id(data, subscription_data)
+    for plan_code, configured_product_id in PLAN_PRODUCT_IDS.items():
+        if configured_product_id and product_id == configured_product_id:
+            return plan_code
+
+    product_name = _extract_creem_product_name(data, subscription_data)
+    if "max" in product_name:
+        return "max"
+    if "pro" in product_name:
+        return "pro"
 
     return DEFAULT_PLAN_CODE
 
 
-def _parse_paddle_datetime(value: str | None) -> datetime | None:
+def _extract_creem_product_id(data: dict, subscription_data: dict) -> str:
+    candidates = [
+        subscription_data.get("product"),
+        data.get("product_id"),
+    ]
+    product_data = data.get("product")
+    if isinstance(product_data, dict):
+        candidates.append(product_data.get("id"))
+
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return ""
+
+
+def _extract_creem_product_name(data: dict, subscription_data: dict) -> str:
+    candidates = []
+    product_data = data.get("product")
+    if isinstance(product_data, dict):
+        candidates.append(product_data.get("name"))
+    subscription_product = subscription_data.get("product")
+    if isinstance(subscription_product, dict):
+        candidates.append(subscription_product.get("name"))
+
+    for candidate in candidates:
+        value = str(candidate or "").strip().lower()
+        if value:
+            return value
+    return ""
+
+
+def _extract_creem_customer_id(data: dict, subscription_data: dict) -> str | None:
+    customer_data = data.get("customer")
+    if isinstance(customer_data, dict):
+        customer_id = str(customer_data.get("id") or "").strip()
+        if customer_id:
+            return customer_id
+
+    customer_id = str(subscription_data.get("customer") or "").strip()
+    return customer_id or None
+
+
+def _parse_provider_datetime(value: str | None) -> datetime | None:
     if not value or not isinstance(value, str):
         return None
 
@@ -358,3 +458,80 @@ def _parse_paddle_datetime(value: str | None) -> datetime | None:
         return parsed.astimezone(timezone.utc)
     except ValueError:
         return None
+
+
+def _is_valid_checkout_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _is_creem_subscription_event(event_type: str) -> bool:
+    normalized = event_type.strip().lower()
+    return normalized == "checkout.completed" or normalized.startswith("subscription.")
+
+
+def _create_creem_checkout_session(
+    *,
+    user_id: int,
+    user_email: str,
+    plan_code: str,
+    product_id: str,
+) -> dict[str, str]:
+    payload = {
+        "product_id": product_id,
+        "success_url": f"{FRONTEND_BASE_URL}/billing?checkout=success",
+        # This metadata field is inferred from Creem webhook payload examples so
+        # the subscription can be linked back to the app user during sync.
+        "metadata": {
+            "user_id": user_id,
+            "plan_code": plan_code,
+            "email": user_email,
+        },
+    }
+    response = _creem_api_request("POST", CREEM_CHECKOUT_PATH, payload)
+    checkout_url = str(response.get("checkout_url") or "").strip()
+    if not _is_valid_checkout_url(checkout_url):
+        raise HTTPException(status_code=502, detail="Creem did not return a valid checkout URL.")
+
+    provider_checkout_id = str(response.get("id") or "").strip()
+    return {
+        "checkout_url": checkout_url,
+        "provider_checkout_id": provider_checkout_id,
+    }
+
+
+def _creem_api_request(method: str, path: str, payload: dict) -> dict:
+    body = json.dumps(payload).encode("utf-8")
+    url = f"{CREEM_API_BASE_URL}{path if path.startswith('/') else f'/{path}'}"
+    request = urllib_request.Request(
+        url,
+        data=body,
+        method=method.upper(),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "ContentOS/1.0 (+https://contentos.ai)",
+            "x-api-key": CREEM_API_KEY,
+        },
+    )
+
+    try:
+        with urllib_request.urlopen(request, timeout=20) as response:
+            raw_response = response.read().decode("utf-8")
+    except urllib_error.HTTPError as exc:
+        raw_error = exc.read().decode("utf-8", errors="ignore")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Creem checkout request failed with HTTP {exc.code}. {raw_error}".strip(),
+        ) from exc
+    except urllib_error.URLError as exc:
+        raise HTTPException(status_code=502, detail=f"Could not reach Creem API: {exc.reason}") from exc
+
+    try:
+        parsed = json.loads(raw_response)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail="Creem returned a non-JSON response.") from exc
+
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=502, detail="Creem returned an unexpected checkout response.")
+    return parsed

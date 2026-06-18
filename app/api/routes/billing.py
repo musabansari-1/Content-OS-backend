@@ -9,8 +9,8 @@ from app.billing.service import (
     get_billing_summary,
     get_checkout_settings,
     list_billing_plans,
-    process_paddle_webhook,
-    verify_paddle_webhook_signature,
+    process_creem_webhook,
+    verify_creem_webhook_signature,
 )
 
 
@@ -50,14 +50,16 @@ class BillingCheckoutRequest(BaseModel):
 
 
 class BillingCheckoutResponse(BaseModel):
+    provider: str
     plan_code: str
-    price_id: str
-    paddle_environment: str
-    paddle_client_token: str
+    checkout_url: str
+    checkout_mode: str
+    creem_mode: str
+    provider_checkout_id: str | None = None
     customer_email: str
     success_url: str
     cancel_url: str
-    custom_data: dict
+    metadata: dict
 
 
 class BillingPlanResponse(BaseModel):
@@ -66,7 +68,7 @@ class BillingPlanResponse(BaseModel):
     assets_per_month: int
     direct_publishes_per_month: int
     checkout_enabled: bool
-    price_id: str | None = None
+    checkout_url: str | None = None
 
 
 @router.get("/billing/me", response_model=BillingSummaryResponse)
@@ -116,11 +118,11 @@ def create_billing_checkout(
     return BillingCheckoutResponse(**settings)
 
 
-@router.post("/billing/webhooks/paddle")
-async def handle_paddle_webhook(
+@router.post("/billing/webhooks/creem")
+async def handle_creem_webhook(
     request: Request,
-    paddle_signature: str | None = Header(default=None, alias="Paddle-Signature"),
+    creem_signature: str | None = Header(default=None, alias="creem-signature"),
 ):
     raw_body = await request.body()
-    verify_paddle_webhook_signature(raw_body, paddle_signature)
-    return process_paddle_webhook(raw_body)
+    verify_creem_webhook_signature(raw_body, creem_signature)
+    return process_creem_webhook(raw_body)
