@@ -135,6 +135,44 @@ def record_direct_publish(user_id: int, publish_count: int = 1) -> BillingUsageC
     )
 
 
+def schedule_subscription_cancellation(user_id: int) -> BillingSummary:
+    subscription = _get_or_create_subscription(user_id)
+    normalized_provider = str(subscription.provider or "").strip().lower()
+
+    if subscription.plan_code == DEFAULT_PLAN_CODE or normalized_provider == "internal":
+        raise HTTPException(status_code=400, detail="There is no paid subscription to cancel.")
+
+    if subscription.cancel_at_period_end or subscription.subscription_status == "scheduled_cancel":
+        return get_billing_summary(user_id)
+
+    if normalized_provider == "creem_test":
+        _persist_subscription_state(
+            subscription,
+            subscription_status="scheduled_cancel",
+            cancel_at_period_end=True,
+        )
+        return get_billing_summary(user_id)
+
+    if normalized_provider != "creem":
+        raise HTTPException(status_code=400, detail="Subscription cancellation is only supported for Creem billing.")
+
+    provider_subscription_id = str(subscription.provider_subscription_id or "").strip()
+    if not provider_subscription_id:
+        raise HTTPException(status_code=400, detail="This subscription is missing a Creem subscription ID.")
+
+    _creem_api_request(
+        "POST",
+        f"/v1/subscriptions/{provider_subscription_id}/cancel",
+        {"mode": "scheduled"},
+    )
+    _persist_subscription_state(
+        subscription,
+        subscription_status="scheduled_cancel",
+        cancel_at_period_end=True,
+    )
+    return get_billing_summary(user_id)
+
+
 def get_checkout_settings(user_id: int, user_email: str, plan_code: str) -> dict:
     normalized_plan = (plan_code or "").strip().lower()
     if normalized_plan not in ("pro", "max"):
@@ -535,3 +573,22 @@ def _creem_api_request(method: str, path: str, payload: dict) -> dict:
     if not isinstance(parsed, dict):
         raise HTTPException(status_code=502, detail="Creem returned an unexpected checkout response.")
     return parsed
+
+
+def _persist_subscription_state(
+    subscription: BillingSubscription,
+    *,
+    subscription_status: str,
+    cancel_at_period_end: bool,
+) -> BillingSubscription:
+    return billing_repository.upsert_subscription(
+        user_id=subscription.user_id,
+        plan_code=subscription.plan_code,
+        provider=subscription.provider,
+        provider_customer_id=subscription.provider_customer_id,
+        provider_subscription_id=subscription.provider_subscription_id,
+        subscription_status=subscription_status,
+        current_period_start=subscription.current_period_start,
+        current_period_end=subscription.current_period_end,
+        cancel_at_period_end=cancel_at_period_end,
+    )

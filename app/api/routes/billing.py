@@ -10,6 +10,7 @@ from app.billing.service import (
     get_checkout_settings,
     list_billing_plans,
     process_creem_webhook,
+    schedule_subscription_cancellation,
     verify_creem_webhook_signature,
 )
 
@@ -116,6 +117,37 @@ def create_billing_checkout(
         plan_code=request.plan_code,
     )
     return BillingCheckoutResponse(**settings)
+
+
+@router.post("/billing/cancel", response_model=BillingSummaryResponse)
+def cancel_billing_subscription(
+    current_user: AuthUser = Depends(require_current_user),
+) -> BillingSummaryResponse:
+    summary = schedule_subscription_cancellation(current_user.id)
+    return BillingSummaryResponse(
+        plan_code=summary.plan.code,
+        plan_label=summary.plan.label,
+        provider=summary.subscription.provider,
+        subscription_status=summary.subscription.subscription_status,
+        current_period_start=summary.subscription.current_period_start,
+        current_period_end=summary.subscription.current_period_end,
+        cancel_at_period_end=summary.subscription.cancel_at_period_end,
+        usage=BillingUsageResponse(
+            assets_generated=summary.usage.assets_generated,
+            direct_publishes=summary.usage.direct_publishes,
+        ),
+        limits=BillingLimitsResponse(
+            assets_per_month=summary.plan.assets_per_month,
+            direct_publishes_per_month=summary.plan.direct_publishes_per_month,
+        ),
+        remaining=BillingRemainingResponse(
+            assets_remaining=max(0, summary.plan.assets_per_month - summary.usage.assets_generated),
+            direct_publishes_remaining=max(
+                0,
+                summary.plan.direct_publishes_per_month - summary.usage.direct_publishes,
+            ),
+        ),
+    )
 
 
 @router.post("/billing/webhooks/creem")

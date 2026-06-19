@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 from fastapi import HTTPException
@@ -72,6 +73,50 @@ class BillingServiceTests(unittest.TestCase):
                 service.verify_creem_webhook_signature(raw_body, "bad_signature")
 
         self.assertEqual(context.exception.status_code, 400)
+
+    def test_schedule_subscription_cancellation_marks_creem_test_subscription(self) -> None:
+        fake_subscription = service.BillingSubscription(
+            id=1,
+            user_id=17,
+            plan_code="max",
+            provider="creem_test",
+            provider_customer_id="cust_123",
+            provider_subscription_id="sub_123",
+            subscription_status="active",
+            current_period_start=datetime(2026, 6, 1, tzinfo=timezone.utc),
+            current_period_end=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            cancel_at_period_end=False,
+            created_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
+            updated_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        )
+        fake_usage = service.BillingUsageCounter(
+            id=1,
+            user_id=17,
+            period_start=datetime(2026, 6, 1, tzinfo=timezone.utc),
+            period_end=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            assets_generated=0,
+            direct_publishes=0,
+            created_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
+            updated_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        )
+
+        with (
+            patch.object(service, "_get_or_create_subscription", return_value=fake_subscription),
+            patch.object(service, "_persist_subscription_state") as persist_state,
+            patch.object(service, "get_billing_summary") as get_summary,
+        ):
+            get_summary.return_value = service.BillingSummary(
+                subscription=service.BillingSubscription(
+                    **{**fake_subscription.__dict__, "subscription_status": "scheduled_cancel", "cancel_at_period_end": True}
+                ),
+                usage=fake_usage,
+                plan=service.PLAN_DEFINITIONS["max"],
+            )
+            summary = service.schedule_subscription_cancellation(17)
+
+        persist_state.assert_called_once()
+        self.assertEqual(summary.subscription.subscription_status, "scheduled_cancel")
+        self.assertTrue(summary.subscription.cancel_at_period_end)
 
 
 if __name__ == "__main__":
