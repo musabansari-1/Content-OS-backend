@@ -47,9 +47,9 @@ If platform == "linkedin":
 - End with question + soft CTA
 
 If platform == "youtube":
-- Optimize for click (title, hook)
-- Add curiosity gaps in hook
-- Do NOT reveal everything in outline
+- If the asset is a video idea, optimize for click (title, hook), add curiosity gaps in the hook, and do NOT reveal everything in the outline
+- If the asset is YouTube Shorts, write spoken vertical-video lines with immediate context, tight retention beats, one micro-payoff, and a natural continuation to the full video
+- Shorts must feel native to YouTube, not like a TikTok script with a YouTube label
 
 If platform == "reddit":
 - Title must feel native to Reddit (specific, not salesy; avoid title gore)

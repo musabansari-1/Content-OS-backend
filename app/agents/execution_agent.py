@@ -17,6 +17,7 @@ from app.prompts.tiktok_prompt import TIKTOK_PROMPT
 from app.prompts.twitter_prompt import TWITTER_PROMPT
 from app.prompts.x_post_prompt import X_POST_PROMPT
 from app.prompts.youtube_prompt import YOUTUBE_PROMPT
+from app.prompts.youtube_shorts_prompt import YOUTUBE_SHORTS_PROMPT
 from app.utils.llm import call_llm
 from app.voice_engine.service import CreatorVoiceProfileService
 
@@ -77,6 +78,9 @@ def execute_task(task, source, creator_voice_profile=None):
 
     if asset_type == "youtube_video_idea":
         return call_llm(YOUTUBE_PROMPT, user_prompt, stage="writer")
+
+    if asset_type == "youtube_shorts":
+        return call_llm(YOUTUBE_SHORTS_PROMPT, user_prompt, stage="writer")
 
     if asset_type == "instagram_carousel":
         return call_llm(INSTAGRAM_CAROUSEL_PROMPT, user_prompt, stage="writer")

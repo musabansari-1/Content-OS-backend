@@ -2203,6 +2203,8 @@ class GroqShortsPipeline:
             return "tiktok"
         if asset_type == "instagram_reel":
             return "instagram_reel"
+        if asset_type == "youtube_shorts":
+            return "youtube_shorts"
         return "generic_short_video"
 
     def _platform_fit_score(self, candidate: dict[str, Any], asset_type: str) -> float:
@@ -2269,6 +2271,32 @@ class GroqShortsPipeline:
                     r"\bthe point\b",
                     r"\bthis is how\b",
                     r"\byou can\b",
+                ],
+                0.03,
+                0.12,
+            )
+        elif profile == "youtube_shorts":
+            platform = (
+                0.18 * hook
+                + 0.17 * retention
+                + 0.16 * self_contained
+                + 0.14 * payoff
+                + 0.12 * arc
+                + 0.09 * density
+                + 0.06 * boundary
+                + 0.04 * context_leak
+                + 0.04 * self._duration_preference(duration, 20.0, 58.0, 72.0)
+            )
+            platform += self._pattern_bonus(
+                text,
+                [
+                    r"\bwhy\b",
+                    r"\bwhat\b",
+                    r"\bhow\b",
+                    r"\bthe reason\b",
+                    r"\bthe moment\b",
+                    r"\bwatch\b",
+                    r"\bthis is\b",
                 ],
                 0.03,
                 0.12,

@@ -156,6 +156,12 @@ class GenerateVideoClipsBoundaryTests(unittest.TestCase):
 
         self.assertLess(end, 20.43)
 
+    def test_youtube_shorts_uses_native_platform_profile(self) -> None:
+        self.assertEqual(
+            self.pipeline._platform_profile_for_asset("youtube_shorts"),
+            "youtube_shorts",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

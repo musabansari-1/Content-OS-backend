@@ -55,6 +55,14 @@ AVAILABLE_TARGET_ASSETS = {
         "label": "YouTube Video Idea",
         "description": "A title, hook, thumbnail angle, and outline package.",
     },
+    "youtube_shorts": {
+        "asset_type": "youtube_shorts",
+        "platform": "youtube",
+        "format": "shorts",
+        "output_type": "short_video",
+        "label": "YouTube Shorts",
+        "description": "A short-form vertical video script built for YouTube Shorts retention.",
+    },
     "blog_post": {
         "asset_type": "blog_post",
         "platform": "blog",

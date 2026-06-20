@@ -239,6 +239,17 @@ mandatory Checks to be made for each asset type:
   - avoids engagement bait, forced hot takes, fake certainty, and generic viral-account phrasing
   - hashtags are absent unless directly justified by the source
   - CTA is natural and does not invent a URL
+- youtube_shorts ->
+  - output is a 15 to 60 second vertical short script, not a long-form video idea
+  - hook creates immediate curiosity while making the source context clear
+  - preserves at least one concrete source detail when available
+  - focuses on one idea only
+  - has tight spoken lines suitable for captions
+  - includes one micro-payoff without fully exhausting the source
+  - CTA naturally continues to the full video without inventing a link
+  - avoids TikTok slang unless creator-native
+  - avoids Instagram caption-first framing
+  - fails if it is just a repackaged TikTok/Reel script with no YouTube Shorts retention logic
 - youtube_video_idea → strong title, thumbnail angle, retention-driven outline
 - instagram_reel →
 
