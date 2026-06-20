@@ -14,6 +14,7 @@ class GenerateVideoClipsBoundaryTests(unittest.TestCase):
             "text": text,
             "gap_before": gap_before,
             "gap_after": 0.0,
+            "is_first": start == 0.0,
             "clean_start": self.pipeline._has_reasonable_start(text),
             "clean_end": self.pipeline._has_reasonable_end(text),
             "topic_start": self.pipeline._looks_like_topic_start(text),
@@ -97,6 +98,18 @@ class GenerateVideoClipsBoundaryTests(unittest.TestCase):
         self.assertEqual(atoms[1]["end"], 10.2)
         self.assertEqual(atoms[1]["text"], "This topic starts cleanly.")
 
+    def test_reasonable_sentence_without_topic_boundary_cannot_start_clip(self) -> None:
+        unit = self._unit(
+            18.0,
+            26.0,
+            "Your system breaks when the day gets busy.",
+            gap_before=0.12,
+        )
+        unit["is_first"] = False
+        unit["topic_start"] = False
+
+        self.assertFalse(self.pipeline._unit_can_start_clip(unit))
+
     def test_render_bounds_do_not_pull_previous_or_next_sentence_words(self) -> None:
         candidate = ClipCandidate(
             clip_id="clip",
@@ -120,6 +133,28 @@ class GenerateVideoClipsBoundaryTests(unittest.TestCase):
 
         self.assertEqual(start, 10.0)
         self.assertLess(end, 20.46)
+
+    def test_render_bounds_ignore_word_that_starts_after_candidate_end(self) -> None:
+        candidate = ClipCandidate(
+            clip_id="clip",
+            start=10.0,
+            end=20.4,
+            duration=10.4,
+            score=1.0,
+            title="Clip",
+            rationale="",
+            transcript_text="A complete thought.",
+        )
+        words = [
+            {"word": "A", "start": 10.0, "end": 10.2},
+            {"word": "complete", "start": 10.25, "end": 10.6},
+            {"word": "thought.", "start": 20.1, "end": 20.4},
+            {"word": "Next", "start": 20.43, "end": 20.7},
+        ]
+
+        _, end = self.pipeline._render_bounds_for_candidate(candidate, words, video_duration=30.0)
+
+        self.assertLess(end, 20.43)
 
 
 if __name__ == "__main__":

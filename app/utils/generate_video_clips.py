@@ -1112,6 +1112,7 @@ class GroqShortsPipeline:
                     "end": end,
                     "texts": [text],
                     "gap_before": gap_before,
+                    "is_first": len(units) == 0,
                 }
                 previous_end = end
                 continue
@@ -1136,6 +1137,7 @@ class GroqShortsPipeline:
                     "end": end,
                     "texts": [text],
                     "gap_before": gap_before,
+                    "is_first": False,
                 }
             else:
                 current["end"] = end
@@ -1233,6 +1235,7 @@ class GroqShortsPipeline:
             "text": text,
             "gap_before": round(float(current.get("gap_before", 0.0)), 2),
             "gap_after": round(gap_after, 2),
+            "is_first": bool(current.get("is_first")),
             "clean_start": self._has_reasonable_start(text),
             "clean_end": self._has_reasonable_end(text),
             "topic_start": self._looks_like_topic_start(text),
@@ -1482,19 +1485,15 @@ class GroqShortsPipeline:
 
     def _unit_can_start_clip(self, unit: dict[str, Any]) -> bool:
         text = unit.get("text", "")
-        if (
-            float(unit.get("gap_before", 0.0)) >= 0.75
-            and self._has_reasonable_start(text)
-            and not self.validator.has_mid_topic_start(text)
-        ):
-            return True
+        if not self._has_reasonable_start(text):
+            return False
+        if self.validator.has_mid_topic_start(text) or self.validator.has_weak_lead(text):
+            return False
+
         return (
-            (bool(unit.get("topic_start")) and not self.validator.has_mid_topic_start(text))
-            or (
-                self._has_reasonable_start(text)
-                and not self.validator.has_mid_topic_start(text)
-                and not self.validator.has_weak_lead(text)
-            )
+            bool(unit.get("is_first"))
+            or float(unit.get("gap_before", 0.0)) >= 0.75
+            or bool(unit.get("topic_start"))
         )
 
     def _unit_can_end_clip(self, unit: dict[str, Any]) -> bool:
@@ -2331,12 +2330,14 @@ class GroqShortsPipeline:
         clip_end = candidate.end
 
         if words:
-            boundary_tolerance = 0.06
+            start_tolerance = 0.04
+            end_tolerance = 0.04
             matching_words = [
                 word
                 for word in words
-                if self._word_start(word) >= candidate.start - boundary_tolerance
-                and self._word_start(word) < candidate.end + boundary_tolerance
+                if self._word_end(word) > candidate.start - start_tolerance
+                and self._word_start(word) < candidate.end
+                and self._word_end(word) <= candidate.end + end_tolerance
             ]
             if matching_words:
                 first_word_start = self._word_start(matching_words[0])
@@ -2386,7 +2387,7 @@ class GroqShortsPipeline:
             return self.RENDER_TRAIL_PAD_SECONDS
         gap = max(0.0, next_word_start - last_word_end)
         if gap < 0.18:
-            return 0.04
+            return max(0.0, gap - 0.01)
         return min(self.RENDER_TRAIL_PAD_SECONDS, max(0.04, gap - 0.08))
 
     @staticmethod
