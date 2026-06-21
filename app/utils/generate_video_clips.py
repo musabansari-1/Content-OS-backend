@@ -44,6 +44,15 @@ Completeness upgrades (v6):
     selected text is standalone, not just grammatically punctuated
   - Relaxed/lenient fallbacks still reject mid-topic starts and unresolved ends
   - Final FFmpeg render bounds snap outward to word timestamps when available
+  - Sentence punctuation from transcript segments is aligned back to real word
+    timestamps so clip windows do not rely on proportional timing guesses
+
+Editorial upgrades (v7):
+  - Scores the first 3 seconds separately for hook archetype, specificity,
+    curiosity gap, and weak intro language
+  - Applies platform-native ranking weights for TikTok, Reels, and Shorts
+  - Penalizes generic setup, context leaks, weak payoff, and low boundary quality
+    before platform selection
 """
 
 from __future__ import annotations
@@ -300,12 +309,14 @@ HARD RULES - violating any of these means the clip is REJECTED:
 6. Avoid clips that are purely intro/outro/CTA/sponsor/housekeeping.
 
 QUALITY RULES:
-- Prefer clips with a strong HOOK in the first 3 seconds: surprising stat, bold claim, relatable problem, direct question, or counterintuitive statement.
+- Prefer clips with a strong HOOK in the first 3 seconds: surprising stat, bold claim, relatable problem, direct question, counterintuitive statement, or an immediate "you" problem.
 - Prefer clips with a satisfying PAYOFF: an insight, revelation, practical tip, emotional resolution, or memorable conclusion.
 - Spread selections across the ENTIRE transcript - do not cluster them in one section.
 - Return 10-15 clips. Fewer high-quality clips are BETTER than many mediocre ones.
 - If a proposed start depends on a previous unit, move the start earlier until it is self-contained.
 - If a proposed end sets up the next unit, extend the end until the payoff or resolved lesson is included.
+- Reject generic intros such as "today I want to talk about", "in this video", "welcome back", or housekeeping unless the next unit contains the real hook and the clip can start there.
+- Prefer native short-form moments: fast setup, clear tension, no filler ramp, and a payoff a viewer can understand without the long video.
 
 SCORING GUIDANCE:
 - has_clean_start: ONLY true if this clip begins at the very start of an independent new thought. If in doubt, mark false.
@@ -436,6 +447,8 @@ Rules:
 - composite_score must reflect a weighted blend (weight completeness most heavily).
 - Penalize any clip that starts with context-dependent language like "this", "that", "so that's why", "the next thing".
 - Penalize any clip that ends with a setup but not the payoff.
+- Penalize generic creator ramps like "today I want to talk about", "in this video", "welcome back", or "let's talk about" unless they immediately become a strong hook.
+- Reward first-three-second openings with one of these patterns: direct viewer problem, contrarian claim, curiosity gap, pain/stakes, specific number, or actionable tip.
 - Use context_before/context_after only to detect whether the selected clip has missing setup/payoff. Do not reward a clip for good content outside the selected boundaries.
 - Reward clips that contain a clear setup, turn, and resolved takeaway.
 - Reward clips that can be understood, captioned, and published without manual editing.
@@ -540,7 +553,10 @@ Return ONLY valid JSON:
                                         "summary":  c.get("summary", ""),
                                         "boundary_score": c.get("boundary_score"),
                                         "hook_score": c.get("hook_score"),
+                                        "first_three_score": c.get("first_three_score"),
+                                        "hook_archetypes": c.get("hook_archetypes", []),
                                         "payoff_score": c.get("payoff_score"),
+                                        "specificity_score": c.get("specificity_score"),
                                         "self_contained_score": c.get("self_contained_score"),
                                         "arc_score": c.get("arc_score"),
                                         "context_before": c.get("context_before", ""),
@@ -613,6 +629,12 @@ Return ONLY valid JSON:
 
             first_three_raw = float(llm.get("first_three_seconds", llm.get("hook_strength", 7.0)))
             if first_three_raw < 4.5:
+                final *= 0.82
+
+            first_three_metric = float(c.get("first_three_score", 1.0))
+            if first_three_metric < 0.35:
+                final *= 0.62
+            elif first_three_metric < 0.50:
                 final *= 0.82
 
             boundary_score = float(c.get("boundary_score", 1.0))
@@ -1084,7 +1106,9 @@ class GroqShortsPipeline:
         Build sentence/thought units that are small enough for precise clipping
         and large enough for the LLM to reason about complete ideas.
         """
-        atoms = self._sentence_atoms_from_words(words or [])
+        atoms = self._sentence_atoms_from_segments_and_words(segments, words or [])
+        if not atoms:
+            atoms = self._sentence_atoms_from_words(words or [])
         if not atoms:
             atoms = self._sentence_atoms_from_segments(segments)
 
@@ -1125,6 +1149,7 @@ class GroqShortsPipeline:
 
             should_flush = (
                 long_pause
+                or (current_ends_clean and next_opens_topic)
                 or (current_duration >= MIN_UNIT_DURATION and current_ends_clean and next_opens_topic)
                 or (current_duration >= TARGET_UNIT_DURATION and current_ends_clean)
                 or current_duration >= MAX_UNIT_DURATION
@@ -1177,6 +1202,68 @@ class GroqShortsPipeline:
                 cursor = part_end
         return atoms
 
+    def _sentence_atoms_from_segments_and_words(
+        self,
+        segments: list[dict[str, Any]],
+        words: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        timed_words = [
+            word
+            for word in sorted(words, key=self._word_start)
+            if str(word.get("word") or "").strip() and self._word_end(word) > self._word_start(word)
+        ]
+        if not segments or not timed_words:
+            return []
+
+        atoms: list[dict[str, Any]] = []
+
+        for seg in segments:
+            text = self._clean_text(seg.get("text") or "")
+            start = float(seg.get("start", 0.0))
+            end = float(seg.get("end", 0.0))
+            if not text or end <= start:
+                continue
+
+            segment_words = [
+                word
+                for word in timed_words
+                if start - 0.25 <= self._word_midpoint(word) <= end + 0.25
+            ]
+            if not segment_words:
+                continue
+
+            parts = self._split_text_sentences(text)
+            if not parts:
+                continue
+
+            if len(parts) == 1:
+                atoms.append(self._word_group_to_atom(segment_words, text=parts[0]))
+                continue
+
+            cursor = 0
+            for idx, part in enumerate(parts):
+                tokens = self._alignment_tokens(part)
+                remaining_parts = len(parts) - idx
+                remaining_words = len(segment_words) - cursor
+
+                if not tokens or remaining_words <= 0:
+                    continue
+
+                if idx == len(parts) - 1:
+                    end_cursor = len(segment_words)
+                else:
+                    min_words_for_rest = max(0, remaining_parts - 1)
+                    requested_end = cursor + len(tokens)
+                    max_end = len(segment_words) - min_words_for_rest
+                    end_cursor = max(cursor + 1, min(requested_end, max_end))
+
+                group = segment_words[cursor:end_cursor]
+                if group:
+                    atoms.append(self._word_group_to_atom(group, text=part))
+                cursor = end_cursor
+
+        return atoms
+
     def _sentence_atoms_from_words(self, words: list[dict[str, Any]]) -> list[dict[str, Any]]:
         timed_words = [
             word
@@ -1209,11 +1296,15 @@ class GroqShortsPipeline:
 
         return atoms
 
-    def _word_group_to_atom(self, words: list[dict[str, Any]]) -> dict[str, Any]:
+    def _word_group_to_atom(self, words: list[dict[str, Any]], text: str | None = None) -> dict[str, Any]:
         return {
             "start": round(self._word_start(words[0]), 2),
             "end": round(self._word_end(words[-1]), 2),
-            "text": self._clean_text(" ".join(str(word.get("word") or "") for word in words)),
+            "text": self._clean_text(
+                text
+                if text is not None
+                else " ".join(str(word.get("word") or "") for word in words)
+            ),
         }
 
     @staticmethod
@@ -1226,6 +1317,10 @@ class GroqShortsPipeline:
             return []
         pieces = re.split(r"(?<=[.?!])\s+(?=[A-Z0-9\"'])", text)
         return [piece.strip() for piece in pieces if piece.strip()]
+
+    @staticmethod
+    def _alignment_tokens(text: str) -> list[str]:
+        return re.findall(r"[a-zA-Z0-9']+", (text or "").lower())
 
     def _finalize_unit(self, current: dict[str, Any], gap_after: float) -> dict[str, Any]:
         text = self._clean_text(" ".join(current["texts"]))
@@ -1248,7 +1343,9 @@ class GroqShortsPipeline:
         patterns = [
             r"^(here'?s|this is|the truth is|the problem is|the biggest|one thing|first|next)\b",
             r"^(let me|i want to|i think|i learned|most people|people don'?t)\b",
+            r"^(most (people|creators|founders|teams)|nobody|everyone|stop|never|the reason|the mistake)\b",
             r"^(why|how|what|when|if you|imagine|suppose)\b",
+            r"^(you|your|you'?re|you'?ve|when you|before you|after you)\b",
             r"^(there'?s|there is|there are)\b",
             r"^(so|now)[,.]? (here'?s|let'?s|the point|the question)\b",
         ]
@@ -1686,6 +1783,12 @@ class GroqShortsPipeline:
             final = max(previous_final, editorial)
             if metrics["boundary_score"] < 0.55:
                 final *= 0.55
+            if metrics["first_three_score"] < 0.35:
+                final *= 0.62
+            elif metrics["first_three_score"] < 0.50:
+                final *= 0.82
+            if metrics["hook_score"] < 0.35:
+                final *= 0.72
             if metrics["payoff_score"] < 0.45:
                 final *= 0.72
             if metrics["self_contained_score"] < 0.50:
@@ -1707,9 +1810,10 @@ class GroqShortsPipeline:
         scored.sort(key=lambda c: float(c.get("final_score", 0.0)), reverse=True)
         return scored
 
-    def _editorial_metrics(self, text: str, duration: float) -> dict[str, float]:
+    def _editorial_metrics(self, text: str, duration: float) -> dict[str, Any]:
         boundary = self._boundary_score(text)
         hook = self._hook_score(text)
+        first_three = self._first_three_seconds_score(text, duration)
         payoff = self._payoff_score(text)
         density = self._information_density_score(text, duration)
         self_contained = self._self_contained_score(text)
@@ -1718,23 +1822,27 @@ class GroqShortsPipeline:
         novelty = self._novelty_score(text)
         actionability = self._actionability_score(text)
         context_leak = self._context_leak_score(text)
+        specificity = self._specificity_score(text)
         duration_score = self._soft_duration_score(duration)
         editorial = (
-            0.18 * boundary
-            + 0.14 * hook
-            + 0.16 * payoff
-            + 0.10 * density
-            + 0.11 * self_contained
+            0.17 * boundary
+            + 0.15 * first_three
+            + 0.12 * hook
+            + 0.15 * payoff
+            + 0.09 * self_contained
+            + 0.08 * arc
             + 0.08 * retention
-            + 0.09 * arc
-            + 0.05 * actionability
-            + 0.03 * novelty
-            + 0.03 * context_leak
-            + 0.03 * duration_score
+            + 0.05 * density
+            + 0.04 * novelty
+            + 0.03 * actionability
+            + 0.02 * specificity
+            + 0.01 * context_leak
+            + 0.01 * duration_score
         )
         return {
             "boundary_score": round(boundary, 4),
             "hook_score": round(hook, 4),
+            "first_three_score": round(first_three, 4),
             "payoff_score": round(payoff, 4),
             "density_score": round(density, 4),
             "self_contained_score": round(self_contained, 4),
@@ -1743,7 +1851,9 @@ class GroqShortsPipeline:
             "novelty_score": round(novelty, 4),
             "actionability_score": round(actionability, 4),
             "context_leak_score": round(context_leak, 4),
+            "specificity_score": round(specificity, 4),
             "duration_score": round(duration_score, 4),
+            "hook_archetypes": self._hook_archetypes(text),
             "editorial_score": round(editorial, 4),
         }
 
@@ -1764,20 +1874,114 @@ class GroqShortsPipeline:
         return min(1.0, score)
 
     def _hook_score(self, text: str) -> float:
-        lead = self.validator.first_words(text, 28).lower()
-        patterns = [
-            r"\bwhy\b", r"\bhow to\b", r"\bwhat if\b", r"\bdo you\b",
-            r"\bmost people\b", r"\bnobody\b", r"\bthe truth\b",
-            r"\bbiggest mistake\b", r"\bhere'?s\b", r"\bimagine\b",
-            r"\bsecret\b", r"\bproblem\b", r"\bnever\b", r"\balways\b",
-            r"\b\d+[%x]?\b",
-        ]
-        score = 0.25 + min(0.65, sum(1 for p in patterns if re.search(p, lead)) * 0.16)
-        if re.search(r"^(um|uh|yeah|okay|so yeah|alright)\b", lead):
-            score -= 0.25
-        if len(lead.split()) >= 8:
-            score += 0.10
+        opening = self._opening_text(text, 28)
+        score = (
+            0.20
+            + 0.42 * self._hook_archetype_score(opening)
+            + 0.18 * self._curiosity_gap_score(opening)
+            + 0.12 * self._specificity_score(opening)
+            + 0.08 * self._opening_momentum_score(opening)
+        )
+        score -= self._weak_opening_penalty(opening)
+        if len(opening.split()) >= 8:
+            score += 0.06
         return max(0.0, min(1.0, score))
+
+    def _first_three_seconds_score(self, text: str, duration: float) -> float:
+        opening = self._opening_text(text, self._opening_word_budget(duration))
+        score = (
+            0.45 * self._hook_score(opening)
+            + 0.20 * self._specificity_score(opening)
+            + 0.18 * self._opening_momentum_score(opening)
+            + 0.12 * self._novelty_score(opening)
+            + 0.05 * self._information_density_score(opening, max(3.0, min(duration, 6.0)))
+        )
+        score -= self._weak_opening_penalty(opening) * 0.65
+        if self._context_leak_score(opening) < 0.55:
+            score -= 0.15
+        return max(0.0, min(1.0, score))
+
+    def _opening_word_budget(self, duration: float) -> int:
+        # Approximate the first few seconds when we only have text at scoring time.
+        if duration <= 0:
+            return 24
+        return max(14, min(30, round(duration * 2.8)))
+
+    def _opening_text(self, text: str, word_limit: int = 24) -> str:
+        return self.validator.first_words(text, max(1, word_limit))
+
+    def _hook_archetype_score(self, text: str) -> float:
+        opening = self._clean_text(text).lower()
+        weighted_patterns = [
+            (r"^(if you|when you|do you|you might|you probably|you are|you'?re|you have|you'?ve)\b", 0.22),
+            (r"\b(most people|nobody|everyone thinks|the truth|biggest mistake|stop doing|never do|wrong about)\b", 0.26),
+            (r"\b(why|how to|what if|what happens|the reason|secret|hidden|turns out)\b", 0.18),
+            (r"\b(problem|mistake|risk|danger|cost|challenge|struggle|trap)\b", 0.18),
+            (r"\b(but|however|instead|even though|the catch|the twist)\b", 0.14),
+            (r"\b\d+[%x]?\b", 0.14),
+            (r"\b(do this|try this|use this|start with|remember this|here'?s how)\b", 0.16),
+        ]
+        return min(1.0, sum(weight for pattern, weight in weighted_patterns if re.search(pattern, opening)))
+
+    def _hook_archetypes(self, text: str) -> list[str]:
+        opening = self._opening_text(text, 28).lower()
+        archetypes = []
+        if re.search(r"^(if you|when you|do you|you might|you probably|you are|you'?re|you have|you'?ve)\b", opening):
+            archetypes.append("direct_viewer_problem")
+        if re.search(r"\b(most people|nobody|everyone thinks|the truth|biggest mistake|stop doing|never do|wrong about)\b", opening):
+            archetypes.append("contrarian_claim")
+        if re.search(r"\b(why|how to|what if|what happens|the reason|secret|hidden|turns out)\b", opening):
+            archetypes.append("curiosity_gap")
+        if re.search(r"\b(problem|mistake|risk|danger|cost|challenge|struggle|trap)\b", opening):
+            archetypes.append("pain_or_stakes")
+        if re.search(r"\b(do this|try this|use this|start with|remember this|here'?s how)\b", opening):
+            archetypes.append("actionable_tip")
+        if re.search(r"\b\d+[%x]?\b", opening):
+            archetypes.append("specific_number")
+        return archetypes
+
+    def _curiosity_gap_score(self, text: str) -> float:
+        opening = self._clean_text(text).lower()
+        score = 0.0
+        patterns = [
+            r"\b(why|what if|what happens|the reason|the truth|the problem|the catch|the twist)\b",
+            r"\b(nobody tells you|most people miss|you probably don'?t know|turns out)\b",
+            r"\b(before you|after you|when you|if you)\b",
+            r"\?$",
+        ]
+        score += sum(0.22 for pattern in patterns if re.search(pattern, opening))
+        if re.search(r"\b(but|however|instead|even though)\b", opening):
+            score += 0.16
+        return max(0.0, min(1.0, score))
+
+    def _opening_momentum_score(self, text: str) -> float:
+        opening = self._clean_text(text).lower()
+        score = 0.35
+        if re.search(r"\b(but|because|so|instead|turns out|that means|the point)\b", opening):
+            score += 0.20
+        if re.search(r"\b(problem|mistake|fix|solution|lesson|reason|framework|step)\b", opening):
+            score += 0.18
+        if re.search(r"\b(um|uh|like|you know|sort of|kind of|basically)\b", opening):
+            score -= 0.18
+        words = opening.split()
+        if 8 <= len(words) <= 26:
+            score += 0.12
+        return max(0.0, min(1.0, score))
+
+    def _weak_opening_penalty(self, text: str) -> float:
+        opening = self._clean_text(text).lower()
+        weak_patterns = [
+            r"^(hi|hello|hey|welcome|welcome back|what'?s up)\b",
+            r"^(okay|ok|alright|all right|so yeah|yeah)\b",
+            r"^(today|in this video|in today'?s video)\b",
+            r"^(i want to talk about|we'?re going to talk about|let'?s talk about)\b",
+            r"^(first of all|before we start|to start off)\b",
+            r"\b(make sure to subscribe|hit the like button|link in the description)\b",
+        ]
+        penalty = sum(0.18 for pattern in weak_patterns if re.search(pattern, opening))
+        if re.search(r"^(this|that|these|those|it|they|he|she|we)\b", opening):
+            penalty += 0.12
+        return min(0.55, penalty)
 
     def _payoff_score(self, text: str) -> float:
         tail = self.validator.last_words(text, 34).lower()
@@ -1853,6 +2057,27 @@ class GroqShortsPipeline:
         tokens = self._tokenize(text)
         if tokens:
             score += min(0.18, len(set(tokens)) / max(len(tokens), 1) * 0.20)
+        return max(0.0, min(1.0, score))
+
+    def _specificity_score(self, text: str) -> float:
+        clean = self._clean_text(text)
+        lowered = clean.lower()
+        tokens = re.findall(r"\b[a-zA-Z0-9']+\b", lowered)
+        if not tokens:
+            return 0.0
+
+        score = 0.22
+        if re.search(r"\b\d+[%x]?\b", lowered):
+            score += 0.24
+        if re.search(r"\b(day|week|month|year|seconds|minutes|hours|dollars|percent|views|followers|clients|customers|creators)\b", lowered):
+            score += 0.14
+        if re.search(r"\b(because|so that|which means|as a result|the reason)\b", lowered):
+            score += 0.12
+        if re.search(r"\b(this|that|thing|stuff|something|somehow)\b", lowered):
+            score -= 0.10
+
+        unique_ratio = len(set(tokens)) / max(1, len(tokens))
+        score += min(0.22, unique_ratio * 0.20)
         return max(0.0, min(1.0, score))
 
     def _actionability_score(self, text: str) -> float:
@@ -1985,6 +2210,8 @@ class GroqShortsPipeline:
         if self.validator.has_weak_lead(text):             reasons.append("weak_lead")
         if self.validator.has_mid_topic_start(text):       reasons.append("mid_topic_start")
         if self.validator.has_mid_topic_end(text):         reasons.append("mid_topic_end")
+        if float(c.get("first_three_score", self._first_three_seconds_score(text, duration))) < 0.35:
+            reasons.append("weak_first_three")
         if float(c.get("context_leak_score", 1.0)) < 0.55: reasons.append("context_leak")
         if float(c.get("arc_score", 1.0)) < 0.35:          reasons.append("weak_story_arc")
 
@@ -2024,6 +2251,8 @@ class GroqShortsPipeline:
             reasons.append("not_self_contained")
         if float(c.get("payoff_score", self._payoff_score(text))) < 0.55:
             reasons.append("weak_payoff")
+        if float(c.get("first_three_score", self._first_three_seconds_score(text, duration))) < 0.25:
+            reasons.append("weak_first_three")
         if float(c.get("context_leak_score", self._context_leak_score(text))) < 0.55:
             reasons.append("context_leak")
 
@@ -2215,6 +2444,7 @@ class GroqShortsPipeline:
         boundary = float(candidate.get("boundary_score", self._boundary_score(text)))
         hook = float(candidate.get("hook_score", self._hook_score(text)))
         payoff = float(candidate.get("payoff_score", self._payoff_score(text)))
+        first_three = float(candidate.get("first_three_score", self._first_three_seconds_score(text, duration)))
         density = float(candidate.get("density_score", self._information_density_score(text, duration)))
         retention = float(candidate.get("retention_score", self._retention_score(text)))
         self_contained = float(candidate.get("self_contained_score", self._self_contained_score(text)))
@@ -2222,17 +2452,20 @@ class GroqShortsPipeline:
         novelty = float(candidate.get("novelty_score", self._novelty_score(text)))
         actionability = float(candidate.get("actionability_score", self._actionability_score(text)))
         context_leak = float(candidate.get("context_leak_score", self._context_leak_score(text)))
+        specificity = float(candidate.get("specificity_score", self._specificity_score(text)))
 
         if profile == "tiktok":
             platform = (
-                0.22 * hook
-                + 0.19 * retention
-                + 0.15 * novelty
-                + 0.13 * density
-                + 0.10 * boundary
-                + 0.08 * payoff
-                + 0.05 * context_leak
-                + 0.04 * arc
+                0.23 * first_three
+                + 0.18 * hook
+                + 0.16 * retention
+                + 0.12 * novelty
+                + 0.10 * density
+                + 0.07 * boundary
+                + 0.05 * payoff
+                + 0.03 * specificity
+                + 0.02 * context_leak
+                + 0.00 * arc
                 + 0.04 * self._duration_preference(duration, 12.0, 44.0, 68.0)
             )
             platform += self._pattern_bonus(
@@ -2251,15 +2484,17 @@ class GroqShortsPipeline:
             )
         elif profile == "instagram_reel":
             platform = (
-                0.19 * payoff
-                + 0.17 * self_contained
-                + 0.14 * boundary
+                0.15 * payoff
+                + 0.16 * self_contained
+                + 0.13 * boundary
                 + 0.13 * actionability
-                + 0.11 * arc
-                + 0.10 * hook
-                + 0.08 * retention
-                + 0.04 * context_leak
-                + 0.04 * self._duration_preference(duration, 18.0, 62.0, 88.0)
+                + 0.11 * first_three
+                + 0.10 * arc
+                + 0.08 * hook
+                + 0.07 * retention
+                + 0.03 * specificity
+                + 0.02 * context_leak
+                + 0.02 * self._duration_preference(duration, 18.0, 62.0, 88.0)
             )
             platform += self._pattern_bonus(
                 text,
@@ -2277,15 +2512,17 @@ class GroqShortsPipeline:
             )
         elif profile == "youtube_shorts":
             platform = (
-                0.18 * hook
-                + 0.17 * retention
-                + 0.16 * self_contained
-                + 0.14 * payoff
-                + 0.12 * arc
-                + 0.09 * density
-                + 0.06 * boundary
-                + 0.04 * context_leak
-                + 0.04 * self._duration_preference(duration, 20.0, 58.0, 72.0)
+                0.15 * first_three
+                + 0.15 * hook
+                + 0.15 * payoff
+                + 0.14 * arc
+                + 0.13 * retention
+                + 0.12 * self_contained
+                + 0.07 * density
+                + 0.04 * boundary
+                + 0.02 * specificity
+                + 0.01 * context_leak
+                + 0.02 * self._duration_preference(duration, 20.0, 58.0, 72.0)
             )
             platform += self._pattern_bonus(
                 text,
@@ -2304,7 +2541,45 @@ class GroqShortsPipeline:
         else:
             platform = base
 
+        platform = self._apply_platform_quality_floor(
+            platform=platform,
+            boundary=boundary,
+            payoff=payoff,
+            self_contained=self_contained,
+            context_leak=context_leak,
+            first_three=first_three,
+        )
+
         return round(0.55 * base + 0.45 * min(1.0, platform), 4)
+
+    def _apply_platform_quality_floor(
+        self,
+        *,
+        platform: float,
+        boundary: float,
+        payoff: float,
+        self_contained: float,
+        context_leak: float,
+        first_three: float,
+    ) -> float:
+        if boundary < 0.62:
+            platform *= 0.58
+        elif boundary < 0.78:
+            platform *= 0.82
+
+        if first_three < 0.35:
+            platform *= 0.60
+        elif first_three < 0.50:
+            platform *= 0.82
+
+        if payoff < 0.45:
+            platform *= 0.70
+        if self_contained < 0.55:
+            platform *= 0.72
+        if context_leak < 0.55:
+            platform *= 0.76
+
+        return max(0.0, min(1.0, platform))
 
     def _duration_preference(
         self,
@@ -2432,6 +2707,9 @@ class GroqShortsPipeline:
         except (TypeError, ValueError):
             return 0.0
 
+    def _word_midpoint(self, word: dict[str, Any]) -> float:
+        return (self._word_start(word) + self._word_end(word)) / 2.0
+
     #
 
     def _write_ass_for_clip(
@@ -2548,9 +2826,9 @@ class GroqShortsPipeline:
                     "-y",
                     "-threads", "1",
                     "-filter_threads", "1",
+                    "-i",  source_video_path,
                     "-ss", str(clip_start),
                     "-t",  str(duration),
-                    "-i",  source_video_path,
                     "-vf", vf,
                     "-c:v", "libx264",
                     "-preset", "veryfast",
@@ -2613,9 +2891,9 @@ class GroqShortsPipeline:
                 "-y",
                 "-threads", "1",
                 "-filter_threads", "1",
+                "-i",  source_video_path,
                 "-ss", str(clip_start),
                 "-t",  str(duration),
-                "-i",  source_video_path,
                 "-filter_complex", filter_complex,
                 "-map", map_arg,
                 "-map", "0:a?",
