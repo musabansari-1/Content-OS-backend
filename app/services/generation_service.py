@@ -165,7 +165,7 @@
 #     file.file.seek(0, 2)
 #     file_size = file.file.tell()
 #     file.file.seek(0)
-#     max_size = 100 * 1024 * 1024
+#     max_size = int(1.0 * 1024 * 1024 * 1024)
 #     if file_size > max_size:
 #         logger.warning(
 #             "Upload-video rejected for size: filename=%s size_bytes=%s",
@@ -174,7 +174,7 @@
 #         )
 #         raise HTTPException(
 #             status_code=400,
-#             detail=f"File too large. Maximum size is 100MB. Your file is {file_size / (1024 * 1024):.1f}MB.",
+#             detail=f"File too large. Maximum size is 1.0GB. Your file is {file_size / (1024 * 1024 * 1024):.2f}GB.",
 #         )
 
 #     try:
@@ -1262,7 +1262,7 @@ def process_uploaded_video(file: UploadFile, user_id: int) -> dict[str, Any]:
     file_size = file.file.tell()
     file.file.seek(0)
 
-    max_size = 100 * 1024 * 1024
+    max_size = int(1.0 * 1024 * 1024 * 1024)
 
     if file_size > max_size:
         logger.warning(
@@ -1272,7 +1272,7 @@ def process_uploaded_video(file: UploadFile, user_id: int) -> dict[str, Any]:
         )
         raise HTTPException(
             status_code=400,
-            detail=f"File too large. Maximum size is 100MB. Your file is {file_size / (1024 * 1024):.1f}MB.",
+            detail=f"File too large. Maximum size is 1.0GB. Your file is {file_size / (1024 * 1024 * 1024):.2f}GB.",
         )
 
     try:
