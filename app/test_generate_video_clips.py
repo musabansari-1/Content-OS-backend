@@ -1,6 +1,40 @@
 import unittest
+from types import SimpleNamespace
 
-from app.utils.generate_video_clips import ClipCandidate, GroqShortsPipeline
+from app.utils.generate_video_clips import ClipCandidate, GroqShortsPipeline, TranscriptChunker
+
+
+class _FallbackChatCompletions:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def create(self, **kwargs):  # noqa: ANN003, ANN201
+        self.calls.append(kwargs)
+        if "response_format" in kwargs:
+            raise RuntimeError("response_format is not supported by this model")
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=(
+                            "```json\n"
+                            "{\"chunks\":[{\"start_unit\":0,\"end_unit\":0,\"title\":\"Hook\","
+                            "\"summary\":\"Strong hook\",\"has_clean_start\":true,"
+                            "\"has_clean_end\":true,\"is_self_contained\":true,"
+                            "\"hook_strength\":8,\"payoff_strength\":7,"
+                            "\"shareability\":7,\"reason\":\"clean\"}]}"
+                            "\n```"
+                        )
+                    )
+                )
+            ]
+        )
+
+
+class _FallbackClient:
+    def __init__(self) -> None:
+        self.completions = _FallbackChatCompletions()
+        self.chat = SimpleNamespace(completions=self.completions)
 
 
 class GenerateVideoClipsBoundaryTests(unittest.TestCase):
@@ -241,6 +275,26 @@ class GenerateVideoClipsBoundaryTests(unittest.TestCase):
         self.assertGreaterEqual(float(optimized["start"]), 4.3)  # type: ignore[index]
         self.assertIn("boundary_breakdown", optimized)  # type: ignore[operator]
         self.assertIsInstance(rejected, list)
+
+    def test_chunker_retries_without_structured_output_for_openrouter_models(self) -> None:
+        client = _FallbackClient()
+        chunker = TranscriptChunker(client=client, model="nvidia/nemotron-3-super-120b-a12b:free")
+        units = [
+            self._unit(
+                0.0,
+                12.0,
+                "Most creators lose momentum because they plan for a perfect day.",
+                gap_before=1.0,
+            )
+        ]
+
+        chunks = chunker.chunk_units(units)
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["title"], "Hook")
+        self.assertEqual(len(client.completions.calls), 2)
+        self.assertIn("response_format", client.completions.calls[0])
+        self.assertNotIn("response_format", client.completions.calls[1])
 
     def test_reasonable_sentence_without_topic_boundary_cannot_start_clip(self) -> None:
         unit = self._unit(

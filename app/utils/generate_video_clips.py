@@ -98,6 +98,55 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_CLIP_SELECTION_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 
 
+def _extract_json_object(raw_content: str) -> dict[str, Any]:
+    content = (raw_content or "").strip()
+    if not content:
+        return {}
+
+    fenced_match = re.search(r"```(?:json)?\s*(.*?)\s*```", content, flags=re.IGNORECASE | re.DOTALL)
+    if fenced_match:
+        content = fenced_match.group(1).strip()
+
+    try:
+        parsed = json.loads(content)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        start = content.find("{")
+        end = content.rfind("}")
+        if start >= 0 and end > start:
+            parsed = json.loads(content[start : end + 1])
+            return parsed if isinstance(parsed, dict) else {}
+        raise
+
+
+def _chat_completion_with_json_fallback(
+    *,
+    client: Any,
+    model: str,
+    temperature: float,
+    messages: list[dict[str, str]],
+    response_format: dict[str, Any],
+):
+    try:
+        return client.chat.completions.create(
+            model=model,
+            temperature=temperature,
+            response_format=response_format,
+            messages=messages,
+        )
+    except Exception as error:
+        logger.warning(
+            "Structured clip LLM call failed; retrying without response_format. model=%s error=%s",
+            model,
+            error,
+        )
+        return client.chat.completions.create(
+            model=model,
+            temperature=temperature,
+            messages=messages,
+        )
+
+
 #
 # Data model
 #
@@ -403,10 +452,7 @@ Return ONLY valid JSON - no explanation, no markdown, no preamble.
         if not units or not self.client:
             return []
 
-        response = self.client.chat.completions.create(
-            model=self.model,
-            temperature=0.2,
-            response_format={
+        response_format = {
                 "type": "json_schema",
                 "json_schema": {
                     "name": "transcript_chunks",
@@ -444,8 +490,8 @@ Return ONLY valid JSON - no explanation, no markdown, no preamble.
                         "additionalProperties": False,
                     },
                 },
-            },
-            messages=[
+            }
+        messages = [
                 {"role": "system", "content": self.SYSTEM_PROMPT},
                 {
                     "role": "user",
@@ -475,11 +521,17 @@ Return ONLY valid JSON - no explanation, no markdown, no preamble.
                         indent=2,
                     ),
                 },
-            ],
-            )
+            ]
+        response = _chat_completion_with_json_fallback(
+            client=self.client,
+            model=self.model,
+            temperature=0.2,
+            response_format=response_format,
+            messages=messages,
+        )
 
         try:
-            parsed = json.loads(response.choices[0].message.content or "{}")
+            parsed = _extract_json_object(response.choices[0].message.content or "{}")
         except json.JSONDecodeError:
             logger.warning("Chunker returned invalid JSON; falling back to semantic chunking.")
             return []
@@ -560,10 +612,7 @@ Return ONLY valid JSON:
 
         for i in range(0, len(candidates), batch_size):
             batch = candidates[i : i + batch_size]
-            response = self.client.chat.completions.create(
-                model=self.model,
-                temperature=0.2,
-                response_format={
+            response_format = {
                     "type": "json_schema",
                     "json_schema": {
                         "name": "scored_chunks",
@@ -605,8 +654,8 @@ Return ONLY valid JSON:
                             "additionalProperties": False,
                         },
                     },
-                },
-                messages=[
+                }
+            messages = [
                     {"role": "system", "content": self.SYSTEM_PROMPT},
                     {
                         "role": "user",
@@ -639,11 +688,17 @@ Return ONLY valid JSON:
                             indent=2,
                         ),
                     },
-                ],
+                ]
+            response = _chat_completion_with_json_fallback(
+                client=self.client,
+                model=self.model,
+                temperature=0.2,
+                response_format=response_format,
+                messages=messages,
             )
 
             try:
-                parsed = json.loads(response.choices[0].message.content or "{}")
+                parsed = _extract_json_object(response.choices[0].message.content or "{}")
             except json.JSONDecodeError:
                 logger.warning("Scorer returned invalid JSON for batch starting at index %s", i)
                 continue
