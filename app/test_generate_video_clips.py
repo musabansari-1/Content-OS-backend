@@ -148,6 +148,100 @@ class GenerateVideoClipsBoundaryTests(unittest.TestCase):
         self.assertEqual(units[1]["start"], words[5]["start"])
         self.assertTrue(units[1]["text"].startswith("Most creators lose momentum"))
 
+    def test_atomic_and_reasoning_units_are_separate_layers(self) -> None:
+        segments = [
+            {
+                "start": 0.0,
+                "end": 12.0,
+                "text": (
+                    "Most creators lose momentum because they plan for a perfect day. "
+                    "The fix is to design a smaller promise. "
+                    "That smaller promise survives busy days."
+                ),
+            }
+        ]
+        words = [
+            {"word": word, "start": round(index * 0.42, 2), "end": round(index * 0.42 + 0.28, 2)}
+            for index, word in enumerate(
+                "Most creators lose momentum because they plan for a perfect day The fix is to design a smaller promise That smaller promise survives busy days".split()
+            )
+        ]
+
+        atomic_units = self.pipeline.build_atomic_units(segments, words)
+        reasoning_units = self.pipeline.build_reasoning_units(atomic_units)
+
+        self.assertGreaterEqual(len(atomic_units), 3)
+        self.assertGreaterEqual(len(reasoning_units), 1)
+        self.assertTrue(all(unit.get("atomic") for unit in atomic_units))
+
+    def test_hook_features_detect_direct_problem_and_contrarian_hook(self) -> None:
+        features = self.pipeline.extract_hook_features(
+            "If you keep missing uploads, the problem is not discipline. "
+            "Your plan is too fragile, so the fix is to make the promise smaller."
+        )
+
+        self.assertGreater(features.direct_problem_score, 0.5)
+        self.assertGreater(features.stop_power, 0.4)
+        self.assertIn("direct_problem", features.hook_archetypes)
+
+    def test_prosody_features_score_pause_boundaries(self) -> None:
+        words = [
+            {"word": "Before.", "start": 0.0, "end": 1.0},
+            {"word": "Strong", "start": 2.0, "end": 2.3},
+            {"word": "hook.", "start": 2.4, "end": 3.0},
+            {"word": "After.", "start": 4.0, "end": 4.4},
+        ]
+
+        features = self.pipeline._prosody_features_for_window(words, 2.0, 3.0)
+
+        self.assertGreaterEqual(features.pause_before_start, 1.0)
+        self.assertGreaterEqual(features.pause_after_end, 1.0)
+        self.assertTrue(features.likely_turn_boundary_start)
+        self.assertTrue(features.likely_turn_boundary_end)
+
+    def test_boundary_optimizer_can_skip_generic_intro_for_real_hook(self) -> None:
+        atomic_units = [
+            self._unit(
+                0.0,
+                4.0,
+                "Today I want to talk about creator consistency.",
+                gap_before=1.0,
+            ),
+            self._unit(
+                4.3,
+                11.0,
+                "Most creators lose momentum because they plan for a perfect day.",
+                gap_before=0.3,
+            ),
+            self._unit(
+                11.1,
+                19.0,
+                "The fix is to design a smaller promise you can keep every day.",
+                gap_before=0.1,
+            ),
+        ]
+        candidate = self.pipeline._candidate_from_units(
+            units=atomic_units,
+            start_idx=0,
+            end_idx=2,
+            source="test",
+        )
+
+        optimized, variants, rejected = self.pipeline._optimize_candidate_boundaries(
+            candidate=candidate,  # type: ignore[arg-type]
+            atomic_units=atomic_units,
+            words=[],
+            source_video_path="",
+            video_duration=30.0,
+            genre_profile="educational_business",
+        )
+
+        self.assertIsNotNone(optimized)
+        self.assertGreater(len(variants), 0)
+        self.assertGreaterEqual(float(optimized["start"]), 4.3)  # type: ignore[index]
+        self.assertIn("boundary_breakdown", optimized)  # type: ignore[operator]
+        self.assertIsInstance(rejected, list)
+
     def test_reasonable_sentence_without_topic_boundary_cannot_start_clip(self) -> None:
         unit = self._unit(
             18.0,

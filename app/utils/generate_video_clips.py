@@ -9,7 +9,7 @@ Improvements over original:
   - FFmpeg subprocess errors surfaced with full stderr context
   - Chunker requests 10-15 candidates spread across the full transcript
   - yt-dlp helper to download a YouTube URL directly
-  - Graceful handling when Groq or yt-dlp are not installed
+  - Graceful handling when the OpenRouter/OpenAI client or yt-dlp are not installed
 
 Clip selection improvements (v3):
   - Smarter _build_units: merges segments into 8-20s paragraph-level blocks
@@ -53,6 +53,15 @@ Editorial upgrades (v7):
   - Applies platform-native ranking weights for TikTok, Reels, and Shorts
   - Penalizes generic setup, context leaks, weak payoff, and low boundary quality
     before platform selection
+
+Boundary optimization upgrades (v8):
+  - Keeps atomic edit units separate from reasoning units
+  - Treats LLM/deterministic chunks as semantic regions, then generates local
+    boundary variants around each region
+  - Scores boundaries with lexical independence, hook strength, payoff closure,
+    pause/speech-rate proxies, genre priors, and detailed debug breakdowns
+  - Uses OpenRouter/Nemotron for clip selection/scoring while preserving Groq
+    transcription bundle compatibility
 """
 
 from __future__ import annotations
@@ -65,7 +74,7 @@ import shutil
 import subprocess
 import sys
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -73,9 +82,9 @@ from typing import Any
 #
 
 try:
-    from groq import Groq
+    from openai import OpenAI
 except ImportError:
-    Groq = None  # type: ignore
+    OpenAI = None  # type: ignore
 
 try:
     import yt_dlp  # type: ignore
@@ -85,10 +94,57 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_CLIP_SELECTION_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+
 
 #
 # Data model
 #
+
+
+@dataclass
+class ProsodyFeatures:
+    pause_before_start: float = 0.0
+    pause_after_end: float = 0.0
+    speech_rate_start: float = 0.0
+    speech_rate_mid: float = 0.0
+    speech_rate_end: float = 0.0
+    energy_start_mean: float = 0.5
+    energy_end_mean: float = 0.5
+    energy_delta_start: float = 0.0
+    energy_delta_end: float = 0.0
+    likely_turn_boundary_start: bool = False
+    likely_turn_boundary_end: bool = False
+
+
+@dataclass
+class HookFeatures:
+    stop_power: float = 0.0
+    instant_clarity: float = 0.0
+    payoff_promise: float = 0.0
+    native_short_form_pacing: float = 0.0
+    hook_archetypes: list[str] = field(default_factory=list)
+    weak_intro_language: bool = False
+    specificity_score: float = 0.0
+    curiosity_gap_score: float = 0.0
+    direct_problem_score: float = 0.0
+    contrarian_score: float = 0.0
+    number_specificity_score: float = 0.0
+    actionable_tip_score: float = 0.0
+
+
+@dataclass
+class BoundaryScoreBreakdown:
+    start_text_score: float = 0.0
+    end_text_score: float = 0.0
+    prosody_start_score: float = 0.5
+    prosody_end_score: float = 0.5
+    context_independence_score: float = 0.0
+    payoff_closure_score: float = 0.0
+    pause_alignment_score: float = 0.5
+    final_boundary_score: float = 0.0
+    penalties: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -103,6 +159,19 @@ class ClipCandidate:
     transcript_text: str
     target_asset_type: str | None = None
     platform_profile: str | None = None
+    region_start: float | None = None
+    region_end: float | None = None
+    optimized_start: float | None = None
+    optimized_end: float | None = None
+    source_candidate_type: str | None = None
+    genre_profile: str | None = None
+    prosody_features: dict[str, Any] | None = None
+    hook_features: dict[str, Any] | None = None
+    boundary_breakdown: dict[str, Any] | None = None
+    quote_density_score: float | None = None
+    visual_editability_score: float | None = None
+    retention_risk_score: float | None = None
+    debug_notes: list[str] = field(default_factory=list)
 
 
 #
@@ -731,6 +800,56 @@ class GroqShortsPipeline:
     MAX_BOUNDARY_REPAIR_UNITS = 6
     RENDER_LEAD_PAD_SECONDS = 0.35
     RENDER_TRAIL_PAD_SECONDS = 0.65
+    BOUNDARY_START_OFFSETS = (-8.0, -5.0, -3.0, -1.5, 0.0, 1.0, 2.0, 4.0)
+    BOUNDARY_END_OFFSETS = (-4.0, -2.0, 0.0, 2.0, 4.0, 7.0, 10.0)
+    MAX_VARIANTS_PER_REGION = 36
+    GENRE_PROFILES: dict[str, dict[str, float]] = {
+        "podcast_interview": {
+            "hook_weight": 1.08,
+            "payoff_weight": 1.02,
+            "quote_weight": 1.28,
+            "setup_tolerance": 1.10,
+            "ideal_min": 18.0,
+            "ideal_max": 58.0,
+            "soft_max": 90.0,
+        },
+        "educational_business": {
+            "hook_weight": 1.10,
+            "payoff_weight": 1.16,
+            "quote_weight": 1.00,
+            "setup_tolerance": 0.92,
+            "ideal_min": 24.0,
+            "ideal_max": 68.0,
+            "soft_max": 95.0,
+        },
+        "storytelling": {
+            "hook_weight": 0.96,
+            "payoff_weight": 1.20,
+            "quote_weight": 0.92,
+            "setup_tolerance": 1.22,
+            "ideal_min": 30.0,
+            "ideal_max": 78.0,
+            "soft_max": 110.0,
+        },
+        "comedy_entertainment": {
+            "hook_weight": 1.22,
+            "payoff_weight": 1.10,
+            "quote_weight": 0.90,
+            "setup_tolerance": 0.80,
+            "ideal_min": 10.0,
+            "ideal_max": 36.0,
+            "soft_max": 60.0,
+        },
+        "general_talking_head": {
+            "hook_weight": 1.00,
+            "payoff_weight": 1.00,
+            "quote_weight": 1.00,
+            "setup_tolerance": 1.00,
+            "ideal_min": 18.0,
+            "ideal_max": 62.0,
+            "soft_max": 88.0,
+        },
+    }
 
     def __init__(
         self,
@@ -760,6 +879,7 @@ class GroqShortsPipeline:
         create_blur_background: bool = False,
         debug: bool = True,
         target_asset_types: list[str] | None = None,
+        genre_profile: str | None = None,
     ) -> dict[str, Any]:
         source_video = Path(source_video_path)
         self._validate_process_inputs(source_video, clip_count, words_per_caption)
@@ -805,8 +925,15 @@ class GroqShortsPipeline:
 
         video_meta = self._probe_video(str(source_video))
         logger.info("Video metadata: %s", video_meta)
-        units      = self._build_units(transcript["segments"], transcript["words"])
-        logger.info("Built transcript units: count=%s", len(units))
+        atomic_units = self.build_atomic_units(transcript["segments"], transcript["words"])
+        units = self.build_reasoning_units(atomic_units)
+        resolved_genre_profile = self._resolve_genre_profile(genre_profile, transcript["text"])
+        logger.info(
+            "Built transcript units: atomic=%s reasoning=%s genre_profile=%s",
+            len(atomic_units),
+            len(units),
+            resolved_genre_profile,
+        )
         if not units:
             raise ValueError("Transcription did not produce any usable clip units.")
 
@@ -834,6 +961,11 @@ class GroqShortsPipeline:
             units,
             clip_count=clip_count,
             debug_dir=debug_dir if debug else None,
+            atomic_units=atomic_units,
+            words=transcript["words"],
+            source_video_path=str(source_video),
+            video_duration=float(video_meta.get("duration") or 0.0),
+            genre_profile=resolved_genre_profile,
         )
         logger.info(
             "Prepared candidate pool: llm=%s deterministic=%s validated=%s",
@@ -860,6 +992,9 @@ class GroqShortsPipeline:
         logger.info("Selected %s diverse candidates", len(candidate_dicts))
 
         if debug:
+            self._write_json(debug_dir / "atomic_units.json", atomic_units)
+            self._write_json(debug_dir / "reasoning_units.json", units)
+            self._write_json(debug_dir / "genre_profile.json", {"genre_profile": resolved_genre_profile})
             self._write_json(debug_dir / "raw_llm_chunks.json",  raw_llm_chunks)
             self._write_json(debug_dir / "final_candidates.json", candidate_dicts)
 
@@ -1106,13 +1241,58 @@ class GroqShortsPipeline:
         Build sentence/thought units that are small enough for precise clipping
         and large enough for the LLM to reason about complete ideas.
         """
+        return self.build_reasoning_units(self.build_atomic_units(segments, words or []))
+
+    def build_atomic_units(
+        self,
+        segments: list[dict[str, Any]],
+        words: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Build the finest reliable edit units from segment text and word timing.
+
+        These are sentence/prosody phrase sized and are used for boundary
+        optimization and rendering decisions. Reasoning units are built from
+        these atoms and passed to the LLM.
+        """
         atoms = self._sentence_atoms_from_segments_and_words(segments, words or [])
         if not atoms:
             atoms = self._sentence_atoms_from_words(words or [])
         if not atoms:
             atoms = self._sentence_atoms_from_segments(segments)
 
-        if not atoms:
+        atomic_units: list[dict[str, Any]] = []
+        previous_end: float | None = None
+        for idx, atom in enumerate(atoms):
+            start = float(atom["start"])
+            end = float(atom["end"])
+            text = self._clean_text(atom.get("text") or "")
+            if not text or end <= start:
+                continue
+
+            gap_before = 0.0 if previous_end is None else max(0.0, start - previous_end)
+            atomic_units.append(
+                {
+                    "start": round(start, 2),
+                    "end": round(end, 2),
+                    "text": text,
+                    "gap_before": round(gap_before, 2),
+                    "gap_after": 0.0,
+                    "is_first": idx == 0,
+                    "clean_start": self._has_reasonable_start(text),
+                    "clean_end": self._has_reasonable_end(text),
+                    "topic_start": self._looks_like_topic_start(text),
+                    "atomic": True,
+                }
+            )
+            if len(atomic_units) > 1:
+                atomic_units[-2]["gap_after"] = round(gap_before, 2)
+            previous_end = end
+
+        return atomic_units
+
+    def build_reasoning_units(self, atomic_units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not atomic_units:
             return []
 
         MIN_UNIT_DURATION = 4.0
@@ -1124,7 +1304,7 @@ class GroqShortsPipeline:
         current: dict[str, Any] | None = None
         previous_end: float | None = None
 
-        for atom in atoms:
+        for atom in atomic_units:
             start = float(atom["start"])
             end = float(atom["end"])
             text = atom["text"].strip()
@@ -1457,7 +1637,7 @@ class GroqShortsPipeline:
         max_abs = self.MAX_CLIP_DURATION
 
         for i in range(len(units)):
-            if not self._unit_can_start_clip(units[i]):
+            if not self._unit_can_start_clip(units[i]) and not self._unit_is_promising_region_anchor(units[i]):
                 continue
 
             for j in range(i, len(units)):
@@ -1480,6 +1660,23 @@ class GroqShortsPipeline:
                     candidates.append(candidate)
 
         return candidates
+
+    def _unit_is_promising_region_anchor(self, unit: dict[str, Any]) -> bool:
+        text = unit.get("text", "")
+        if not self._has_reasonable_start(text):
+            return False
+        if self.validator.has_mid_topic_start(text) or self.validator.has_weak_lead(text):
+            return False
+        hook_features = self.extract_hook_features(text)
+        if hook_features.weak_intro_language:
+            return False
+        return (
+            hook_features.stop_power >= 0.46
+            or hook_features.direct_problem_score >= 0.55
+            or hook_features.contrarian_score >= 0.42
+            or hook_features.number_specificity_score >= 0.55
+            or hook_features.actionable_tip_score >= 0.55
+        )
 
     def _candidate_from_units(
         self,
@@ -1522,6 +1719,10 @@ class GroqShortsPipeline:
             "start_unit": start_idx,
             "end_unit": end_idx,
             "source": source,
+            "region_start": round(start, 2),
+            "region_end": round(end, 2),
+            "source_candidate_type": source,
+            "debug_notes": [f"semantic_region_source={source}"],
         }
         return candidate
 
@@ -1601,13 +1802,813 @@ class GroqShortsPipeline:
             and not self.validator.has_mid_topic_end(text)
         )
 
+    def build_boundary_feature_context(
+        self,
+        source_video_path: str,
+        words: list[dict[str, Any]],
+        atomic_units: list[dict[str, Any]],
+        video_duration: float = 0.0,
+    ) -> dict[str, Any]:
+        return {
+            "source_video_path": source_video_path,
+            "words": sorted(words or [], key=self._word_start),
+            "atomic_units": atomic_units,
+            "video_duration": video_duration,
+        }
+
+    def compute_pause_features(
+        self,
+        words: list[dict[str, Any]],
+        start: float,
+        end: float,
+    ) -> tuple[float, float]:
+        previous_word_end = self._previous_word_end(words, start)
+        next_word_start = self._next_word_start(words, end)
+        pause_before = max(0.0, start - previous_word_end) if previous_word_end is not None else 0.0
+        pause_after = max(0.0, next_word_start - end) if next_word_start is not None else 0.0
+        return round(pause_before, 3), round(pause_after, 3)
+
+    def estimate_speech_rate(
+        self,
+        words: list[dict[str, Any]],
+        start: float,
+        end: float,
+    ) -> float:
+        duration = max(0.001, end - start)
+        count = sum(
+            1
+            for word in words
+            if self._word_midpoint(word) >= start and self._word_midpoint(word) <= end
+        )
+        return round(count / duration, 3)
+
+    def compute_energy_curve(
+        self,
+        source_video_path: str,
+        start: float,
+        end: float,
+    ) -> dict[str, float]:
+        """
+        Lightweight FFmpeg-backed RMS energy proxy.
+
+        It is opt-in via CLIP_ENABLE_FFMPEG_ENERGY=true because boundary
+        optimization can score many variants. Without the flag, pause and speech
+        rate features still provide deterministic prosody signal and this returns
+        neutral energy values.
+        """
+        neutral = {"start_mean": 0.5, "end_mean": 0.5, "delta_start": 0.0, "delta_end": 0.0}
+        if (os.getenv("CLIP_ENABLE_FFMPEG_ENERGY", "false") or "").strip().lower() not in {"1", "true", "yes"}:
+            return neutral
+        if not source_video_path or not Path(source_video_path).exists() or end <= start:
+            return neutral
+
+        try:
+            start_mean = self._extract_audio_rms(source_video_path, start, min(end, start + 1.25))
+            pre_start_mean = self._extract_audio_rms(source_video_path, max(0.0, start - 1.25), start)
+            end_mean = self._extract_audio_rms(source_video_path, max(start, end - 1.25), end)
+            post_end_mean = self._extract_audio_rms(source_video_path, end, end + 1.25)
+        except Exception:
+            logger.debug("Energy extraction failed for window start=%s end=%s", start, end, exc_info=True)
+            return neutral
+
+        return {
+            "start_mean": round(start_mean, 4),
+            "end_mean": round(end_mean, 4),
+            "delta_start": round(start_mean - pre_start_mean, 4),
+            "delta_end": round(end_mean - post_end_mean, 4),
+        }
+
+    def _extract_audio_rms(self, source_video_path: str, start: float, end: float) -> float:
+        duration = max(0.0, end - start)
+        if duration <= 0.05:
+            return 0.0
+        if not self._is_executable_available(self.ffmpeg_bin):
+            return 0.5
+
+        result = subprocess.run(
+            [
+                self.ffmpeg_bin,
+                "-v",
+                "error",
+                "-ss",
+                str(max(0.0, start)),
+                "-t",
+                str(duration),
+                "-i",
+                source_video_path,
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "8000",
+                "-f",
+                "s16le",
+                "pipe:1",
+            ],
+            check=True,
+            capture_output=True,
+            timeout=12,
+        )
+        raw = result.stdout
+        if len(raw) < 2:
+            return 0.0
+
+        sample_count = len(raw) // 2
+        total = 0
+        for index in range(0, sample_count * 2, 2):
+            value = int.from_bytes(raw[index : index + 2], byteorder="little", signed=True)
+            total += value * value
+        rms = (total / max(1, sample_count)) ** 0.5
+        return max(0.0, min(1.0, rms / 32768.0))
+
+    def extract_audio_features_for_window(
+        self,
+        source_video_path: str,
+        words: list[dict[str, Any]],
+        start: float,
+        end: float,
+    ) -> ProsodyFeatures:
+        return self._prosody_features_for_window(words, start, end, source_video_path)
+
+    def _prosody_features_for_window(
+        self,
+        words: list[dict[str, Any]],
+        start: float,
+        end: float,
+        source_video_path: str | None = None,
+    ) -> ProsodyFeatures:
+        sorted_words = sorted(words or [], key=self._word_start)
+        pause_before, pause_after = self.compute_pause_features(sorted_words, start, end)
+        energy = self.compute_energy_curve(source_video_path or "", start, end)
+        return ProsodyFeatures(
+            pause_before_start=pause_before,
+            pause_after_end=pause_after,
+            speech_rate_start=self.estimate_speech_rate(sorted_words, start, min(end, start + 3.0)),
+            speech_rate_mid=self.estimate_speech_rate(sorted_words, start, end),
+            speech_rate_end=self.estimate_speech_rate(sorted_words, max(start, end - 3.0), end),
+            energy_start_mean=energy["start_mean"],
+            energy_end_mean=energy["end_mean"],
+            energy_delta_start=energy["delta_start"],
+            energy_delta_end=energy["delta_end"],
+            likely_turn_boundary_start=pause_before >= 0.35,
+            likely_turn_boundary_end=pause_after >= 0.35,
+        )
+
+    def extract_hook_features(
+        self,
+        text: str,
+        first_n_words: int = 28,
+        first_n_seconds_words: str | None = None,
+    ) -> HookFeatures:
+        opening = self._clean_text(first_n_seconds_words or self._opening_text(text, first_n_words))
+        direct_problem = self._direct_problem_score(opening)
+        contrarian = self._contrarian_score(opening)
+        number_specificity = self._number_specificity_score(opening)
+        actionable_tip = self._actionable_tip_feature_score(opening)
+        specificity = self._specificity_score(opening)
+        curiosity = self._curiosity_gap_score(opening)
+        weak_intro = self._weak_opening_penalty(opening) >= 0.18
+        stop_power = max(
+            self._hook_archetype_score(opening),
+            0.26 * direct_problem
+            + 0.24 * contrarian
+            + 0.18 * curiosity
+            + 0.16 * number_specificity
+            + 0.16 * actionable_tip,
+        )
+        instant_clarity = max(0.0, min(1.0, 0.42 * specificity + 0.34 * self._context_leak_score(opening) + 0.24 * self._opening_momentum_score(opening)))
+        payoff_promise = max(0.0, min(1.0, 0.55 * self._payoff_score(text) + 0.45 * self._arc_score(text)))
+        native_pacing = max(0.0, min(1.0, 0.55 * self._information_density_score(opening, 3.0) + 0.45 * self._opening_momentum_score(opening)))
+
+        return HookFeatures(
+            stop_power=round(max(0.0, min(1.0, stop_power)), 4),
+            instant_clarity=round(instant_clarity, 4),
+            payoff_promise=round(payoff_promise, 4),
+            native_short_form_pacing=round(native_pacing, 4),
+            hook_archetypes=self.detect_hook_archetypes(opening),
+            weak_intro_language=weak_intro,
+            specificity_score=round(specificity, 4),
+            curiosity_gap_score=round(curiosity, 4),
+            direct_problem_score=round(direct_problem, 4),
+            contrarian_score=round(contrarian, 4),
+            number_specificity_score=round(number_specificity, 4),
+            actionable_tip_score=round(actionable_tip, 4),
+        )
+
+    def score_hook_features(self, features: HookFeatures) -> float:
+        score = (
+            0.26 * features.stop_power
+            + 0.22 * features.instant_clarity
+            + 0.18 * features.payoff_promise
+            + 0.14 * features.native_short_form_pacing
+            + 0.08 * features.specificity_score
+            + 0.05 * features.curiosity_gap_score
+            + 0.04 * features.direct_problem_score
+            + 0.03 * features.contrarian_score
+        )
+        if features.weak_intro_language:
+            score *= 0.72
+        return round(max(0.0, min(1.0, score)), 4)
+
+    def detect_hook_archetypes(self, text: str) -> list[str]:
+        opening = self._clean_text(text).lower()
+        archetypes = list(self._hook_archetypes(opening))
+        pattern_map = [
+            ("bold_claim", r"\b(the truth is|here'?s the truth|the biggest|never|always|no one)\b"),
+            ("direct_problem", r"^(if you|when you|you'?re|you have|you keep|do you)\b"),
+            ("contrarian_take", r"\b(most people|everyone thinks|wrong|myth|actually|instead)\b"),
+            ("number_specificity", r"\b\d+[%x]?\b"),
+            ("story_drop_in", r"^(i remember|one day|when i|the moment|years ago)\b"),
+            ("emotional_confession", r"\b(i was wrong|i failed|i struggled|i was scared|honestly)\b"),
+            ("conflict", r"\b(problem|mistake|trap|risk|fight|conflict|disagree)\b"),
+            ("surprise_reveal", r"\b(turns out|surprisingly|nobody tells you|what nobody)\b"),
+        ]
+        for name, pattern in pattern_map:
+            if re.search(pattern, opening) and name not in archetypes:
+                archetypes.append(name)
+        if self._actionable_tip_feature_score(opening) > 0.5 and "actionable_tip" not in archetypes:
+            archetypes.append("actionable_tip")
+        if self._curiosity_gap_score(opening) > 0.5 and "curiosity_gap" not in archetypes:
+            archetypes.append("curiosity_gap")
+        return archetypes
+
+    def _direct_problem_score(self, text: str) -> float:
+        opening = self._clean_text(text).lower()
+        score = 0.0
+        if re.search(r"^(if you|when you|do you|you keep|you'?re|you have|you probably)\b", opening):
+            score += 0.45
+        if re.search(r"\b(problem|mistake|struggle|stuck|missing|losing|can'?t|don'?t)\b", opening):
+            score += 0.35
+        if re.search(r"\byou\b", opening):
+            score += 0.20
+        return min(1.0, score)
+
+    def _contrarian_score(self, text: str) -> float:
+        opening = self._clean_text(text).lower()
+        patterns = [
+            r"\b(most people|everyone thinks|the truth|actually|wrong|myth|counterintuitive)\b",
+            r"\b(not because|isn'?t|instead|but the real|what nobody)\b",
+        ]
+        return min(1.0, sum(0.42 for pattern in patterns if re.search(pattern, opening)))
+
+    def _number_specificity_score(self, text: str) -> float:
+        opening = self._clean_text(text).lower()
+        score = 0.0
+        if re.search(r"\b\d+[%x]?\b", opening):
+            score += 0.62
+        if re.search(r"\b(one|two|three|four|five)\s+(reason|thing|way|step|mistake|lesson)s?\b", opening):
+            score += 0.38
+        return min(1.0, score)
+
+    def _actionable_tip_feature_score(self, text: str) -> float:
+        opening = self._clean_text(text).lower()
+        patterns = [
+            r"\b(here'?s how|how to|do this|try this|use this|start with)\b",
+            r"\b(the fix|the solution|the answer|instead of|you need to|you should)\b",
+        ]
+        return min(1.0, sum(0.46 for pattern in patterns if re.search(pattern, opening)))
+
+    def detect_soft_ramp(self, text: str) -> bool:
+        opening = self._opening_text(text, 18).lower()
+        return bool(
+            re.search(
+                r"^(today|in this video|i want to talk about|we'?re going to talk about|let'?s talk about|"
+                r"before we start|first of all|so basically|basically)\b",
+                opening,
+            )
+        )
+
+    def detect_resolved_ending(self, text: str) -> bool:
+        return (
+            self.validator.is_valid_end(text)
+            and not self.validator.has_mid_topic_end(text)
+            and not self.validator.has_unfinished_tail(text)
+            and self._payoff_score(text) >= 0.55
+        )
+
+    def detect_unresolved_forward_reference(self, text: str) -> bool:
+        return self.validator.has_mid_topic_end(text) or bool(
+            re.search(
+                r"\b(i'?ll show you|we'?ll get to|next we|in a second|coming up|let me explain)\b",
+                self.validator.last_words(text, 24).lower(),
+            )
+        )
+
+    def score_boundary_text_start(self, text: str) -> float:
+        score = 0.0
+        if self.validator.is_valid_start(text):
+            score += 0.30
+        if not self.validator.has_mid_topic_start(text):
+            score += 0.22
+        if self._context_leak_score(self._opening_text(text, 20)) >= 0.70:
+            score += 0.16
+        if self._hook_score(text) >= 0.55:
+            score += 0.16
+        if not self.detect_soft_ramp(text):
+            score += 0.10
+        if self._specificity_score(self._opening_text(text, 20)) >= 0.45:
+            score += 0.06
+        return round(max(0.0, min(1.0, score)), 4)
+
+    def score_boundary_text_end(self, text: str) -> float:
+        score = 0.0
+        if self.validator.is_valid_end(text):
+            score += 0.28
+        if self.detect_resolved_ending(text):
+            score += 0.28
+        if not self.detect_unresolved_forward_reference(text):
+            score += 0.18
+        if self._payoff_score(text) >= 0.60:
+            score += 0.18
+        if not self.validator.looks_like_cta_or_outro(text):
+            score += 0.08
+        return round(max(0.0, min(1.0, score)), 4)
+
+    def score_boundary_prosody_start(self, features: ProsodyFeatures) -> float:
+        score = 0.48
+        if features.pause_before_start >= 0.70:
+            score += 0.30
+        elif features.pause_before_start >= 0.35:
+            score += 0.20
+        elif features.pause_before_start < 0.08:
+            score -= 0.18
+        if 1.0 <= features.speech_rate_start <= 3.7:
+            score += 0.12
+        if features.likely_turn_boundary_start:
+            score += 0.10
+        return round(max(0.0, min(1.0, score)), 4)
+
+    def score_boundary_prosody_end(self, features: ProsodyFeatures) -> float:
+        score = 0.48
+        if features.pause_after_end >= 0.70:
+            score += 0.30
+        elif features.pause_after_end >= 0.35:
+            score += 0.20
+        elif features.pause_after_end < 0.08:
+            score -= 0.16
+        if features.speech_rate_end <= max(3.8, features.speech_rate_mid + 0.8):
+            score += 0.12
+        if features.likely_turn_boundary_end:
+            score += 0.10
+        return round(max(0.0, min(1.0, score)), 4)
+
+    def _boundary_breakdown_for_candidate(
+        self,
+        candidate: dict[str, Any],
+        words: list[dict[str, Any]],
+        source_video_path: str,
+    ) -> BoundaryScoreBreakdown:
+        text = candidate.get("transcript_text", "")
+        start = float(candidate.get("start", 0.0))
+        end = float(candidate.get("end", 0.0))
+        prosody = self._prosody_features_for_window(words, start, end, source_video_path)
+        start_text = self.score_boundary_text_start(text)
+        end_text = self.score_boundary_text_end(text)
+        prosody_start = self.score_boundary_prosody_start(prosody)
+        prosody_end = self.score_boundary_prosody_end(prosody)
+        context = self._context_leak_score(text)
+        payoff = self._payoff_score(text)
+        pause_alignment = max(0.0, min(1.0, (prosody_start + prosody_end) / 2.0))
+        penalties = self._boundary_penalties(text, prosody)
+        final = (
+            0.21 * start_text
+            + 0.23 * end_text
+            + 0.13 * prosody_start
+            + 0.13 * prosody_end
+            + 0.12 * context
+            + 0.13 * payoff
+            + 0.05 * pause_alignment
+        )
+        for penalty in penalties:
+            if penalty in {"mid_topic_start", "unresolved_end", "fragment_end"}:
+                final *= 0.58
+            elif penalty in {"soft_ramp", "weak_pause_start", "weak_pause_end"}:
+                final *= 0.84
+            else:
+                final *= 0.92
+
+        return BoundaryScoreBreakdown(
+            start_text_score=round(start_text, 4),
+            end_text_score=round(end_text, 4),
+            prosody_start_score=round(prosody_start, 4),
+            prosody_end_score=round(prosody_end, 4),
+            context_independence_score=round(context, 4),
+            payoff_closure_score=round(payoff, 4),
+            pause_alignment_score=round(pause_alignment, 4),
+            final_boundary_score=round(max(0.0, min(1.0, final)), 4),
+            penalties=penalties,
+        )
+
+    def _boundary_penalties(self, text: str, prosody: ProsodyFeatures) -> list[str]:
+        penalties: list[str] = []
+        if not self.validator.is_valid_start(text):
+            penalties.append("bad_start")
+        if self.validator.has_mid_topic_start(text):
+            penalties.append("mid_topic_start")
+        if self.detect_soft_ramp(text):
+            penalties.append("soft_ramp")
+        if not self.validator.is_valid_end(text):
+            penalties.append("fragment_end")
+        if self.detect_unresolved_forward_reference(text):
+            penalties.append("unresolved_end")
+        if self.validator.looks_like_cta_or_outro(text):
+            penalties.append("cta_or_outro")
+        if prosody.pause_before_start < 0.08:
+            penalties.append("weak_pause_start")
+        if prosody.pause_after_end < 0.08:
+            penalties.append("weak_pause_end")
+        return penalties
+
+    def _generate_boundary_variants(
+        self,
+        candidate: dict[str, Any],
+        atomic_units: list[dict[str, Any]],
+        words: list[dict[str, Any]],
+        video_duration: float,
+    ) -> list[dict[str, Any]]:
+        if not atomic_units:
+            return [candidate]
+
+        variants: list[dict[str, Any]] = []
+        seen: set[tuple[int, int]] = set()
+        region_start = float(candidate.get("region_start", candidate.get("start", 0.0)))
+        region_end = float(candidate.get("region_end", candidate.get("end", 0.0)))
+        source = candidate.get("source", "candidate")
+
+        for start_offset in self.BOUNDARY_START_OFFSETS:
+            snapped_start = self._snap_time_to_atomic_start(atomic_units, region_start + start_offset)
+            if words:
+                snapped_start = self._nearest_word_start(words, snapped_start, tolerance=0.35)
+            for end_offset in self.BOUNDARY_END_OFFSETS:
+                snapped_end = self._snap_time_to_atomic_end(atomic_units, region_end + end_offset)
+                if words:
+                    snapped_end = self._nearest_word_end(words, snapped_end, tolerance=0.35)
+                if video_duration > 0:
+                    snapped_start = max(0.0, min(snapped_start, video_duration))
+                    snapped_end = max(0.0, min(snapped_end, video_duration))
+                if snapped_end <= snapped_start:
+                    continue
+                duration = snapped_end - snapped_start
+                if duration < self.MIN_CLIP_DURATION or duration > self.MAX_CLIP_DURATION:
+                    continue
+                key = (round(snapped_start * 10), round(snapped_end * 10))
+                if key in seen:
+                    continue
+                seen.add(key)
+                variant = self._candidate_from_time_window(
+                    atomic_units=atomic_units,
+                    start=snapped_start,
+                    end=snapped_end,
+                    source="variant",
+                    title=candidate.get("title"),
+                    rationale=candidate.get("rationale", ""),
+                    summary=candidate.get("summary", ""),
+                )
+                if not variant:
+                    continue
+                variant.update(
+                    {
+                        "region_start": round(region_start, 2),
+                        "region_end": round(region_end, 2),
+                        "original_start": candidate.get("start"),
+                        "original_end": candidate.get("end"),
+                        "source_candidate_type": source,
+                        "variant_reason": (
+                            f"start_offset={start_offset:+.1f}s end_offset={end_offset:+.1f}s "
+                            "snapped_to_atomic_word_boundary"
+                        ),
+                        "debug_notes": [
+                            *(candidate.get("debug_notes") or []),
+                            f"boundary_variant from {candidate.get('start')}->{candidate.get('end')}",
+                        ],
+                    }
+                )
+                variants.append(variant)
+                if len(variants) >= self.MAX_VARIANTS_PER_REGION:
+                    return variants
+
+        return variants or [candidate]
+
+    def _optimize_candidate_boundaries(
+        self,
+        candidate: dict[str, Any],
+        atomic_units: list[dict[str, Any]],
+        words: list[dict[str, Any]],
+        source_video_path: str,
+        video_duration: float,
+        genre_profile: str,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]]]:
+        variants = self._generate_boundary_variants(candidate, atomic_units, words, video_duration)
+        variant_rows: list[dict[str, Any]] = []
+        rejected_rows: list[dict[str, Any]] = []
+        best: dict[str, Any] | None = None
+        best_score = -1.0
+        original_boundary = self._boundary_breakdown_for_candidate(candidate, words, source_video_path)
+        original_score = self._candidate_optimization_score(candidate, original_boundary, genre_profile)
+
+        for variant in variants:
+            breakdown = self._boundary_breakdown_for_candidate(variant, words, source_video_path)
+            hook_features = self.extract_hook_features(variant.get("transcript_text", ""))
+            prosody = self._prosody_features_for_window(
+                words,
+                float(variant["start"]),
+                float(variant["end"]),
+                source_video_path,
+            )
+            variant["boundary_breakdown"] = asdict(breakdown)
+            variant["hook_features"] = asdict(hook_features)
+            variant["prosody_features"] = asdict(prosody)
+            variant["genre_profile"] = genre_profile
+            variant["optimized_start"] = variant["start"]
+            variant["optimized_end"] = variant["end"]
+            variant["quote_density_score"] = self._quote_density_score(variant.get("transcript_text", ""))
+            variant["visual_editability_score"] = self._visual_editability_score(variant.get("transcript_text", ""))
+            variant["retention_risk_score"] = self._retention_risk_score(variant.get("transcript_text", ""), float(variant["duration"]))
+            score = self._candidate_optimization_score(variant, breakdown, genre_profile)
+            variant["optimization_score"] = round(score, 4)
+            row = self._candidate_debug_row(variant)
+            row["variant_reason"] = variant.get("variant_reason", "")
+            row["hard_valid"] = self._variant_passes_hard_filters(variant)
+            variant_rows.append(row)
+
+            if not row["hard_valid"]:
+                rejected_rows.append({**row, "reject_reason": "hard_boundary_filter"})
+                continue
+            if score > best_score:
+                best_score = score
+                best = variant
+
+        if best is None:
+            relaxed_ok, reasons = self._passes_relaxed(candidate)
+            if relaxed_ok:
+                fallback = dict(candidate)
+                fallback["boundary_breakdown"] = asdict(original_boundary)
+                fallback["genre_profile"] = genre_profile
+                fallback["optimization_score"] = round(original_score, 4)
+                fallback["debug_notes"] = [*(candidate.get("debug_notes") or []), "optimizer_kept_repaired_candidate"]
+                return fallback, variant_rows, rejected_rows
+            rejected_rows.append(
+                {
+                    **self._candidate_debug_row(candidate),
+                    "reject_reason": "no_variant_survived",
+                    "relaxed_reasons": reasons,
+                }
+            )
+            return None, variant_rows, rejected_rows
+
+        if best_score + 0.01 < original_score and self._variant_passes_hard_filters(candidate):
+            kept = dict(candidate)
+            kept["boundary_breakdown"] = asdict(original_boundary)
+            kept["genre_profile"] = genre_profile
+            kept["optimization_score"] = round(original_score, 4)
+            kept["debug_notes"] = [*(candidate.get("debug_notes") or []), "optimizer_kept_original_because_variants_worse"]
+            return kept, variant_rows, rejected_rows
+
+        if (
+            abs(float(best["start"]) - float(candidate.get("start", best["start"]))) > 0.05
+            or abs(float(best["end"]) - float(candidate.get("end", best["end"]))) > 0.05
+        ):
+            best["debug_notes"] = [*(best.get("debug_notes") or []), "boundary_optimized"]
+            best["boundary_optimized"] = True
+
+        best["final_score"] = max(
+            float(best.get("final_score", 0.0)),
+            round(best_score, 4),
+        )
+        best["base_score"] = max(
+            float(best.get("base_score", 0.0)),
+            self._heuristic_text_score(best.get("transcript_text", ""), float(best["duration"])),
+        )
+        return best, variant_rows, rejected_rows
+
+    def _candidate_optimization_score(
+        self,
+        candidate: dict[str, Any],
+        breakdown: BoundaryScoreBreakdown,
+        genre_profile: str,
+    ) -> float:
+        text = candidate.get("transcript_text", "")
+        duration = float(candidate.get("duration", 0.0))
+        hook_features = self.extract_hook_features(text)
+        hook_score = self.score_hook_features(hook_features)
+        duration_prior = self.duration_score(duration, genre=genre_profile, clip_type=self._clip_type_from_hook_features(hook_features))
+        quote_density = self._quote_density_score(text)
+        visual_editability = self._visual_editability_score(text)
+        retention_risk = self._retention_risk_score(text, duration)
+        genre = self.GENRE_PROFILES.get(genre_profile, self.GENRE_PROFILES["general_talking_head"])
+        score = (
+            0.22 * hook_score * genre["hook_weight"]
+            + 0.18 * breakdown.payoff_closure_score * genre["payoff_weight"]
+            + 0.15 * breakdown.context_independence_score
+            + 0.14 * breakdown.final_boundary_score
+            + 0.10 * self._specificity_score(text)
+            + 0.08 * self._information_density_score(text, duration)
+            + 0.06 * quote_density * genre["quote_weight"]
+            + 0.04 * visual_editability
+            + 0.03 * duration_prior
+        )
+        score *= max(0.35, 1.0 - (retention_risk * 0.35))
+        if self.detect_soft_ramp(text):
+            score *= 0.72
+        if breakdown.payoff_closure_score < 0.45:
+            score *= 0.70
+        if breakdown.final_boundary_score < 0.55:
+            score *= 0.62
+        return max(0.0, min(1.0, score))
+
+    def _variant_passes_hard_filters(self, candidate: dict[str, Any]) -> bool:
+        text = candidate.get("transcript_text", "")
+        duration = float(candidate.get("duration", 0.0))
+        return (
+            self.MIN_CLIP_DURATION <= duration <= self.MAX_CLIP_DURATION
+            and self.validator.is_valid_start(text)
+            and self.validator.is_valid_end(text)
+            and not self.validator.has_mid_topic_start(text)
+            and not self.validator.has_mid_topic_end(text)
+            and not self.validator.has_unfinished_tail(text)
+            and not self.validator.looks_like_cta_or_outro(text)
+        )
+
+    def _candidate_from_time_window(
+        self,
+        atomic_units: list[dict[str, Any]],
+        start: float,
+        end: float,
+        source: str,
+        title: str | None = None,
+        rationale: str = "",
+        summary: str = "",
+    ) -> dict[str, Any] | None:
+        indices = [
+            idx
+            for idx, unit in enumerate(atomic_units)
+            if float(unit["end"]) > start + 0.01 and float(unit["start"]) < end - 0.01
+        ]
+        if not indices:
+            return None
+        return self._candidate_from_units(
+            units=atomic_units,
+            start_idx=min(indices),
+            end_idx=max(indices),
+            source=source,
+            title=title,
+            rationale=rationale,
+            summary=summary,
+        )
+
+    def _snap_time_to_atomic_start(self, atomic_units: list[dict[str, Any]], target_time: float) -> float:
+        candidates = [float(unit["start"]) for unit in atomic_units]
+        return min(candidates, key=lambda value: abs(value - target_time)) if candidates else max(0.0, target_time)
+
+    def _snap_time_to_atomic_end(self, atomic_units: list[dict[str, Any]], target_time: float) -> float:
+        candidates = [float(unit["end"]) for unit in atomic_units]
+        return min(candidates, key=lambda value: abs(value - target_time)) if candidates else max(0.0, target_time)
+
+    def _nearest_word_start(
+        self,
+        words: list[dict[str, Any]],
+        target_time: float,
+        tolerance: float,
+    ) -> float:
+        starts = [self._word_start(word) for word in words if abs(self._word_start(word) - target_time) <= tolerance]
+        return min(starts, key=lambda value: abs(value - target_time)) if starts else target_time
+
+    def _nearest_word_end(
+        self,
+        words: list[dict[str, Any]],
+        target_time: float,
+        tolerance: float,
+    ) -> float:
+        ends = [self._word_end(word) for word in words if abs(self._word_end(word) - target_time) <= tolerance]
+        return min(ends, key=lambda value: abs(value - target_time)) if ends else target_time
+
+    def _optimize_candidate_pool(
+        self,
+        candidates: list[dict[str, Any]],
+        atomic_units: list[dict[str, Any]],
+        words: list[dict[str, Any]],
+        source_video_path: str,
+        video_duration: float,
+        genre_profile: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        optimized: list[dict[str, Any]] = []
+        variant_rows: list[dict[str, Any]] = []
+        rejected_rows: list[dict[str, Any]] = []
+
+        for candidate in candidates:
+            best, variants, rejected = self._optimize_candidate_boundaries(
+                candidate=candidate,
+                atomic_units=atomic_units,
+                words=words,
+                source_video_path=source_video_path,
+                video_duration=video_duration,
+                genre_profile=genre_profile,
+            )
+            variant_rows.extend(variants)
+            rejected_rows.extend(rejected)
+            if best:
+                optimized.append(best)
+
+        return optimized, variant_rows, rejected_rows
+
+    def compare_original_vs_optimized_boundary_scores(
+        self,
+        original: dict[str, Any],
+        optimized: dict[str, Any],
+        words: list[dict[str, Any]],
+        source_video_path: str = "",
+    ) -> dict[str, float]:
+        original_breakdown = self._boundary_breakdown_for_candidate(original, words, source_video_path)
+        optimized_breakdown = self._boundary_breakdown_for_candidate(optimized, words, source_video_path)
+        return {
+            "original_boundary_score": original_breakdown.final_boundary_score,
+            "optimized_boundary_score": optimized_breakdown.final_boundary_score,
+            "boundary_delta": round(optimized_breakdown.final_boundary_score - original_breakdown.final_boundary_score, 4),
+            "original_hook_score": self._hook_score(original.get("transcript_text", "")),
+            "optimized_hook_score": self._hook_score(optimized.get("transcript_text", "")),
+            "hook_delta": round(
+                self._hook_score(optimized.get("transcript_text", ""))
+                - self._hook_score(original.get("transcript_text", "")),
+                4,
+            ),
+            "original_payoff_score": self._payoff_score(original.get("transcript_text", "")),
+            "optimized_payoff_score": self._payoff_score(optimized.get("transcript_text", "")),
+            "payoff_delta": round(
+                self._payoff_score(optimized.get("transcript_text", ""))
+                - self._payoff_score(original.get("transcript_text", "")),
+                4,
+            ),
+        }
+
+    def _optimization_summary(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        optimized = [candidate for candidate in candidates if candidate.get("boundary_optimized")]
+        if not candidates:
+            return {
+                "candidate_count": 0,
+                "optimized_count": 0,
+                "average_hook_score": 0.0,
+                "average_boundary_score": 0.0,
+                "average_payoff_score": 0.0,
+            }
+        return {
+            "candidate_count": len(candidates),
+            "optimized_count": len(optimized),
+            "average_hook_score": round(
+                sum(float(candidate.get("hook_score", 0.0)) for candidate in candidates) / len(candidates),
+                4,
+            ),
+            "average_boundary_score": round(
+                sum(float(candidate.get("boundary_score", 0.0)) for candidate in candidates) / len(candidates),
+                4,
+            ),
+            "average_payoff_score": round(
+                sum(float(candidate.get("payoff_score", 0.0)) for candidate in candidates) / len(candidates),
+                4,
+            ),
+        }
+
+    def _candidate_debug_row(self, candidate: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "clip_id": candidate.get("clip_id"),
+            "start": candidate.get("start"),
+            "end": candidate.get("end"),
+            "duration": candidate.get("duration"),
+            "region_start": candidate.get("region_start"),
+            "region_end": candidate.get("region_end"),
+            "optimized_start": candidate.get("optimized_start"),
+            "optimized_end": candidate.get("optimized_end"),
+            "source": candidate.get("source"),
+            "source_candidate_type": candidate.get("source_candidate_type"),
+            "genre_profile": candidate.get("genre_profile"),
+            "title": candidate.get("title"),
+            "text_preview": candidate.get("transcript_text", "")[:360],
+            "hook_features": candidate.get("hook_features"),
+            "prosody_features": candidate.get("prosody_features"),
+            "boundary_breakdown": candidate.get("boundary_breakdown"),
+            "quote_density_score": candidate.get("quote_density_score"),
+            "visual_editability_score": candidate.get("visual_editability_score"),
+            "retention_risk_score": candidate.get("retention_risk_score"),
+            "optimization_score": candidate.get("optimization_score"),
+            "final_score": candidate.get("final_score"),
+            "validation_tier": candidate.get("validation_tier"),
+            "debug_notes": candidate.get("debug_notes", []),
+        }
+
     def _prepare_candidate_pool(
         self,
         candidates: list[dict[str, Any]],
         units: list[dict[str, Any]],
         clip_count: int,
         debug_dir: Path | None = None,
+        atomic_units: list[dict[str, Any]] | None = None,
+        words: list[dict[str, Any]] | None = None,
+        source_video_path: str = "",
+        video_duration: float = 0.0,
+        genre_profile: str = "general_talking_head",
     ) -> list[dict[str, Any]]:
+        if debug_dir:
+            self._write_json(debug_dir / "semantic_regions.json", [self._candidate_debug_row(c) for c in candidates])
+
         repaired: list[dict[str, Any]] = []
         for candidate in candidates:
             repaired_candidate = self._repair_candidate_boundaries(candidate, units)
@@ -1615,12 +2616,32 @@ class GroqShortsPipeline:
                 repaired.append(repaired_candidate)
 
         deduped = self._dedupe_candidates(repaired)
-        scored = self._apply_editorial_scores(deduped)
+        optimized = deduped
+        variant_rows: list[dict[str, Any]] = []
+        rejected_rows: list[dict[str, Any]] = []
+
+        if atomic_units:
+            optimized, variant_rows, rejected_rows = self._optimize_candidate_pool(
+                candidates=deduped,
+                atomic_units=atomic_units,
+                words=words or [],
+                source_video_path=source_video_path,
+                video_duration=video_duration,
+                genre_profile=genre_profile,
+            )
+
+        scored = self._apply_editorial_scores(optimized)
         validated = self._validate_candidates_with_backoff(scored, debug_dir)
         pool_size = max(self.MAX_POOL_SIZE, clip_count * 24)
         prepared = self._preselect_candidate_pool(validated, pool_size)
 
         if debug_dir:
+            self._write_json(debug_dir / "boundary_variants.json", variant_rows)
+            self._write_json(debug_dir / "rejected_candidates.json", rejected_rows)
+            self._write_json(debug_dir / "optimized_candidates.json", [self._candidate_debug_row(c) for c in optimized])
+            self._write_json(debug_dir / "candidate_feature_matrix.json", [self._candidate_debug_row(c) for c in scored])
+            self._write_json(debug_dir / "final_ranked_candidates.json", [self._candidate_debug_row(c) for c in prepared])
+            self._write_json(debug_dir / "optimization_summary.json", self._optimization_summary(scored))
             self._write_json(debug_dir / "candidate_pool_prepared.json", prepared)
 
         return prepared
@@ -1812,7 +2833,8 @@ class GroqShortsPipeline:
 
     def _editorial_metrics(self, text: str, duration: float) -> dict[str, Any]:
         boundary = self._boundary_score(text)
-        hook = self._hook_score(text)
+        hook_features = self.extract_hook_features(text)
+        hook = max(self._hook_score(text), self.score_hook_features(hook_features))
         first_three = self._first_three_seconds_score(text, duration)
         payoff = self._payoff_score(text)
         density = self._information_density_score(text, duration)
@@ -1823,22 +2845,27 @@ class GroqShortsPipeline:
         actionability = self._actionability_score(text)
         context_leak = self._context_leak_score(text)
         specificity = self._specificity_score(text)
-        duration_score = self._soft_duration_score(duration)
+        clip_type = self._clip_type_from_hook_features(hook_features)
+        duration_score = self.duration_score(duration, clip_type=clip_type)
+        quote_density = self._quote_density_score(text)
+        visual_editability = self._visual_editability_score(text)
+        retention_risk = self._retention_risk_score(text, duration)
+        first_value_delay = self._first_value_delay_score(text, duration)
         editorial = (
-            0.17 * boundary
-            + 0.15 * first_three
-            + 0.12 * hook
-            + 0.15 * payoff
-            + 0.09 * self_contained
-            + 0.08 * arc
-            + 0.08 * retention
-            + 0.05 * density
-            + 0.04 * novelty
-            + 0.03 * actionability
-            + 0.02 * specificity
-            + 0.01 * context_leak
-            + 0.01 * duration_score
+            0.22 * first_three
+            + 0.18 * payoff
+            + 0.15 * self_contained
+            + 0.14 * boundary
+            + 0.10 * specificity
+            + 0.08 * density
+            + 0.06 * quote_density
+            + 0.04 * visual_editability
+            + 0.03 * duration_score
         )
+        editorial += 0.04 * hook + 0.03 * arc + 0.02 * retention + 0.02 * novelty + 0.01 * actionability
+        editorial *= max(0.45, 1.0 - retention_risk * 0.32)
+        if first_value_delay < 0.50:
+            editorial *= 0.78
         return {
             "boundary_score": round(boundary, 4),
             "hook_score": round(hook, 4),
@@ -1853,8 +2880,13 @@ class GroqShortsPipeline:
             "context_leak_score": round(context_leak, 4),
             "specificity_score": round(specificity, 4),
             "duration_score": round(duration_score, 4),
-            "hook_archetypes": self._hook_archetypes(text),
-            "editorial_score": round(editorial, 4),
+            "quote_density_score": round(quote_density, 4),
+            "visual_editability_score": round(visual_editability, 4),
+            "retention_risk_score": round(retention_risk, 4),
+            "first_value_delay_score": round(first_value_delay, 4),
+            "hook_archetypes": hook_features.hook_archetypes,
+            "hook_features": asdict(hook_features),
+            "editorial_score": round(max(0.0, min(1.0, editorial)), 4),
         }
 
     def _boundary_score(self, text: str) -> float:
@@ -2104,6 +3136,132 @@ class GroqShortsPipeline:
         if self.validator.has_mid_topic_end(text) or self.validator.has_unfinished_tail(text):
             score -= 0.24
         return max(0.0, min(1.0, score))
+
+    def _resolve_genre_profile(self, explicit_profile: str | None, transcript_text: str) -> str:
+        if explicit_profile and explicit_profile in self.GENRE_PROFILES:
+            return explicit_profile
+        return self._detect_genre_profile(transcript_text)
+
+    def _detect_genre_profile(self, text: str) -> str:
+        lowered = (text or "").lower()
+        if re.search(r"\b(interview|guest|host|podcast|conversation|question for you|what do you think)\b", lowered):
+            return "podcast_interview"
+        if re.search(r"\b(business|creator|marketing|customer|sales|strategy|framework|clients|revenue|growth)\b", lowered):
+            return "educational_business"
+        if re.search(r"\b(i remember|one day|years ago|story|when i was|the moment|it started)\b", lowered):
+            return "storytelling"
+        if re.search(r"\b(joke|funny|laugh|comedy|ridiculous|crazy|hilarious)\b", lowered):
+            return "comedy_entertainment"
+        return "general_talking_head"
+
+    def duration_score(
+        self,
+        duration: float,
+        platform: str | None = None,
+        genre: str | None = None,
+        clip_type: str | None = None,
+    ) -> float:
+        genre_settings = self.GENRE_PROFILES.get(
+            genre or "general_talking_head",
+            self.GENRE_PROFILES["general_talking_head"],
+        )
+        ideal_min = float(genre_settings["ideal_min"])
+        ideal_max = float(genre_settings["ideal_max"])
+        soft_max = float(genre_settings["soft_max"])
+
+        if clip_type in {"bold_claim", "contrarian_take", "direct_problem"}:
+            ideal_min, ideal_max, soft_max = 12.0, 28.0, 52.0
+        elif clip_type == "actionable_tip":
+            ideal_min, ideal_max, soft_max = 20.0, 45.0, 70.0
+        elif clip_type == "story_drop_in":
+            ideal_min, ideal_max, soft_max = 30.0, 60.0, 95.0
+        elif genre == "educational_business":
+            ideal_min, ideal_max, soft_max = 35.0, 75.0, 105.0
+
+        if platform == "tiktok":
+            ideal_min = max(8.0, ideal_min - 6.0)
+            ideal_max = max(ideal_min + 10.0, ideal_max - 12.0)
+            soft_max = max(ideal_max + 14.0, soft_max - 18.0)
+        elif platform == "instagram_reel":
+            ideal_min = max(10.0, ideal_min - 2.0)
+            ideal_max = ideal_max + 4.0
+            soft_max = soft_max + 2.0
+        elif platform == "youtube_shorts":
+            ideal_min = max(12.0, ideal_min)
+            ideal_max = min(85.0, ideal_max + 10.0)
+            soft_max = min(120.0, soft_max + 12.0)
+
+        return self._duration_preference(duration, ideal_min, ideal_max, soft_max)
+
+    def _clip_type_from_hook_features(self, features: HookFeatures) -> str:
+        preferred_order = [
+            "bold_claim",
+            "direct_problem",
+            "contrarian_take",
+            "actionable_tip",
+            "story_drop_in",
+            "curiosity_gap",
+            "number_specificity",
+        ]
+        for item in preferred_order:
+            if item in features.hook_archetypes:
+                return item
+        return features.hook_archetypes[0] if features.hook_archetypes else "general"
+
+    def _quote_density_score(self, text: str) -> float:
+        lowered = self._clean_text(text).lower()
+        patterns = [
+            r"\b(the truth is|the problem is|the point is|the lesson is|remember this)\b",
+            r"\b(most people|nobody|everyone|you need to|you can|never|always)\b",
+            r"\b(not because|that means|that'?s why|in reality|ultimately)\b",
+        ]
+        score = 0.18 + min(0.50, sum(0.12 for pattern in patterns if re.search(pattern, lowered)))
+        words = lowered.split()
+        if 18 <= len(words) <= 90:
+            score += 0.14
+        if re.search(r"\b\d+[%x]?\b", lowered):
+            score += 0.10
+        if self._context_leak_score(text) < 0.55:
+            score -= 0.18
+        return round(max(0.0, min(1.0, score)), 4)
+
+    def _visual_editability_score(self, text: str) -> float:
+        lowered = self._clean_text(text).lower()
+        score = 0.38
+        if re.search(r"\b(first|second|third|step|reason|mistake|lesson|framework)\b", lowered):
+            score += 0.18
+        if re.search(r"\b(for example|imagine|picture this|here'?s how|do this)\b", lowered):
+            score += 0.16
+        if re.search(r"\b(problem|solution|before|after|instead|because)\b", lowered):
+            score += 0.16
+        if len(lowered.split()) > 130:
+            score -= 0.12
+        return round(max(0.0, min(1.0, score)), 4)
+
+    def _retention_risk_score(self, text: str, duration: float) -> float:
+        lowered = self._clean_text(text).lower()
+        risk = 0.0
+        if self.detect_soft_ramp(text):
+            risk += 0.30
+        if self._first_three_seconds_score(text, duration) < 0.38:
+            risk += 0.24
+        if self._payoff_score(text) < 0.45:
+            risk += 0.22
+        if self._context_leak_score(text) < 0.55:
+            risk += 0.20
+        if re.search(r"\b(um|uh|you know|sort of|kind of)\b", lowered):
+            risk += 0.08
+        return round(max(0.0, min(1.0, risk)), 4)
+
+    def _first_value_delay_score(self, text: str, duration: float) -> float:
+        opening = self._opening_text(text, self._opening_word_budget(duration))
+        if self.detect_soft_ramp(text):
+            return 0.35
+        if self._hook_archetype_score(opening) >= 0.45:
+            return 1.0
+        if re.search(r"\b(problem|mistake|reason|fix|solution|because|why|how)\b", opening.lower()):
+            return 0.78
+        return 0.55
 
     def _heuristic_text_score(self, text: str, duration: float) -> float:
         t = text.lower()
@@ -2453,6 +3611,9 @@ class GroqShortsPipeline:
         actionability = float(candidate.get("actionability_score", self._actionability_score(text)))
         context_leak = float(candidate.get("context_leak_score", self._context_leak_score(text)))
         specificity = float(candidate.get("specificity_score", self._specificity_score(text)))
+        genre_profile = candidate.get("genre_profile") or "general_talking_head"
+        hook_features = self.extract_hook_features(text)
+        clip_type = self._clip_type_from_hook_features(hook_features)
 
         if profile == "tiktok":
             platform = (
@@ -2466,7 +3627,7 @@ class GroqShortsPipeline:
                 + 0.03 * specificity
                 + 0.02 * context_leak
                 + 0.00 * arc
-                + 0.04 * self._duration_preference(duration, 12.0, 44.0, 68.0)
+                + 0.04 * self.duration_score(duration, platform="tiktok", genre=genre_profile, clip_type=clip_type)
             )
             platform += self._pattern_bonus(
                 text,
@@ -2494,7 +3655,7 @@ class GroqShortsPipeline:
                 + 0.07 * retention
                 + 0.03 * specificity
                 + 0.02 * context_leak
-                + 0.02 * self._duration_preference(duration, 18.0, 62.0, 88.0)
+                + 0.02 * self.duration_score(duration, platform="instagram_reel", genre=genre_profile, clip_type=clip_type)
             )
             platform += self._pattern_bonus(
                 text,
@@ -2522,7 +3683,7 @@ class GroqShortsPipeline:
                 + 0.04 * boundary
                 + 0.02 * specificity
                 + 0.01 * context_leak
-                + 0.02 * self._duration_preference(duration, 20.0, 58.0, 72.0)
+                + 0.02 * self.duration_score(duration, platform="youtube_shorts", genre=genre_profile, clip_type=clip_type)
             )
             platform += self._pattern_bonus(
                 text,
@@ -2619,6 +3780,19 @@ class GroqShortsPipeline:
                 transcript_text = item["transcript_text"],
                 target_asset_type = item.get("target_asset_type"),
                 platform_profile = item.get("platform_profile"),
+                region_start = item.get("region_start"),
+                region_end = item.get("region_end"),
+                optimized_start = item.get("optimized_start"),
+                optimized_end = item.get("optimized_end"),
+                source_candidate_type = item.get("source_candidate_type"),
+                genre_profile = item.get("genre_profile"),
+                prosody_features = item.get("prosody_features"),
+                hook_features = item.get("hook_features"),
+                boundary_breakdown = item.get("boundary_breakdown"),
+                quote_density_score = item.get("quote_density_score"),
+                visual_editability_score = item.get("visual_editability_score"),
+                retention_risk_score = item.get("retention_risk_score"),
+                debug_notes = item.get("debug_notes", []),
             )
             for item in items
         ]
@@ -3161,26 +4335,20 @@ def generate_short_clips_from_groq(
     words_per_caption: int = 4,
     create_blur_background: bool = False,
     groq_api_key: str | None = None,
-    chunk_model: str = "openai/gpt-oss-120b",
-    scorer_model: str = "openai/gpt-oss-120b",
+    openrouter_api_key: str | None = None,
+    chunk_model: str = DEFAULT_CLIP_SELECTION_MODEL,
+    scorer_model: str = DEFAULT_CLIP_SELECTION_MODEL,
     debug: bool = True,
     target_asset_types: list[str] | None = None,
+    genre_profile: str | None = None,
 ) -> dict[str, Any]:
     """
     High-level entry point.  Accepts a Groq transcription object or plain dict.
 
     Example
     -------
-    from groq import Groq
-
-    groq_client = Groq(api_key="...")
-    with open("video.mp4", "rb") as f:
-        transcription = groq_client.audio.transcriptions.create(
-            file=f,
-            model="whisper-large-v3",
-            response_format="verbose_json",
-            timestamp_granularities=["segment", "word"],
-        )
+    # transcription can be a Groq verbose_json object or a plain dict with
+    # text/segments/words. Clip selection itself uses OpenRouter.
 
     result = generate_short_clips_from_groq(
         source_video_path="video.mp4",
@@ -3208,9 +4376,15 @@ def generate_short_clips_from_groq(
 
     from app.core.config import env
 
-    api_key = groq_api_key or env("GROQ_API_KEY")
-    client  = Groq(api_key=api_key) if (api_key and Groq is not None) else None
-    logger.info("Groq client initialized: has_client=%s", bool(client))
+    # Keep groq_api_key as a deprecated compatibility alias; clip selection now
+    # uses OpenRouter while transcription can still be produced by Groq upstream.
+    api_key = openrouter_api_key or env("OPENROUTER_API_KEY") or groq_api_key
+    client = (
+        OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL)
+        if (api_key and OpenAI is not None)
+        else None
+    )
+    logger.info("OpenRouter clip-selection client initialized: has_client=%s", bool(client))
 
     chunker = TranscriptChunker(client=client, model=chunk_model) if client else None
     scorer  = LLMMomentScorer(client=client,  model=scorer_model) if client else None
@@ -3231,6 +4405,7 @@ def generate_short_clips_from_groq(
         create_blur_background = create_blur_background,
         debug                  = debug,
         target_asset_types     = target_asset_types,
+        genre_profile          = genre_profile,
     )
 
 
@@ -3244,10 +4419,12 @@ def generate_short_clips_from_youtube(
     words_per_caption: int = 4,
     create_blur_background: bool = False,
     groq_api_key: str | None = None,
-    chunk_model: str = "llama-3.3-70b-versatile",
-    scorer_model: str = "llama-3.3-70b-versatile",
+    openrouter_api_key: str | None = None,
+    chunk_model: str = DEFAULT_CLIP_SELECTION_MODEL,
+    scorer_model: str = DEFAULT_CLIP_SELECTION_MODEL,
     debug: bool = True,
     target_asset_types: list[str] | None = None,
+    genre_profile: str | None = None,
 ) -> dict[str, Any]:
     """
     Convenience wrapper:  YouTube URL -> download -> clip generation.
@@ -3268,8 +4445,10 @@ def generate_short_clips_from_youtube(
         words_per_caption      = words_per_caption,
         create_blur_background = create_blur_background,
         groq_api_key           = groq_api_key,
+        openrouter_api_key     = openrouter_api_key,
         chunk_model            = chunk_model,
         scorer_model           = scorer_model,
         debug                  = debug,
         target_asset_types     = target_asset_types,
+        genre_profile          = genre_profile,
     )
