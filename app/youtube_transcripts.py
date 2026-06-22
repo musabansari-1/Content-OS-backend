@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import tempfile
 import time
 from uuid import uuid4
@@ -547,44 +548,52 @@ def resolve_uploaded_video_path(stored_path: str) -> Path:
 
 def _extract_audio_from_video(video_path: Path, temp_dir: Path) -> Path:
     """
-    Extract audio from a local uploaded video file using yt-dlp.
+    Extract audio from a local uploaded video file using ffmpeg.
     Returns the path to the extracted audio file.
     """
-    output_template = str(temp_dir / "audio.%(ext)s")
-    source_url = video_path.resolve().as_uri()
-
-    options = {
-        "format": "bestaudio/best",
-        "outtmpl": output_template,
-        "enable_file_urls": True,
-        "quiet": True,
-        "no_warnings": True,
-    }
+    file_descriptor, temp_audio_path = tempfile.mkstemp(
+        prefix="audio-",
+        suffix=".wav",
+        dir=str(temp_dir),
+    )
+    os.close(file_descriptor)
+    audio_path = Path(temp_audio_path)
+    ffmpeg_bin = (env("FFMPEG_BIN", "ffmpeg") or "ffmpeg").strip() or "ffmpeg"
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-i",
+        str(video_path),
+        "-vn",
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        str(audio_path),
+    ]
 
     try:
-        logger.info("Starting yt-dlp audio extraction for uploaded file: %s", video_path)
-        with YoutubeDL(options) as ydl:
-            ydl.extract_info(source_url, download=False)
-            ydl.download([source_url])
-
-            # Find the extracted audio file
-            for file_path in temp_dir.glob("audio.*"):
-                if file_path.exists():
-                    # Create a copy in a temp file for processing
-                    file_descriptor, temp_copy_path = tempfile.mkstemp(
-                        prefix="audio-",
-                        suffix=file_path.suffix,
-                    )
-                    os.close(file_descriptor)
-                    temp_copy = Path(temp_copy_path)
-                    temp_copy.write_bytes(file_path.read_bytes())
-                    logger.info("yt-dlp audio extraction succeeded: source=%s output=%s", video_path, temp_copy)
-                    return temp_copy
-
-        raise RuntimeError("Failed to extract audio from video")
+        logger.info("Starting ffmpeg audio extraction for uploaded file: %s", video_path)
+        subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        logger.info("ffmpeg audio extraction succeeded: source=%s output=%s", video_path, audio_path)
+        return audio_path
+    except FileNotFoundError as error:
+        audio_path.unlink(missing_ok=True)
+        logger.exception("ffmpeg was not found for uploaded file: %s", video_path)
+        raise RuntimeError("FFmpeg is not installed or not available on PATH.") from error
     except Exception as error:
-        logger.exception("yt-dlp audio extraction failed for uploaded file: %s", video_path)
-        raise RuntimeError(f"Error extracting audio from video: {error}") from error
+        audio_path.unlink(missing_ok=True)
+        logger.exception("ffmpeg audio extraction failed for uploaded file: %s", video_path)
+        stderr = getattr(error, "stderr", "") or ""
+        stderr_text = f" stderr: {stderr.strip()}" if stderr else ""
+        raise RuntimeError(f"Error extracting audio from video with FFmpeg:{stderr_text or f' {error}'}") from error
 
 
 def fetch_video_transcripts(video_inputs: Iterable[str]) -> list[str]:
