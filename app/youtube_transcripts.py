@@ -465,8 +465,8 @@ def transcribe_uploaded_video(video_file: UploadFile) -> str:
 def transcribe_uploaded_video_with_artifacts(video_file: UploadFile) -> tuple[str, Path, dict[str, Any], Path]:
     """
     Transcribe an uploaded video file using Groq Whisper.
-    The uploaded video is first sent directly to Whisper. If that fails, we
-    fall back to extracting audio from the local file and retrying.
+    The uploaded video is first converted to a transcription-friendly audio file.
+    If that path fails, we fall back to sending the stored video directly.
     """
     # Validate file type
     content_type = video_file.content_type or ""
@@ -490,23 +490,24 @@ def transcribe_uploaded_video_with_artifacts(video_file: UploadFile) -> tuple[st
     logger.info("Uploaded video stored at %s", stored_path)
 
     try:
-        logger.info("Trying direct Whisper transcription for uploaded video: %s", stored_path.name)
-        bundle = _transcribe_media_with_groq_bundle(stored_path)
+        logger.info("Trying audio-first transcription for uploaded video: %s", stored_path.name)
+        audio_path = _extract_audio_from_video(stored_path, stored_path.parent)
+        logger.info("Audio extracted for uploaded video: %s", audio_path)
+        bundle = _transcribe_audio_with_groq_bundle(audio_path)
+        bundle["source"] = "audio_first"
         saved_bundle_path = _save_groq_transcription_bundle(bundle, stored_path)
         logger.info("Saved Groq transcription bundle to %s", saved_bundle_path)
         return bundle["text"], saved_bundle_path, bundle, stored_path
-    except Exception as direct_error:
+    except Exception as audio_error:
         logger.warning(
-            "Direct transcription of uploaded video failed for %s; trying audio extraction fallback.",
+            "Audio-first transcription of uploaded video failed for %s; trying direct video fallback.",
             stored_path.name,
             exc_info=True,
         )
         try:
-            logger.info("Trying audio extraction fallback for uploaded video: %s", stored_path.name)
-            audio_path = _extract_audio_from_video(stored_path, stored_path.parent)
-            logger.info("Audio extracted for uploaded video: %s", audio_path)
-            bundle = _transcribe_audio_with_groq_bundle(audio_path)
-            bundle["source"] = "audio_fallback"
+            logger.info("Trying direct video transcription fallback for uploaded video: %s", stored_path.name)
+            bundle = _transcribe_media_with_groq_bundle(stored_path)
+            bundle["source"] = "video_fallback"
             saved_bundle_path = _save_groq_transcription_bundle(bundle, stored_path)
             logger.info("Saved fallback transcription bundle to %s", saved_bundle_path)
             return bundle["text"], saved_bundle_path, bundle, stored_path
@@ -516,8 +517,8 @@ def transcribe_uploaded_video_with_artifacts(video_file: UploadFile) -> tuple[st
                 stored_path,
             )
             raise RuntimeError(
-                f"Could not transcribe uploaded video. Direct transcription error: {direct_error}. "
-                f"Audio extraction error: {fallback_error}"
+                f"Could not transcribe uploaded video. Audio-first error: {audio_error}. "
+                f"Direct video fallback error: {fallback_error}"
             ) from fallback_error
 
 
