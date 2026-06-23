@@ -254,16 +254,33 @@ def _is_retryable_transcription_error(error: Exception) -> bool:
 
     message = str(error).lower()
     retryable_markers = (
+        "502",
+        "bad gateway",
+        "cloudflare",
         "incomplete chunked read",
         "peer closed connection",
         "connection reset",
         "connection aborted",
+        "server error",
         "temporary failure",
         "timed out",
         "timeout",
         "read error",
     )
     return any(marker in message for marker in retryable_markers)
+
+
+def _is_request_too_large_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "413",
+            "request entity too large",
+            "request_too_large",
+            "too large",
+        )
+    )
 
 
 def _transcribe_media_with_groq_bundle_once(media_path: Path) -> dict[str, Any]:
@@ -389,6 +406,128 @@ def _transcribe_audio_with_groq_bundle(audio_path: Path) -> dict[str, Any]:
         audio_path.unlink(missing_ok=True)
 
 
+def _transcription_chunk_seconds() -> float:
+    raw_value = env("GROQ_TRANSCRIPTION_CHUNK_MINUTES", "35") or "35"
+    try:
+        minutes = float(raw_value)
+    except ValueError:
+        logger.warning("Invalid GROQ_TRANSCRIPTION_CHUNK_MINUTES=%s; using 8 minutes.", raw_value)
+        minutes = 8.0
+    return max(1.0, minutes) * 60.0
+
+
+def _offset_timed_item(item: dict[str, Any], offset_seconds: float) -> dict[str, Any]:
+    shifted = dict(item)
+    shifted["start"] = round(float(shifted.get("start", 0) or 0) + offset_seconds, 3)
+    shifted["end"] = round(float(shifted.get("end", 0) or 0) + offset_seconds, 3)
+    return shifted
+
+
+def _merge_chunked_transcription_bundles(
+    chunk_bundles: list[dict[str, Any]],
+    chunk_seconds: float,
+) -> dict[str, Any]:
+    text_parts: list[str] = []
+    segments: list[dict[str, Any]] = []
+    words: list[dict[str, Any]] = []
+    chunk_metadata: list[dict[str, Any]] = []
+
+    for index, bundle in enumerate(chunk_bundles):
+        offset_seconds = index * chunk_seconds
+        text = str(bundle.get("text") or "").strip()
+        if text:
+            text_parts.append(text)
+
+        for segment in bundle.get("segments", []) or []:
+            if isinstance(segment, dict):
+                shifted_segment = _offset_timed_item(segment, offset_seconds)
+                shifted_segment["id"] = len(segments)
+                segments.append(shifted_segment)
+
+        for word in bundle.get("words", []) or []:
+            if isinstance(word, dict):
+                words.append(_offset_timed_item(word, offset_seconds))
+
+        chunk_metadata.append(
+            {
+                "index": index,
+                "offset_seconds": offset_seconds,
+                "text": text,
+            }
+        )
+
+    return {
+        "text": " ".join(text_parts).strip(),
+        "segments": segments,
+        "words": words,
+        "source": "chunked_audio",
+        "chunk_count": len(chunk_bundles),
+        "chunk_seconds": chunk_seconds,
+        "raw": {"chunks": chunk_metadata},
+    }
+
+
+def _transcribe_audio_chunks_with_groq_bundle(
+    audio_paths: list[Path],
+    chunk_seconds: float,
+) -> dict[str, Any]:
+    chunk_dirs = {audio_path.parent for audio_path in audio_paths}
+    try:
+        if not audio_paths:
+            raise RuntimeError("FFmpeg did not produce any audio chunks.")
+
+        if len(audio_paths) == 1:
+            return _transcribe_audio_with_groq_bundle(audio_paths[0])
+
+        chunk_bundles: list[dict[str, Any]] = []
+        for index, audio_path in enumerate(audio_paths):
+            logger.info(
+                "Transcribing uploaded audio chunk %s/%s: %s",
+                index + 1,
+                len(audio_paths),
+                audio_path,
+            )
+            chunk_bundles.append(_transcribe_audio_with_groq_bundle(audio_path))
+
+        return _merge_chunked_transcription_bundles(chunk_bundles, chunk_seconds)
+    finally:
+        for audio_path in audio_paths:
+            audio_path.unlink(missing_ok=True)
+        for chunk_dir in chunk_dirs:
+            try:
+                chunk_dir.rmdir()
+            except OSError:
+                pass
+
+
+def _transcribe_uploaded_video_audio_first(stored_path: Path) -> dict[str, Any]:
+    chunk_seconds = _transcription_chunk_seconds()
+
+    while True:
+        audio_paths = _extract_audio_chunks_from_video(stored_path, stored_path.parent, chunk_seconds)
+        try:
+            bundle = _transcribe_audio_chunks_with_groq_bundle(audio_paths, chunk_seconds)
+        except Exception as error:
+            if not _is_request_too_large_error(error) or chunk_seconds <= 60:
+                raise
+
+            next_chunk_seconds = max(60.0, chunk_seconds / 2)
+            if next_chunk_seconds >= chunk_seconds:
+                raise
+
+            logger.warning(
+                "Groq rejected an audio chunk as too large; retrying with smaller chunks. previous_seconds=%s next_seconds=%s",
+                chunk_seconds,
+                next_chunk_seconds,
+                exc_info=True,
+            )
+            chunk_seconds = next_chunk_seconds
+            continue
+
+        bundle["source"] = "audio_first" if len(audio_paths) == 1 else "chunked_audio"
+        return bundle
+
+
 def _download_audio_file(video_id: str, source_url: str) -> Path:
     with tempfile.TemporaryDirectory(prefix="youtube-audio-") as temp_dir:
         output_template = str(Path(temp_dir) / f"{video_id}.%(ext)s")
@@ -491,10 +630,7 @@ def transcribe_uploaded_video_with_artifacts(video_file: UploadFile) -> tuple[st
 
     try:
         logger.info("Trying audio-first transcription for uploaded video: %s", stored_path.name)
-        audio_path = _extract_audio_from_video(stored_path, stored_path.parent)
-        logger.info("Audio extracted for uploaded video: %s", audio_path)
-        bundle = _transcribe_audio_with_groq_bundle(audio_path)
-        bundle["source"] = "audio_first"
+        bundle = _transcribe_uploaded_video_audio_first(stored_path)
         saved_bundle_path = _save_groq_transcription_bundle(bundle, stored_path)
         logger.info("Saved Groq transcription bundle to %s", saved_bundle_path)
         return bundle["text"], saved_bundle_path, bundle, stored_path
@@ -595,6 +731,79 @@ def _extract_audio_from_video(video_path: Path, temp_dir: Path) -> Path:
         stderr = getattr(error, "stderr", "") or ""
         stderr_text = f" stderr: {stderr.strip()}" if stderr else ""
         raise RuntimeError(f"Error extracting audio from video with FFmpeg:{stderr_text or f' {error}'}") from error
+
+
+def _extract_audio_chunks_from_video(
+    video_path: Path,
+    temp_dir: Path,
+    chunk_seconds: float,
+) -> list[Path]:
+    chunk_dir = Path(tempfile.mkdtemp(prefix="transcription-audio-", dir=str(temp_dir)))
+    output_template = str(chunk_dir / "chunk-%05d.wav")
+    ffmpeg_bin = (env("FFMPEG_BIN", "ffmpeg") or "ffmpeg").strip() or "ffmpeg"
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-i",
+        str(video_path),
+        "-vn",
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        "-f",
+        "segment",
+        "-segment_time",
+        str(int(chunk_seconds)),
+        "-reset_timestamps",
+        "1",
+        output_template,
+    ]
+
+    try:
+        logger.info(
+            "Starting ffmpeg chunked audio extraction for uploaded file: %s segment_seconds=%s",
+            video_path,
+            chunk_seconds,
+        )
+        subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        audio_paths = sorted(chunk_dir.glob("chunk-*.wav"))
+        if not audio_paths:
+            raise RuntimeError("FFmpeg finished without producing audio chunks.")
+        logger.info(
+            "ffmpeg chunked audio extraction succeeded: source=%s chunks=%s dir=%s",
+            video_path,
+            len(audio_paths),
+            chunk_dir,
+        )
+        return audio_paths
+    except FileNotFoundError as error:
+        for audio_path in chunk_dir.glob("chunk-*.wav"):
+            audio_path.unlink(missing_ok=True)
+        try:
+            chunk_dir.rmdir()
+        except OSError:
+            pass
+        logger.exception("ffmpeg was not found for uploaded file: %s", video_path)
+        raise RuntimeError("FFmpeg is not installed or not available on PATH.") from error
+    except Exception as error:
+        for audio_path in chunk_dir.glob("chunk-*.wav"):
+            audio_path.unlink(missing_ok=True)
+        try:
+            chunk_dir.rmdir()
+        except OSError:
+            pass
+        logger.exception("ffmpeg chunked audio extraction failed for uploaded file: %s", video_path)
+        stderr = getattr(error, "stderr", "") or ""
+        stderr_text = f" stderr: {stderr.strip()}" if stderr else ""
+        raise RuntimeError(f"Error extracting audio chunks from video with FFmpeg:{stderr_text or f' {error}'}") from error
 
 
 def fetch_video_transcripts(video_inputs: Iterable[str]) -> list[str]:
