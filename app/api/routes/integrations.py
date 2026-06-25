@@ -104,8 +104,20 @@ def auth_instagram(current_user: AuthUser = Depends(require_current_user)):
 
 
 @router.get("/auth/instagram/callback")
-async def auth_instagram_callback(code: str = None, state: str = None, error: str = None):
-    return await handle_instagram_callback(code=code, state=state, error=error)
+async def auth_instagram_callback(
+    code: str = None,
+    state: str = None,
+    error: str = None,
+    error_reason: str = None,
+    error_description: str = None,
+):
+    return await handle_instagram_callback(
+        code=code,
+        state=state,
+        error=error,
+        error_reason=error_reason,
+        error_description=error_description,
+    )
 
 
 @router.get("/auth/tiktok")

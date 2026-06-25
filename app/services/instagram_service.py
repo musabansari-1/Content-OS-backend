@@ -4,6 +4,7 @@ import secrets
 import textwrap
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -12,27 +13,39 @@ from fastapi import HTTPException
 from starlette.responses import RedirectResponse
 
 from app.core.config import env
-from app.integrations_repository import SocialIntegrationRepository
+from app.integrations_repository import SocialIntegrationRecord, SocialIntegrationRepository
 from app.services.generation_service import GENERATED_CLIPS_DIR
 
 
-INSTAGRAM_CLIENT_ID = env("INSTAGRAM_CLIENT_ID", "") or ""
-INSTAGRAM_CLIENT_SECRET = env("INSTAGRAM_CLIENT_SECRET", "") or ""
+def _first_env(*names: str) -> str:
+    for name in names:
+        value = env(name, "") or ""
+        if value.strip():
+            return value.strip()
+    return ""
+
+
+INSTAGRAM_APP_ID = _first_env("INSTAGRAM_APP_ID", "INSTAGRAM_CLIENT_ID")
+INSTAGRAM_APP_SECRET = _first_env("INSTAGRAM_APP_SECRET", "INSTAGRAM_CLIENT_SECRET")
 INSTAGRAM_REDIRECT_URI = env("INSTAGRAM_REDIRECT_URI", "") or ""
 FRONTEND_BASE_URL = env("FRONTEND_BASE_URL", "http://localhost:3000") or "http://localhost:3000"
 PUBLIC_BASE_URL = (env("PUBLIC_BASE_URL", "http://localhost:8000") or "http://localhost:8000").rstrip("/")
 
-META_AUTH_URL = "https://www.facebook.com/v20.0/dialog/oauth"
-META_TOKEN_URL = "https://graph.facebook.com/v20.0/oauth/access_token"
-META_GRAPH_URL = "https://graph.facebook.com/v20.0"
+INSTAGRAM_PLATFORM = "instagram"
+INSTAGRAM_API_VERSION = "v25.0"
+INSTAGRAM_AUTH_URL = "https://www.instagram.com/oauth/authorize"
+INSTAGRAM_SHORT_LIVED_TOKEN_URL = "https://api.instagram.com/oauth/access_token"
+INSTAGRAM_LONG_LIVED_TOKEN_URL = "https://graph.instagram.com/access_token"
+INSTAGRAM_REFRESH_TOKEN_URL = "https://graph.instagram.com/refresh_access_token"
+INSTAGRAM_GRAPH_URL = f"https://graph.instagram.com/{INSTAGRAM_API_VERSION}"
 INSTAGRAM_SCOPES = (
-    "instagram_basic",
-    "instagram_content_publish",
-    "pages_show_list",
-    "pages_read_engagement",
+    "instagram_business_basic",
+    "instagram_business_content_publish",
 )
 
 _OAUTH_STATE_TTL_SECONDS = 600
+_TOKEN_REFRESH_MIN_AGE = timedelta(hours=24)
+_TOKEN_REFRESH_SKEW = timedelta(days=7)
 _instagram_oauth_state_lock = threading.Lock()
 _instagram_oauth_state_store: dict[str, dict[str, int]] = {}
 social_integration_repository = SocialIntegrationRepository()
@@ -44,86 +57,80 @@ def start_instagram_auth(*, user_id: int) -> str:
     _store_instagram_oauth_state(state, user_id)
 
     params = {
-        "client_id": INSTAGRAM_CLIENT_ID,
+        "client_id": INSTAGRAM_APP_ID,
         "redirect_uri": INSTAGRAM_REDIRECT_URI,
         "response_type": "code",
         "scope": ",".join(INSTAGRAM_SCOPES),
         "state": state,
     }
-    return f"{META_AUTH_URL}?{urlencode(params)}"
+    return f"{INSTAGRAM_AUTH_URL}?{urlencode(params)}"
 
 
 async def handle_instagram_callback(
     code: str = None,
     state: str = None,
     error: str = None,
+    error_reason: str = None,
+    error_description: str = None,
 ) -> RedirectResponse:
     if error:
-        return RedirectResponse(_build_frontend_error_redirect("instagram", "authorization"), status_code=302)
+        reason = str(error_reason or error or "authorization").strip().lower().replace(" ", "_")
+        return RedirectResponse(_build_frontend_error_redirect(INSTAGRAM_PLATFORM, reason), status_code=302)
 
     if not code or not state:
-        return RedirectResponse(_build_frontend_error_redirect("instagram", "missing_code_or_state"), status_code=302)
+        return RedirectResponse(_build_frontend_error_redirect(INSTAGRAM_PLATFORM, "missing_code_or_state"), status_code=302)
 
     config_error = _instagram_config_error()
     if config_error:
-        return RedirectResponse(_build_frontend_error_redirect("instagram", config_error), status_code=302)
+        return RedirectResponse(_build_frontend_error_redirect(INSTAGRAM_PLATFORM, config_error), status_code=302)
 
     user_id = _pop_instagram_oauth_state(state)
     if user_id is None:
-        return RedirectResponse(_build_frontend_error_redirect("instagram", "expired_state"), status_code=302)
+        return RedirectResponse(_build_frontend_error_redirect(INSTAGRAM_PLATFORM, "expired_state"), status_code=302)
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            token_resp = await client.get(
-                META_TOKEN_URL,
-                params={
-                    "client_id": INSTAGRAM_CLIENT_ID,
-                    "client_secret": INSTAGRAM_CLIENT_SECRET,
-                    "redirect_uri": INSTAGRAM_REDIRECT_URI,
-                    "code": code,
-                },
-            )
-        if token_resp.status_code >= 400:
+        token_data = await _exchange_instagram_code_for_short_lived_token(code)
+        short_lived_access_token = _extract_short_lived_access_token(token_data)
+        if not short_lived_access_token:
             return RedirectResponse(
-                _build_frontend_error_redirect("instagram", f"token_{token_resp.status_code}"),
+                _build_frontend_error_redirect(INSTAGRAM_PLATFORM, "missing_access_token"),
                 status_code=302,
             )
 
-        token_data = token_resp.json()
-        access_token = token_data.get("access_token")
+        long_lived_token_data = await _exchange_instagram_token_for_long_lived_token(short_lived_access_token)
+        access_token = str(long_lived_token_data.get("access_token") or "").strip()
         if not access_token:
             return RedirectResponse(
-                _build_frontend_error_redirect("instagram", "missing_access_token"),
+                _build_frontend_error_redirect(INSTAGRAM_PLATFORM, "missing_long_lived_access_token"),
                 status_code=302,
             )
 
-        page_data = await _fetch_instagram_page_data(access_token)
-        if not page_data:
-            return RedirectResponse(
-                _build_frontend_error_redirect("instagram", "missing_instagram_business_account"),
-                status_code=302,
-            )
-
+        account_data = await _fetch_instagram_account_profile(access_token)
         social_integration_repository.upsert_connection(
             user_id=user_id,
-            platform="instagram",
-            platform_user_id=page_data["instagram_business_account_id"],
-            platform_username=page_data.get("username") or page_data.get("name"),
-            access_token=page_data["access_token"],
+            platform=INSTAGRAM_PLATFORM,
+            platform_user_id=account_data["instagram_user_id"],
+            platform_username=account_data["username"],
+            access_token=access_token,
             refresh_token=None,
-            scope=",".join(INSTAGRAM_SCOPES),
-            token_type="bearer",
-            expires_in=token_data.get("expires_in"),
+            scope=_extract_granted_permissions(token_data) or ",".join(INSTAGRAM_SCOPES),
+            token_type=str(long_lived_token_data.get("token_type") or "bearer").strip() or "bearer",
+            expires_in=long_lived_token_data.get("expires_in"),
         )
 
         return RedirectResponse(
-            _build_frontend_redirect("instagram", "connected"),
+            _build_frontend_redirect(INSTAGRAM_PLATFORM, "connected"),
+            status_code=302,
+        )
+    except httpx.HTTPStatusError as error:
+        return RedirectResponse(
+            _build_frontend_error_redirect(INSTAGRAM_PLATFORM, f"token_{error.response.status_code}"),
             status_code=302,
         )
     except httpx.HTTPError:
-        return RedirectResponse(_build_frontend_error_redirect("instagram", "http_error"), status_code=302)
+        return RedirectResponse(_build_frontend_error_redirect(INSTAGRAM_PLATFORM, "http_error"), status_code=302)
     except Exception:
-        return RedirectResponse(_build_frontend_error_redirect("instagram", "exception"), status_code=302)
+        return RedirectResponse(_build_frontend_error_redirect(INSTAGRAM_PLATFORM, "exception"), status_code=302)
 
 
 async def publish_instagram_asset_for_user(*, user_id: int, asset: dict) -> dict:
@@ -143,7 +150,7 @@ async def publish_instagram_asset_for_user(*, user_id: int, asset: dict) -> dict
             "message": "Only Instagram reel and carousel assets can be published directly.",
         }
 
-    connection = social_integration_repository.get_by_user_and_platform(user_id=user_id, platform="instagram")
+    connection = social_integration_repository.get_by_user_and_platform(user_id=user_id, platform=INSTAGRAM_PLATFORM)
     if connection is None:
         return {
             "ok": False,
@@ -159,9 +166,10 @@ async def publish_instagram_asset_for_user(*, user_id: int, asset: dict) -> dict
         }
 
     try:
+        access_token = await _access_token_for_connection(connection)
         if asset_type == "instagram_reel":
-            return await _publish_instagram_reel(connection.access_token, connection.platform_user_id, asset)
-        return await _publish_instagram_carousel(connection.access_token, connection.platform_user_id, asset)
+            return await _publish_instagram_reel(access_token, connection.platform_user_id, asset)
+        return await _publish_instagram_carousel(access_token, connection.platform_user_id, asset)
     except HTTPException as error:
         return {
             "ok": False,
@@ -217,6 +225,132 @@ def _build_frontend_redirect(platform: str, status: str) -> str:
 
 def _build_frontend_error_redirect(platform: str, reason: str) -> str:
     return f"{FRONTEND_BASE_URL}/integrations?{platform}=error&reason={reason}"
+
+
+async def _exchange_instagram_code_for_short_lived_token(code: str) -> dict:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            INSTAGRAM_SHORT_LIVED_TOKEN_URL,
+            data={
+                "client_id": INSTAGRAM_APP_ID,
+                "client_secret": INSTAGRAM_APP_SECRET,
+                "grant_type": "authorization_code",
+                "redirect_uri": INSTAGRAM_REDIRECT_URI,
+                "code": code,
+            },
+        )
+        response.raise_for_status()
+    return response.json()
+
+
+def _extract_short_lived_access_token(payload: dict) -> str:
+    data = _extract_single_data_object(payload)
+    access_token = ""
+    if isinstance(data, dict):
+        access_token = str(data.get("access_token") or "").strip()
+    if access_token:
+        return access_token
+    return str(payload.get("access_token") or "").strip()
+
+
+def _extract_granted_permissions(payload: dict) -> str:
+    data = _extract_single_data_object(payload)
+    if isinstance(data, dict):
+        permissions = data.get("permissions")
+        if isinstance(permissions, list):
+            normalized = [str(permission).strip() for permission in permissions if str(permission).strip()]
+            return ",".join(normalized)
+        return str(permissions or "").strip()
+    permissions = payload.get("permissions")
+    if isinstance(permissions, list):
+        normalized = [str(permission).strip() for permission in permissions if str(permission).strip()]
+        return ",".join(normalized)
+    return str(permissions or "").strip()
+
+
+def _extract_single_data_object(payload: dict) -> dict | None:
+    data = payload.get("data")
+    if isinstance(data, list) and data:
+        first_item = data[0]
+        if isinstance(first_item, dict):
+            return first_item
+    if isinstance(data, dict):
+        return data
+    return payload if isinstance(payload, dict) else None
+
+
+async def _exchange_instagram_token_for_long_lived_token(short_lived_access_token: str) -> dict:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(
+            INSTAGRAM_LONG_LIVED_TOKEN_URL,
+            params={
+                "grant_type": "ig_exchange_token",
+                "client_secret": INSTAGRAM_APP_SECRET,
+                "access_token": short_lived_access_token,
+            },
+        )
+        response.raise_for_status()
+    return response.json()
+
+
+async def _refresh_instagram_access_token(connection: SocialIntegrationRecord) -> str:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(
+            INSTAGRAM_REFRESH_TOKEN_URL,
+            params={
+                "grant_type": "ig_refresh_token",
+                "access_token": connection.access_token,
+            },
+        )
+        response.raise_for_status()
+
+    token_data = response.json()
+    access_token = str(token_data.get("access_token") or "").strip()
+    if not access_token:
+        raise HTTPException(status_code=502, detail="Instagram did not return a refreshed access token.")
+
+    social_integration_repository.upsert_connection(
+        user_id=connection.user_id,
+        platform=INSTAGRAM_PLATFORM,
+        platform_user_id=connection.platform_user_id,
+        platform_username=connection.platform_username,
+        access_token=access_token,
+        refresh_token=None,
+        scope=connection.scope,
+        token_type=str(token_data.get("token_type") or connection.token_type or "bearer").strip() or "bearer",
+        expires_in=token_data.get("expires_in"),
+    )
+    return access_token
+
+
+async def _access_token_for_connection(connection: SocialIntegrationRecord) -> str:
+    if not connection.access_token:
+        raise HTTPException(status_code=409, detail="Your Instagram connection is missing token data.")
+
+    expires_at = _ensure_aware(connection.token_expires_at)
+    updated_at = _ensure_aware(connection.updated_at)
+    now = datetime.now(timezone.utc)
+
+    if expires_at and expires_at <= now:
+        raise HTTPException(status_code=409, detail="Your Instagram connection has expired. Reconnect Instagram.")
+
+    if (
+        expires_at
+        and updated_at
+        and expires_at <= now + _TOKEN_REFRESH_SKEW
+        and updated_at <= now - _TOKEN_REFRESH_MIN_AGE
+    ):
+        return await _refresh_instagram_access_token(connection)
+
+    return connection.access_token
+
+
+def _ensure_aware(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _asset_type(asset: dict) -> str:
@@ -382,61 +516,36 @@ def _public_media_url(file_path: Path) -> str:
     return f"{PUBLIC_BASE_URL}/generated-clips/{relative_path}"
 
 
-async def _fetch_instagram_page_data(access_token: str) -> dict | None:
+async def _fetch_instagram_account_profile(access_token: str) -> dict:
     async with httpx.AsyncClient(timeout=30.0) as client:
-        pages_resp = await client.get(
-            f"{META_GRAPH_URL}/me/accounts",
+        response = await client.get(
+            f"{INSTAGRAM_GRAPH_URL}/me",
             params={
-                "fields": "id,name,access_token,instagram_business_account",
+                "fields": "user_id,username",
                 "access_token": access_token,
             },
         )
-        pages_resp.raise_for_status()
+        response.raise_for_status()
 
-    pages_payload = pages_resp.json()
-    pages = pages_payload.get("data", []) if isinstance(pages_payload, dict) else []
-    for page in pages:
-        instagram_business_account = page.get("instagram_business_account")
-        if not isinstance(instagram_business_account, dict):
-            continue
+    payload = response.json()
+    profile = _extract_single_data_object(payload) or {}
+    instagram_user_id = str(profile.get("user_id") or "").strip()
+    username = str(profile.get("username") or "").strip()
+    if not instagram_user_id or not username:
+        raise HTTPException(status_code=502, detail="Instagram did not return the professional account id and username.")
 
-        ig_user_id = str(instagram_business_account.get("id") or "").strip()
-        if not ig_user_id:
-            continue
-
-        instagram_username = str(page.get("name") or "").strip()
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                profile_resp = await client.get(
-                    f"{META_GRAPH_URL}/{ig_user_id}",
-                    params={
-                        "fields": "username",
-                        "access_token": page.get("access_token") or access_token,
-                    },
-                )
-            if profile_resp.status_code < 400:
-                profile_data = profile_resp.json()
-                instagram_username = str(profile_data.get("username") or instagram_username).strip()
-        except httpx.HTTPError:
-            pass
-
-        return {
-            "id": str(page.get("id") or "").strip(),
-            "name": str(page.get("name") or "").strip(),
-            "username": instagram_username,
-            "access_token": str(page.get("access_token") or "").strip() or access_token,
-            "instagram_business_account_id": ig_user_id,
-        }
-
-    return None
+    return {
+        "instagram_user_id": instagram_user_id,
+        "username": username,
+    }
 
 
 def _instagram_config_error() -> str:
     missing = []
-    if not INSTAGRAM_CLIENT_ID:
-        missing.append("INSTAGRAM_CLIENT_ID")
-    if not INSTAGRAM_CLIENT_SECRET:
-        missing.append("INSTAGRAM_CLIENT_SECRET")
+    if not INSTAGRAM_APP_ID:
+        missing.append("INSTAGRAM_APP_ID or INSTAGRAM_CLIENT_ID")
+    if not INSTAGRAM_APP_SECRET:
+        missing.append("INSTAGRAM_APP_SECRET or INSTAGRAM_CLIENT_SECRET")
     if not INSTAGRAM_REDIRECT_URI:
         missing.append("INSTAGRAM_REDIRECT_URI")
     if missing:
@@ -458,7 +567,7 @@ async def _create_instagram_media_container(
 ) -> str:
     async with httpx.AsyncClient(timeout=60.0) as client:
         response = await client.post(
-            f"{META_GRAPH_URL}/{instagram_user_id}/media",
+            f"{INSTAGRAM_GRAPH_URL}/{instagram_user_id}/media",
             data={**payload, "access_token": access_token},
         )
         response.raise_for_status()
@@ -478,7 +587,7 @@ async def _publish_instagram_container(
 ) -> dict:
     async with httpx.AsyncClient(timeout=60.0) as client:
         response = await client.post(
-            f"{META_GRAPH_URL}/{instagram_user_id}/media_publish",
+            f"{INSTAGRAM_GRAPH_URL}/{instagram_user_id}/media_publish",
             data={
                 "creation_id": creation_id,
                 "access_token": access_token,
