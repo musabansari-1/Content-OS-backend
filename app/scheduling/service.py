@@ -12,11 +12,11 @@ from app.services.ghost_service import publish_ghost_asset_for_user
 from app.scheduling.domain import ScheduledPostRecord
 from app.scheduling.repository import ScheduledPostRepository
 from app.services.instagram_service import publish_instagram_asset_for_user
-from app.services.integration_service import publish_linkedin_post_for_user
+from app.services.integration_service import publish_linkedin_post_for_user, publish_x_asset_for_user
 from app.services.tiktok_service import publish_tiktok_asset_for_user
 
 
-VALID_PLATFORMS = {"linkedin", "instagram", "tiktok", "ghost"}
+VALID_PLATFORMS = {"linkedin", "x", "instagram", "tiktok", "ghost"}
 VALID_STATUSES = {"scheduled", "publishing", "published", "failed", "canceled"}
 MINIMUM_SCHEDULE_DELAY_SECONDS = 30
 DEFAULT_MAX_ATTEMPTS = 3
@@ -151,6 +151,8 @@ async def _publish_claimed_post(post: ScheduledPostRecord) -> dict[str, Any]:
 
     if post.platform == "linkedin":
         result = await publish_linkedin_post_for_user(user_id=post.user_id, text=str(post.payload["text"]))
+    elif post.platform == "x":
+        result = await publish_x_asset_for_user(user_id=post.user_id, asset=post.payload["asset"])
     elif post.platform == "instagram":
         result = await publish_instagram_asset_for_user(user_id=post.user_id, asset=post.payload["asset"])
     elif post.platform == "tiktok":
@@ -204,6 +206,7 @@ def _normalize_platform(platform: str) -> str:
 def _platform_label(platform: str) -> str:
     labels = {
         "linkedin": "LinkedIn",
+        "x": "X",
         "instagram": "Instagram",
         "tiktok": "TikTok",
         "ghost": "Ghost",
@@ -226,7 +229,7 @@ def _normalize_payload(platform: str, payload: dict[str, Any]) -> dict[str, Any]
             normalized_payload["metadata"] = metadata
         return normalized_payload
 
-    if platform in {"instagram", "tiktok", "ghost"}:
+    if platform in {"x", "instagram", "tiktok", "ghost"}:
         asset = payload.get("asset")
         if not isinstance(asset, dict):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{platform.title()} scheduled posts require an asset.")
@@ -297,7 +300,7 @@ def _client_asset_id(payload: dict[str, Any]) -> str:
 
 
 def _external_post_id(result: dict[str, Any]) -> str | None:
-    for key in ("linkedin_post_id", "instagram_post_id", "publish_id", "ghost_post_id"):
+    for key in ("linkedin_post_id", "x_post_id", "instagram_post_id", "publish_id", "ghost_post_id"):
         value = result.get(key)
         if value:
             return str(value)

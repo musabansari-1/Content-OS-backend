@@ -3,9 +3,12 @@ import hashlib
 import secrets
 import threading
 import time
+from datetime import datetime, timedelta, timezone
+from typing import Any
 from urllib.parse import urlencode
 
 import httpx
+from fastapi import HTTPException
 from starlette.responses import RedirectResponse
 
 from app.core.config import env, require_env
@@ -25,8 +28,12 @@ X_CLIENT_SECRET = env("X_CLIENT_SECRET")
 X_AUTH_URL = "https://x.com/i/oauth2/authorize"
 X_TOKEN_URL = "https://api.x.com/2/oauth2/token"
 X_ME_URL = "https://api.x.com/2/users/me"
+X_POSTS_URL = "https://api.x.com/2/tweets"
 X_SCOPES = ("tweet.read", "tweet.write", "users.read", "offline.access")
+X_PLATFORM = "x"
 _OAUTH_STATE_TTL_SECONDS = 600
+_TOKEN_REFRESH_SKEW_SECONDS = 120
+_MAX_X_POST_LENGTH = 280
 _x_oauth_state_lock = threading.Lock()
 _x_oauth_state_store: dict[str, dict[str, str | int]] = {}
 _linkedin_oauth_state_lock = threading.Lock()
@@ -278,7 +285,7 @@ async def handle_x_callback(
             return RedirectResponse(_build_frontend_error_redirect("x", "missing_x_user"), status_code=302)
         social_integration_repository.upsert_connection(
             user_id=user_id,
-            platform="x",
+            platform=X_PLATFORM,
             platform_user_id=str(x_user.get("id", "")),
             platform_username=x_user.get("username"),
             access_token=access_token,
@@ -292,6 +299,59 @@ async def handle_x_callback(
         return RedirectResponse(_build_frontend_error_redirect("x", "http_error"), status_code=302)
     except Exception:
         return RedirectResponse(_build_frontend_error_redirect("x", "exception"), status_code=302)
+
+
+async def _refresh_x_access_token(connection) -> str:
+    if not connection.refresh_token:
+        raise HTTPException(status_code=409, detail="Your X connection needs to be reconnected.")
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        token_request_kwargs = {}
+        if X_CLIENT_SECRET:
+            token_request_kwargs["auth"] = (X_CLIENT_ID, X_CLIENT_SECRET)
+        response = await client.post(
+            X_TOKEN_URL,
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": connection.refresh_token,
+                "client_id": X_CLIENT_ID,
+            },
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            **token_request_kwargs,
+        )
+        response.raise_for_status()
+
+    token_data = response.json()
+    access_token = str(token_data.get("access_token") or "").strip()
+    if not access_token:
+        raise HTTPException(status_code=502, detail="X did not return a refreshed access token.")
+
+    social_integration_repository.upsert_connection(
+        user_id=connection.user_id,
+        platform=X_PLATFORM,
+        platform_user_id=connection.platform_user_id,
+        platform_username=connection.platform_username,
+        access_token=access_token,
+        refresh_token=token_data.get("refresh_token") or connection.refresh_token,
+        scope=token_data.get("scope") or connection.scope,
+        token_type=token_data.get("token_type") or connection.token_type,
+        expires_in=token_data.get("expires_in"),
+    )
+    return access_token
+
+
+async def _access_token_for_x_connection(connection) -> str:
+    if not connection.access_token:
+        raise HTTPException(status_code=409, detail="Your X connection is missing token data.")
+
+    expires_at = _ensure_aware(connection.token_expires_at)
+    refresh_after = datetime.now(timezone.utc) + timedelta(seconds=_TOKEN_REFRESH_SKEW_SECONDS)
+    if expires_at and expires_at <= refresh_after:
+        return await _refresh_x_access_token(connection)
+
+    return connection.access_token
 
 
 async def get_linkedin_user_id(access_token: str):
@@ -379,15 +439,269 @@ async def publish_linkedin_post_for_user(*, user_id: int, text: str) -> dict:
         }
 
 
+async def publish_x_post(access_token: str, text: str, *, reply_to_post_id: str | None = None) -> tuple[str, str]:
+    payload: dict[str, Any] = {"text": text}
+    if reply_to_post_id:
+        payload["reply"] = {"in_reply_to_tweet_id": reply_to_post_id}
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.post(
+            X_POSTS_URL,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+        )
+        response.raise_for_status()
+
+    response_payload = response.json()
+    post_data = response_payload.get("data") if isinstance(response_payload, dict) else None
+    post_id = str(post_data.get("id") or "").strip() if isinstance(post_data, dict) else ""
+    if not post_id:
+        raise HTTPException(status_code=502, detail="X did not return a post id.")
+    return post_id, response.text
+
+
+async def publish_x_asset_for_user(*, user_id: int, asset: dict[str, Any]) -> dict[str, Any]:
+    asset_type = _asset_type(asset)
+    if asset_type not in {"x_post", "twitter_thread"}:
+        return {
+            "ok": False,
+            "error": "x_unsupported_asset",
+            "message": "Only X posts and thread assets can be published directly to X.",
+        }
+
+    connection = social_integration_repository.get_by_user_and_platform(user_id=user_id, platform=X_PLATFORM)
+    if connection is None:
+        return {
+            "ok": False,
+            "error": "x_not_connected",
+            "message": "Connect X before publishing.",
+        }
+
+    if not connection.access_token or not connection.platform_user_id:
+        return {
+            "ok": False,
+            "error": "x_connection_incomplete",
+            "message": "Your X connection is missing token data.",
+        }
+
+    try:
+        access_token = await _access_token_for_x_connection(connection)
+        if asset_type == "x_post":
+            post_text = _build_x_post_text(asset)
+            post_id, response_text = await publish_x_post(access_token, post_text)
+            return {
+                "ok": True,
+                "platform": X_PLATFORM,
+                "asset_type": asset_type,
+                "x_user_id": connection.platform_user_id,
+                "x_username": connection.platform_username,
+                "x_post_id": post_id,
+                "x_post_ids": [post_id],
+                "published_count": 1,
+                "response_text": response_text,
+            }
+
+        thread_posts = _build_x_thread_posts(asset)
+        post_ids: list[str] = []
+        reply_to_post_id: str | None = None
+        response_texts: list[str] = []
+        for post_text in thread_posts:
+            post_id, response_text = await publish_x_post(
+                access_token,
+                post_text,
+                reply_to_post_id=reply_to_post_id,
+            )
+            post_ids.append(post_id)
+            response_texts.append(response_text)
+            reply_to_post_id = post_id
+
+        return {
+            "ok": True,
+            "platform": X_PLATFORM,
+            "asset_type": asset_type,
+            "x_user_id": connection.platform_user_id,
+            "x_username": connection.platform_username,
+            "x_post_id": post_ids[0],
+            "x_post_ids": post_ids,
+            "published_count": len(post_ids),
+            "response_text": "\n".join(part for part in response_texts if part),
+        }
+    except HTTPException as error:
+        error_key = "x_invalid_asset" if error.status_code == 400 else "x_connection_incomplete" if error.status_code == 409 else "x_publish_failed"
+        return {
+            "ok": False,
+            "error": error_key,
+            "message": error.detail if isinstance(error.detail, str) else "X publish failed.",
+            "status_code": error.status_code,
+        }
+    except httpx.HTTPStatusError as error:
+        return _x_http_error_result(error, default_message="X rejected the publish request.")
+    except Exception:
+        return {
+            "ok": False,
+            "error": "x_publish_failed",
+            "message": "X publish failed unexpectedly.",
+        }
+
+
+def _ensure_aware(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _asset_type(asset: dict[str, Any]) -> str:
+    return str(asset.get("assetType") or asset.get("asset_type") or "").strip().lower()
+
+
+def _asset_blocks(asset: dict[str, Any]) -> list[dict[str, Any]]:
+    blocks = asset.get("blocks")
+    if not isinstance(blocks, list):
+        return []
+    return [block for block in blocks if isinstance(block, dict)]
+
+
+def _block_map(asset: dict[str, Any]) -> dict[str, Any]:
+    block_map: dict[str, Any] = {}
+    for block in _asset_blocks(asset):
+        key = str(block.get("key") or "").strip().lower()
+        if key:
+            block_map[key] = block.get("value")
+    return block_map
+
+
+def _normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, dict):
+        for key in ("post", "text", "content", "body", "summary", "caption", "title", "hook", "value"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        parts = [_normalize_text(candidate) for candidate in value.values()]
+        return "\n".join(part for part in parts if part)
+    if isinstance(value, list):
+        parts = [_normalize_text(item) for item in value]
+        return "\n".join(part for part in parts if part)
+    return str(value).strip()
+
+
+def _normalize_post_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [_normalize_text(item) for item in value if _normalize_text(item)]
+    if isinstance(value, str):
+        return [part.strip() for part in value.split("\n\n") if part.strip()]
+    if isinstance(value, dict):
+        posts: list[str] = []
+        for key in sorted(value):
+            normalized = _normalize_text(value.get(key))
+            if normalized:
+                posts.append(normalized)
+        return posts
+    normalized = _normalize_text(value)
+    return [normalized] if normalized else []
+
+
+def _build_x_post_text(asset: dict[str, Any]) -> str:
+    block_map = _block_map(asset)
+    for candidate in (
+        asset.get("post"),
+        asset.get("text"),
+        asset.get("content"),
+        asset.get("body"),
+        asset.get("caption"),
+        block_map.get("post"),
+        block_map.get("text"),
+        block_map.get("content"),
+        block_map.get("body"),
+    ):
+        text = _normalize_text(candidate)
+        if text:
+            return _validate_x_post_text(text, asset_label="post")
+
+    raise HTTPException(status_code=400, detail="This X post asset is missing the post text required for publishing.")
+
+
+def _build_x_thread_posts(asset: dict[str, Any]) -> list[str]:
+    block_map = _block_map(asset)
+    for candidate in (
+        asset.get("tweets"),
+        asset.get("thread"),
+        block_map.get("tweets"),
+        block_map.get("thread"),
+    ):
+        posts = _normalize_post_list(candidate)
+        if posts:
+            return _validate_x_thread_posts(posts)
+
+    raise HTTPException(status_code=400, detail="This X thread asset is missing the tweet list required for publishing.")
+
+
+def _validate_x_post_text(text: str, *, asset_label: str) -> str:
+    normalized = text.strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail=f"This X {asset_label} asset is empty and cannot be published.")
+    if len(normalized) > _MAX_X_POST_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"This X {asset_label} exceeds {_MAX_X_POST_LENGTH} characters and cannot be published.",
+        )
+    return normalized
+
+
+def _validate_x_thread_posts(posts: list[str]) -> list[str]:
+    normalized_posts = [_validate_x_post_text(post, asset_label=f"thread tweet {index}") for index, post in enumerate(posts, start=1)]
+    if len(normalized_posts) < 2:
+        raise HTTPException(status_code=400, detail="This X thread asset must contain at least 2 tweets.")
+    return normalized_posts
+
+
+def _x_http_error_result(error: httpx.HTTPStatusError, *, default_message: str) -> dict[str, Any]:
+    response = error.response
+    message = default_message
+    try:
+        payload = response.json()
+        errors = payload.get("errors") if isinstance(payload, dict) else None
+        if isinstance(errors, list) and errors:
+            candidate = errors[0]
+            if isinstance(candidate, dict):
+                candidate_message = str(candidate.get("message") or candidate.get("detail") or "").strip()
+                if candidate_message:
+                    message = candidate_message
+        elif isinstance(payload, dict):
+            candidate_message = str(payload.get("detail") or payload.get("title") or "").strip()
+            if candidate_message:
+                message = candidate_message
+    except Exception:
+        pass
+
+    return {
+        "ok": False,
+        "error": "x_publish_failed",
+        "message": message,
+        "status_code": response.status_code,
+        "response_text": response.text,
+    }
+
+
 def get_connected_platforms_for_user(*, user_id: int) -> dict:
     platforms = social_integration_repository.list_connected_platforms(user_id=user_id)
-    platform_ids = ["twitter" if platform == "x" else platform for platform in platforms]
+    platform_ids = ["twitter" if platform == X_PLATFORM else platform for platform in platforms]
     return {
         "connected_platforms": platforms,
         "connected_platform_ids": platform_ids,
         "linkedin_connected": "linkedin" in platforms,
         "instagram_connected": "instagram" in platforms,
-        "x_connected": "x" in platforms,
+        "x_connected": X_PLATFORM in platforms,
         "tiktok_connected": "tiktok" in platforms,
         "ghost_connected": "ghost" in platforms,
     }

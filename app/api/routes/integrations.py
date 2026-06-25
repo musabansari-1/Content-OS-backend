@@ -20,6 +20,7 @@ from app.services.integration_service import (
     handle_linkedin_callback,
     handle_x_callback,
     publish_linkedin_post_for_user,
+    publish_x_asset_for_user,
     start_linkedin_auth,
     start_x_auth,
 )
@@ -37,6 +38,10 @@ router = APIRouter()
 
 class LinkedInPublishRequest(BaseModel):
     text: str = Field(..., description="The LinkedIn post text to publish.")
+
+
+class XPublishRequest(BaseModel):
+    asset: dict = Field(..., description="The X post or thread asset payload to publish.")
 
 
 class InstagramPublishRequest(BaseModel):
@@ -206,6 +211,39 @@ async def publish_linkedin(
         "platform": result["platform"],
         "linkedin_post_id": result.get("linkedin_post_id"),
         "status_code": result.get("status_code"),
+    }
+
+
+@router.post("/x/publish")
+async def publish_x(
+    request: XPublishRequest,
+    current_user: AuthUser = Depends(require_current_user),
+):
+    ensure_can_direct_publish(current_user.id, 1)
+
+    asset = request.asset if isinstance(request.asset, dict) else {}
+    result = await publish_x_asset_for_user(user_id=current_user.id, asset=asset)
+    if not result.get("ok"):
+        error = result.get("error")
+        if error == "x_not_connected":
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=result["message"])
+        if error == "x_connection_incomplete":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result["message"])
+        if error in {"x_unsupported_asset", "x_invalid_asset"}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result["message"])
+        raise HTTPException(
+            status_code=result.get("status_code") or status.HTTP_502_BAD_GATEWAY,
+            detail=result.get("message", "X publish failed."),
+        )
+
+    record_direct_publish(current_user.id, 1)
+    return {
+        "message": "X content published.",
+        "platform": result["platform"],
+        "asset_type": result.get("asset_type"),
+        "x_post_id": result.get("x_post_id"),
+        "x_post_ids": result.get("x_post_ids"),
+        "published_count": result.get("published_count"),
     }
 
 
