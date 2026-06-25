@@ -13,6 +13,7 @@ PBKDF2_ITERATIONS = 200_000
 ACCESS_TOKEN_TTL_SECONDS = int(env("ACCESS_TOKEN_TTL_SECONDS", "900") or "900")
 REFRESH_SESSION_TTL_SECONDS = int(env("REFRESH_SESSION_TTL_SECONDS", str(60 * 60 * 24 * 30)) or str(60 * 60 * 24 * 30))
 EMAIL_VERIFICATION_TTL_SECONDS = int(env("EMAIL_VERIFICATION_TTL_SECONDS", str(60 * 60 * 24)) or str(60 * 60 * 24))
+PASSWORD_RESET_TTL_SECONDS = int(env("PASSWORD_RESET_TTL_SECONDS", str(60 * 60)) or str(60 * 60))
 AUTH_SECRET = env("AUTH_SECRET", "dev-auth-secret-change-me") or "dev-auth-secret-change-me"
 
 

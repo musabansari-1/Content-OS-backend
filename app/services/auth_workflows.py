@@ -2,8 +2,11 @@ from app.auth.domain import AuthSession, AuthUser
 from app.auth.dependencies import auth_service
 from app.auth.types import (
     AuthResponse,
+    ForgotPasswordRequest,
     LoginRequest,
+    PasswordResetRequestResponse,
     RegisterRequest,
+    ResetPasswordConfirmRequest,
     UserResponse,
     VerifyEmailRequestResponse,
 )
@@ -72,3 +75,12 @@ def request_email_verification(current_user: AuthUser) -> VerifyEmailRequestResp
 
 def confirm_email_verification(token: str) -> UserResponse:
     return _to_user_response(auth_service.verify_email(token))
+
+
+def request_password_reset(request: ForgotPasswordRequest) -> PasswordResetRequestResponse:
+    payload = auth_service.request_password_reset(request)
+    return PasswordResetRequestResponse(**payload)
+
+
+def confirm_password_reset(request: ResetPasswordConfirmRequest) -> UserResponse:
+    return _to_user_response(auth_service.reset_password(request))

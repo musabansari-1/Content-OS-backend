@@ -2,21 +2,26 @@ from fastapi import APIRouter, Depends, Request, Response
 
 from app.auth.domain import AuthUser
 from app.auth.dependencies import auth_service, require_current_user
+from app.auth.notifications import FRONTEND_BASE_URL
 from app.auth.security import REFRESH_SESSION_TTL_SECONDS
-from app.auth.service import FRONTEND_BASE_URL
 from app.auth.types import (
     AuthResponse,
+    ForgotPasswordRequest,
     LoginRequest,
     MessageResponse,
+    PasswordResetRequestResponse,
     RegisterRequest,
+    ResetPasswordConfirmRequest,
     UserResponse,
     VerifyEmailConfirmRequest,
     VerifyEmailRequestResponse,
 )
 from app.services.auth_workflows import (
+    confirm_password_reset,
     confirm_email_verification,
     get_current_user_profile,
     login_user,
+    request_password_reset,
     refresh_user,
     register_user,
     request_email_verification,
@@ -119,3 +124,13 @@ def resend_email_verification(current_user: AuthUser = Depends(require_current_u
 @router.post("/auth/verify-email/confirm", response_model=UserResponse)
 def verify_email_confirm(request: VerifyEmailConfirmRequest):
     return confirm_email_verification(request.token)
+
+
+@router.post("/auth/password/forgot", response_model=PasswordResetRequestResponse)
+def forgot_password(request: ForgotPasswordRequest):
+    return request_password_reset(request)
+
+
+@router.post("/auth/password/reset", response_model=UserResponse)
+def reset_password(request: ResetPasswordConfirmRequest):
+    return confirm_password_reset(request)

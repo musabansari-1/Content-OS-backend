@@ -56,3 +56,13 @@ class EmailVerificationTokenRecord:
     expires_at: datetime
     used_at: Optional[datetime]
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class PasswordResetTokenRecord:
+    id: int
+    user_id: int
+    token_hash: str
+    expires_at: datetime
+    used_at: Optional[datetime]
+    created_at: datetime

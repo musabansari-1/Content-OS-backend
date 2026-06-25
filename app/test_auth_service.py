@@ -1,16 +1,21 @@
 import unittest
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
+from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
 from fastapi import HTTPException
 
-import app.auth.service as service_module
-from app.auth.domain import AuthSessionRecord, AuthUser, AuthUserCredentials, EmailVerificationTokenRecord
+import app.auth.notifications as notifications_module
+from app.auth.domain import (
+    AuthSessionRecord,
+    AuthUser,
+    AuthUserCredentials,
+    EmailVerificationTokenRecord,
+    PasswordResetTokenRecord,
+)
 from app.auth.security import hash_password
 from app.auth.service import AuthService
-from app.auth.types import LoginRequest, RegisterRequest
+from app.auth.types import ForgotPasswordRequest, LoginRequest, RegisterRequest, ResetPasswordConfirmRequest
 
 
 class FakeRepository:
@@ -19,9 +24,11 @@ class FakeRepository:
         self._credentials_by_email: dict[str, AuthUserCredentials] = {}
         self._sessions: dict[int, AuthSessionRecord] = {}
         self._verification_tokens: dict[int, EmailVerificationTokenRecord] = {}
+        self._password_reset_tokens: dict[int, PasswordResetTokenRecord] = {}
         self._next_user_id = 1
         self._next_session_id = 1
         self._next_verification_token_id = 1
+        self._next_password_reset_token_id = 1
 
     def create_user(self, email: str, password_hash: str, display_name: str) -> AuthUser:
         user = AuthUser(
@@ -124,19 +131,48 @@ class FakeRepository:
         self._credentials_by_email[user.email] = replace(credentials, email_verified_at=verified_at)
         return updated_user
 
+    def create_password_reset_token(self, *, user_id: int, token_hash: str, expires_at):
+        for token_id, record in list(self._password_reset_tokens.items()):
+            if record.user_id == user_id and record.used_at is None:
+                self._password_reset_tokens[token_id] = replace(record, used_at=datetime.now(timezone.utc))
+        record = PasswordResetTokenRecord(
+            id=self._next_password_reset_token_id,
+            user_id=user_id,
+            token_hash=token_hash,
+            expires_at=expires_at,
+            used_at=None,
+            created_at=datetime.now(timezone.utc),
+        )
+        self._password_reset_tokens[record.id] = record
+        self._next_password_reset_token_id += 1
+        return record
+
+    def get_password_reset_token_by_id(self, token_id: int):
+        return self._password_reset_tokens.get(token_id)
+
+    def mark_password_reset_token_used(self, token_id: int) -> None:
+        record = self._password_reset_tokens[token_id]
+        self._password_reset_tokens[token_id] = replace(record, used_at=record.used_at or datetime.now(timezone.utc))
+
+    def update_user_password(self, user_id: int, password_hash: str) -> AuthUser | None:
+        user = self._users[user_id]
+        credentials = self._credentials_by_email[user.email]
+        self._credentials_by_email[user.email] = replace(credentials, password_hash=password_hash)
+        return self._users[user_id]
+
 
 class AuthServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.repository = FakeRepository()
         self.service = AuthService(repository=self.repository)
-        self._old_preview_flag = service_module.EMAIL_VERIFICATION_PREVIEW_ENABLED
-        self._old_frontend = service_module.FRONTEND_BASE_URL
-        service_module.EMAIL_VERIFICATION_PREVIEW_ENABLED = True
-        service_module.FRONTEND_BASE_URL = "http://localhost:3000"
+        self._old_preview_flag = notifications_module.AUTH_EMAIL_PREVIEW_ENABLED
+        self._old_frontend = notifications_module.FRONTEND_BASE_URL
+        notifications_module.AUTH_EMAIL_PREVIEW_ENABLED = True
+        notifications_module.FRONTEND_BASE_URL = "http://localhost:3000"
 
     def tearDown(self) -> None:
-        service_module.EMAIL_VERIFICATION_PREVIEW_ENABLED = self._old_preview_flag
-        service_module.FRONTEND_BASE_URL = self._old_frontend
+        notifications_module.AUTH_EMAIL_PREVIEW_ENABLED = self._old_preview_flag
+        notifications_module.FRONTEND_BASE_URL = self._old_frontend
 
     def test_register_creates_session_and_verification_preview(self) -> None:
         session = self.service.register(
@@ -191,6 +227,28 @@ class AuthServiceTests(unittest.TestCase):
         payload = self.service.request_email_verification(user.id)
         self.assertFalse(payload["email_verification_required"])
         self.assertFalse(payload["email_verification_sent"])
+
+    def test_request_password_reset_issues_preview_link(self) -> None:
+        self.repository.create_user("user@example.com", hash_password("password123"), "User")
+
+        payload = self.service.request_password_reset(ForgotPasswordRequest(email="user@example.com"))
+
+        self.assertTrue(payload["password_reset_sent"])
+        self.assertIn("reset-password?token=", payload["password_reset_preview_url"] or "")
+
+    def test_reset_password_updates_credentials_and_revokes_sessions(self) -> None:
+        session = self.service.register(RegisterRequest(email="user@example.com", password="password123", display_name="User"))
+        payload = self.service.request_password_reset(ForgotPasswordRequest(email="user@example.com"))
+        parsed = urlparse(payload["password_reset_preview_url"] or "")
+        token = parse_qs(parsed.query)["token"][0]
+
+        user = self.service.reset_password(ResetPasswordConfirmRequest(token=token, password="newpassword123"))
+
+        self.assertEqual(user.email, "user@example.com")
+        with self.assertRaises(HTTPException):
+            self.service.refresh(session.refresh_token)
+        new_session = self.service.login(LoginRequest(email="user@example.com", password="newpassword123"))
+        self.assertTrue(new_session.access_token)
 
 
 if __name__ == "__main__":

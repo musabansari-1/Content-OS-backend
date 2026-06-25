@@ -5,6 +5,7 @@ from app.auth.domain import (
     AuthUser,
     AuthUserCredentials,
     EmailVerificationTokenRecord,
+    PasswordResetTokenRecord,
 )
 from app.core.db import get_connection
 
@@ -335,6 +336,116 @@ class UserRepository:
                 WHERE id = %s
                 """,
                 (user_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        return self.get_by_id(user_id)
+
+    def create_password_reset_token(self, *, user_id: int, token_hash: str, expires_at) -> PasswordResetTokenRecord:
+        connection = get_connection()
+
+        try:
+            connection.execute(
+                """
+                UPDATE password_reset_tokens
+                SET used_at = CURRENT_TIMESTAMP
+                WHERE user_id = %s AND used_at IS NULL
+                """,
+                (user_id,),
+            )
+            row = connection.execute(
+                """
+                INSERT INTO password_reset_tokens (
+                    user_id,
+                    token_hash,
+                    expires_at
+                )
+                VALUES (%s, %s, %s)
+                RETURNING
+                    id,
+                    user_id,
+                    token_hash,
+                    expires_at,
+                    used_at,
+                    created_at
+                """,
+                (user_id, token_hash, expires_at),
+            ).fetchone()
+            connection.commit()
+        finally:
+            connection.close()
+
+        return PasswordResetTokenRecord(
+            id=int(row["id"]),
+            user_id=int(row["user_id"]),
+            token_hash=row["token_hash"],
+            expires_at=row["expires_at"],
+            used_at=row["used_at"],
+            created_at=row["created_at"],
+        )
+
+    def get_password_reset_token_by_id(self, token_id: int) -> Optional[PasswordResetTokenRecord]:
+        connection = get_connection()
+
+        try:
+            row = connection.execute(
+                """
+                SELECT
+                    id,
+                    user_id,
+                    token_hash,
+                    expires_at,
+                    used_at,
+                    created_at
+                FROM password_reset_tokens
+                WHERE id = %s
+                """,
+                (token_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        if not row:
+            return None
+
+        return PasswordResetTokenRecord(
+            id=int(row["id"]),
+            user_id=int(row["user_id"]),
+            token_hash=row["token_hash"],
+            expires_at=row["expires_at"],
+            used_at=row["used_at"],
+            created_at=row["created_at"],
+        )
+
+    def mark_password_reset_token_used(self, token_id: int) -> None:
+        connection = get_connection()
+
+        try:
+            connection.execute(
+                """
+                UPDATE password_reset_tokens
+                SET used_at = COALESCE(used_at, CURRENT_TIMESTAMP)
+                WHERE id = %s
+                """,
+                (token_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def update_user_password(self, user_id: int, password_hash: str) -> AuthUser | None:
+        connection = get_connection()
+
+        try:
+            connection.execute(
+                """
+                UPDATE users
+                SET password_hash = %s
+                WHERE id = %s
+                """,
+                (password_hash, user_id),
             )
             connection.commit()
         finally:

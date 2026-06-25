@@ -24,6 +24,15 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+
+class ResetPasswordConfirmRequest(BaseModel):
+    token: str
+    password: str
+
+
 class AuthResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -45,3 +54,9 @@ class VerifyEmailRequestResponse(BaseModel):
 
 class MessageResponse(BaseModel):
     message: str
+
+
+class PasswordResetRequestResponse(BaseModel):
+    message: str
+    password_reset_sent: bool
+    password_reset_preview_url: Optional[str] = None

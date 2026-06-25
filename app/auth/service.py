@@ -1,13 +1,18 @@
 import logging
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
 
 from fastapi import HTTPException
 
+from app.auth.notifications import (
+    build_email_verification_url,
+    build_password_reset_url,
+    send_auth_email,
+)
 from app.auth.domain import AuthSession, AuthUser
 from app.auth.repository import UserRepository
 from app.auth.security import (
     EMAIL_VERIFICATION_TTL_SECONDS,
+    PASSWORD_RESET_TTL_SECONDS,
     REFRESH_SESSION_TTL_SECONDS,
     build_scoped_token,
     create_access_token,
@@ -18,18 +23,10 @@ from app.auth.security import (
     parse_scoped_token,
     verify_password,
 )
-from app.auth.types import LoginRequest, RegisterRequest
-from app.core.config import env
+from app.auth.types import ForgotPasswordRequest, LoginRequest, RegisterRequest, ResetPasswordConfirmRequest
 
 
 logger = logging.getLogger(__name__)
-FRONTEND_BASE_URL = (env("FRONTEND_BASE_URL", "http://localhost:3000") or "http://localhost:3000").rstrip("/")
-PUBLIC_BASE_URL = (env("PUBLIC_BASE_URL", "http://localhost:8000") or "http://localhost:8000").rstrip("/")
-EMAIL_VERIFICATION_PREVIEW_ENABLED = (
-    (env("AUTH_EMAIL_VERIFY_SHOW_TOKEN", "") or "").strip().lower() in {"1", "true", "yes", "on"}
-    if (env("AUTH_EMAIL_VERIFY_SHOW_TOKEN", "") or "").strip()
-    else FRONTEND_BASE_URL.startswith("http://localhost") or PUBLIC_BASE_URL.startswith("http://localhost")
-)
 
 
 def _now() -> datetime:
@@ -50,6 +47,13 @@ def _is_expired(value: datetime) -> bool:
     return value <= _now()
 
 
+def _validate_new_password(password: str) -> str:
+    normalized = (password or "").strip()
+    if len(normalized) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters long.")
+    return normalized
+
+
 class AuthService:
     def __init__(self, repository: UserRepository | None = None) -> None:
         self.repository = repository or UserRepository()
@@ -67,12 +71,7 @@ class AuthService:
         if existing_user:
             raise HTTPException(status_code=409, detail="Email is already registered.")
 
-        password = request.password.strip()
-        if len(password) < 8:
-            raise HTTPException(
-                status_code=400,
-                detail="Password must be at least 8 characters long.",
-            )
+        password = _validate_new_password(request.password)
 
         display_name = (request.display_name or request.email.split("@")[0]).strip()
         user = self.repository.create_user(
@@ -188,6 +187,42 @@ class AuthService:
             raise HTTPException(status_code=404, detail="User not found.")
         return user
 
+    def request_password_reset(self, request: ForgotPasswordRequest) -> dict:
+        email = _normalize_email(request.email)
+        _validate_email(email)
+        user = self.repository.get_by_email(email)
+        if not user or not user.is_active:
+            return {
+                "message": "If an account exists for that email, a reset link has been sent.",
+                "password_reset_sent": False,
+                "password_reset_preview_url": None,
+            }
+
+        preview_url = self._issue_password_reset(user.id, user.email)
+        return {
+            "message": "If an account exists for that email, a reset link has been sent.",
+            "password_reset_sent": True,
+            "password_reset_preview_url": preview_url,
+        }
+
+    def reset_password(self, request: ResetPasswordConfirmRequest) -> AuthUser:
+        password = _validate_new_password(request.password)
+        parsed = parse_scoped_token(request.token)
+        if not parsed:
+            raise HTTPException(status_code=400, detail="Invalid password reset token.")
+        token_id, token_secret = parsed
+        record = self.repository.get_password_reset_token_by_id(token_id)
+        if not record or record.used_at or _is_expired(record.expires_at):
+            raise HTTPException(status_code=400, detail="Password reset token is invalid or expired.")
+        if hash_opaque_token(token_secret) != record.token_hash:
+            raise HTTPException(status_code=400, detail="Password reset token is invalid or expired.")
+        self.repository.mark_password_reset_token_used(token_id)
+        user = self.repository.update_user_password(record.user_id, hash_password(password))
+        self.repository.revoke_all_auth_sessions_for_user(record.user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found.")
+        return user
+
     def get_current_user(self, token: str) -> AuthUser:
         payload = decode_access_token(token)
         if not payload:
@@ -266,8 +301,24 @@ class AuthService:
             expires_at=_now() + timedelta(seconds=EMAIL_VERIFICATION_TTL_SECONDS),
         )
         token = build_scoped_token(record.id, verification_secret)
-        preview_url = f"{FRONTEND_BASE_URL}/verify-email?token={quote(token, safe='')}"
-        logger.info("Email verification requested for %s. Preview URL: %s", email, preview_url)
-        if EMAIL_VERIFICATION_PREVIEW_ENABLED:
-            return preview_url
-        return None
+        return send_auth_email(
+            email=email,
+            subject="Verify your ContentOS email",
+            action="verify_email",
+            action_url=build_email_verification_url(token),
+        )
+
+    def _issue_password_reset(self, user_id: int, email: str) -> str | None:
+        reset_secret = generate_opaque_token_secret()
+        record = self.repository.create_password_reset_token(
+            user_id=user_id,
+            token_hash=hash_opaque_token(reset_secret),
+            expires_at=_now() + timedelta(seconds=PASSWORD_RESET_TTL_SECONDS),
+        )
+        token = build_scoped_token(record.id, reset_secret)
+        return send_auth_email(
+            email=email,
+            subject="Reset your ContentOS password",
+            action="reset_password",
+            action_url=build_password_reset_url(token),
+        )
