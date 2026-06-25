@@ -10,7 +10,9 @@ from app.core.config import env
 
 
 PBKDF2_ITERATIONS = 200_000
-TOKEN_TTL_SECONDS = 60 * 60 * 24 * 7
+ACCESS_TOKEN_TTL_SECONDS = int(env("ACCESS_TOKEN_TTL_SECONDS", "900") or "900")
+REFRESH_SESSION_TTL_SECONDS = int(env("REFRESH_SESSION_TTL_SECONDS", str(60 * 60 * 24 * 30)) or str(60 * 60 * 24 * 30))
+EMAIL_VERIFICATION_TTL_SECONDS = int(env("EMAIL_VERIFICATION_TTL_SECONDS", str(60 * 60 * 24)) or str(60 * 60 * 24))
 AUTH_SECRET = env("AUTH_SECRET", "dev-auth-secret-change-me") or "dev-auth-secret-change-me"
 
 
@@ -44,13 +46,15 @@ def verify_password(password: str, stored_hash: str) -> bool:
     return hmac.compare_digest(candidate_hash, f"{salt}${expected_hash}")
 
 
-def create_access_token(user_id: int, email: str) -> str:
+def create_access_token(user_id: int, email: str, session_id: int) -> str:
     header = {"alg": "HS256", "typ": "JWT"}
+    now = int(time.time())
     payload = {
         "sub": str(user_id),
+        "sid": str(session_id),
         "email": email,
-        "iat": int(time.time()),
-        "exp": int(time.time()) + TOKEN_TTL_SECONDS,
+        "iat": now,
+        "exp": now + ACCESS_TOKEN_TTL_SECONDS,
     }
 
     header_segment = _b64url_encode(
@@ -97,3 +101,29 @@ def decode_access_token(token: str) -> Optional[dict]:
         return None
 
     return payload
+
+
+def generate_opaque_token_secret() -> str:
+    return secrets.token_urlsafe(48)
+
+
+def hash_opaque_token(secret: str) -> str:
+    return hashlib.sha256(f"{AUTH_SECRET}:{secret}".encode("utf-8")).hexdigest()
+
+
+def build_scoped_token(record_id: int, secret: str) -> str:
+    return f"{record_id}.{secret}"
+
+
+def parse_scoped_token(token: str) -> Optional[tuple[int, str]]:
+    try:
+        record_id_raw, secret = token.split(".", 1)
+        record_id = int(record_id_raw)
+    except (ValueError, TypeError):
+        return None
+
+    secret = (secret or "").strip()
+    if record_id <= 0 or not secret:
+        return None
+
+    return record_id, secret

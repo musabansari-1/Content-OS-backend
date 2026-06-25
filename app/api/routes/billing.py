@@ -3,7 +3,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, Header, Request
 from pydantic import BaseModel, Field
 
-from app.auth.dependencies import require_current_user
+from app.auth.dependencies import require_current_user, require_verified_user
 from app.auth.domain import AuthUser
 from app.billing.service import (
     get_billing_summary,
@@ -109,7 +109,7 @@ def get_billing_plans() -> list[BillingPlanResponse]:
 @router.post("/billing/checkout", response_model=BillingCheckoutResponse)
 def create_billing_checkout(
     request: BillingCheckoutRequest,
-    current_user: AuthUser = Depends(require_current_user),
+    current_user: AuthUser = Depends(require_verified_user),
 ) -> BillingCheckoutResponse:
     settings = get_checkout_settings(
         user_id=current_user.id,
@@ -121,7 +121,7 @@ def create_billing_checkout(
 
 @router.post("/billing/cancel", response_model=BillingSummaryResponse)
 def cancel_billing_subscription(
-    current_user: AuthUser = Depends(require_current_user),
+    current_user: AuthUser = Depends(require_verified_user),
 ) -> BillingSummaryResponse:
     summary = schedule_subscription_cancellation(current_user.id)
     return BillingSummaryResponse(

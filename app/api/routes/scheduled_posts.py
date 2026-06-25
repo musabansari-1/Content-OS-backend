@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from app.auth.dependencies import require_current_user
+from app.auth.dependencies import require_verified_user
 from app.auth.domain import AuthUser
 from app.core.config import env
 from app.scheduling.domain import ScheduledPostRecord
@@ -51,7 +51,7 @@ class ScheduledPostResponse(BaseModel):
 @router.post("", response_model=ScheduledPostResponse)
 def schedule_post(
     request: ScheduledPostCreateRequest,
-    current_user: AuthUser = Depends(require_current_user),
+    current_user: AuthUser = Depends(require_verified_user),
 ):
     record = create_scheduled_post(
         user_id=current_user.id,
@@ -67,7 +67,7 @@ def schedule_post(
 def list_posts(
     status_filter: str | None = Query(None, alias="status"),
     limit: int = 100,
-    current_user: AuthUser = Depends(require_current_user),
+    current_user: AuthUser = Depends(require_verified_user),
 ):
     records = list_scheduled_posts(
         user_id=current_user.id,
@@ -80,7 +80,7 @@ def list_posts(
 @router.post("/{post_id}/cancel", response_model=ScheduledPostResponse)
 def cancel_post(
     post_id: int,
-    current_user: AuthUser = Depends(require_current_user),
+    current_user: AuthUser = Depends(require_verified_user),
 ):
     return _response_from_record(cancel_scheduled_post(user_id=current_user.id, post_id=post_id))
 

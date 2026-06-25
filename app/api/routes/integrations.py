@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 import httpx
 from pydantic import BaseModel, Field
 
-from app.auth.dependencies import require_current_user
+from app.auth.dependencies import require_current_user, require_verified_user
 from app.auth.domain import AuthUser
 from app.billing.service import ensure_can_direct_publish, record_direct_publish
 from app.services.ghost_service import (
@@ -79,12 +79,12 @@ class GhostPublishRequest(BaseModel):
 
 
 @router.get("/status")
-def get_status(current_user: AuthUser = Depends(require_current_user)):
+def get_status(current_user: AuthUser = Depends(require_verified_user)):
     return get_connected_platforms_for_user(user_id=current_user.id)
 
 
 @router.get("/auth/linkedin")
-def auth_linkedin(current_user: AuthUser = Depends(require_current_user)):
+def auth_linkedin(current_user: AuthUser = Depends(require_verified_user)):
     return {"auth_url": start_linkedin_auth(user_id=current_user.id)}
 
 
@@ -94,7 +94,7 @@ async def auth_linkedin_callback(code: str = None, state: str = None, error: str
 
 
 @router.get("/auth/x")
-def auth_x(current_user: AuthUser = Depends(require_current_user)):
+def auth_x(current_user: AuthUser = Depends(require_verified_user)):
     return {"auth_url": start_x_auth(user_id=current_user.id)}
 
 
@@ -104,7 +104,7 @@ async def auth_x_callback(code: str = None, state: str = None, error: str = None
 
 
 @router.get("/auth/instagram")
-def auth_instagram(current_user: AuthUser = Depends(require_current_user)):
+def auth_instagram(current_user: AuthUser = Depends(require_verified_user)):
     return {"auth_url": start_instagram_auth(user_id=current_user.id)}
 
 
@@ -126,7 +126,7 @@ async def auth_instagram_callback(
 
 
 @router.get("/auth/tiktok")
-def auth_tiktok(current_user: AuthUser = Depends(require_current_user)):
+def auth_tiktok(current_user: AuthUser = Depends(require_verified_user)):
     return {"auth_url": start_tiktok_auth(user_id=current_user.id)}
 
 
@@ -138,7 +138,7 @@ async def auth_tiktok_callback(code: str = None, state: str = None, error: str =
 @router.post("/ghost/connect")
 async def connect_ghost(
     request: GhostConnectRequest,
-    current_user: AuthUser = Depends(require_current_user),
+    current_user: AuthUser = Depends(require_verified_user),
 ):
     try:
         result = await connect_ghost_site_for_user(
@@ -161,7 +161,7 @@ async def connect_ghost(
 
 
 @router.get("/ghost/newsletters")
-async def get_ghost_newsletters(current_user: AuthUser = Depends(require_current_user)):
+async def get_ghost_newsletters(current_user: AuthUser = Depends(require_verified_user)):
     try:
         result = await list_ghost_newsletters_for_user(user_id=current_user.id)
     except httpx.HTTPStatusError as error:
@@ -183,7 +183,7 @@ async def get_ghost_newsletters(current_user: AuthUser = Depends(require_current
 @router.post("/linkedin/publish")
 async def publish_linkedin(
     request: LinkedInPublishRequest,
-    current_user: AuthUser = Depends(require_current_user),
+    current_user: AuthUser = Depends(require_verified_user),
 ):
     text = request.text.strip()
     if not text:
@@ -217,7 +217,7 @@ async def publish_linkedin(
 @router.post("/x/publish")
 async def publish_x(
     request: XPublishRequest,
-    current_user: AuthUser = Depends(require_current_user),
+    current_user: AuthUser = Depends(require_verified_user),
 ):
     ensure_can_direct_publish(current_user.id, 1)
 
@@ -250,7 +250,7 @@ async def publish_x(
 @router.post("/instagram/publish")
 async def publish_instagram(
     request: InstagramPublishRequest,
-    current_user: AuthUser = Depends(require_current_user),
+    current_user: AuthUser = Depends(require_verified_user),
 ):
     ensure_can_direct_publish(current_user.id, 1)
 
@@ -282,7 +282,7 @@ async def publish_instagram(
 @router.post("/ghost/publish")
 async def publish_ghost(
     request: GhostPublishRequest,
-    current_user: AuthUser = Depends(require_current_user),
+    current_user: AuthUser = Depends(require_verified_user),
 ):
     ensure_can_direct_publish(current_user.id, 1)
 
@@ -321,7 +321,7 @@ async def publish_ghost(
 
 
 @router.get("/tiktok/creator-info")
-async def get_tiktok_creator_info(current_user: AuthUser = Depends(require_current_user)):
+async def get_tiktok_creator_info(current_user: AuthUser = Depends(require_verified_user)):
     result = await get_tiktok_creator_info_for_user(user_id=current_user.id)
     if not result.get("ok"):
         error = result.get("error")
@@ -337,7 +337,7 @@ async def get_tiktok_creator_info(current_user: AuthUser = Depends(require_curre
 @router.post("/tiktok/publish")
 async def publish_tiktok(
     request: TikTokPublishRequest,
-    current_user: AuthUser = Depends(require_current_user),
+    current_user: AuthUser = Depends(require_verified_user),
 ):
     ensure_can_direct_publish(current_user.id, 1)
 
@@ -379,7 +379,7 @@ async def publish_tiktok(
 @router.post("/tiktok/status")
 async def get_tiktok_publish_status(
     request: TikTokStatusRequest,
-    current_user: AuthUser = Depends(require_current_user),
+    current_user: AuthUser = Depends(require_verified_user),
 ):
     publish_id = request.publish_id.strip()
     if not publish_id:

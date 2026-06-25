@@ -16,3 +16,12 @@ def require_current_user(
         raise HTTPException(status_code=401, detail="Authentication required.")
 
     return auth_service.get_current_user(credentials.credentials)
+
+
+def require_verified_user(current_user: AuthUser = Depends(require_current_user)) -> AuthUser:
+    if not current_user.email_verified_at:
+        raise HTTPException(
+            status_code=403,
+            detail="Verify your email before accessing this feature.",
+        )
+    return current_user
