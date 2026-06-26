@@ -60,6 +60,12 @@ Create a `.env` file:
 DATABASE_URL=postgresql://user:password@localhost/contentos
 GROQ_API_KEY=your_groq_api_key_here
 CORS_ALLOWED_ORIGINS=http://localhost:5173,http://localhost:3000
+AUTH_SECRET=replace_with_a_long_random_secret
+ACCESS_TOKEN_TTL_SECONDS=900
+REFRESH_SESSION_TTL_SECONDS=2592000
+EMAIL_VERIFICATION_TTL_SECONDS=86400
+PASSWORD_RESET_TTL_SECONDS=3600
+GOOGLE_CLIENT_ID=your_google_client_id.apps.googleusercontent.com
 ```
 
 ### Optional Services

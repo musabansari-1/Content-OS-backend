@@ -12,17 +12,17 @@ from app.api.routes.scheduled_posts import router as scheduled_posts_router
 from app.api.routes.system import router as system_router
 from app.api.routes.voice_profiles import router as voice_profiles_router
 from app.api.services import creator_voice_profile_service
+from app.core.config import get_allowed_origin_regex, get_allowed_origins
 from app.core.db import run_migrations
 
 
 app = FastAPI()
 app.mount("/generated-clips", StaticFiles(directory=str(GENERATED_CLIPS_DIR)), name="generated-clips")
 
-logging.getLogger(__name__).warning("CORS middleware is configured to allow all origins.")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_origin_regex=None,
+    allow_origins=get_allowed_origins(),
+    allow_origin_regex=get_allowed_origin_regex(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

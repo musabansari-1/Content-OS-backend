@@ -7,6 +7,7 @@ from app.auth.security import REFRESH_SESSION_TTL_SECONDS
 from app.auth.types import (
     AuthResponse,
     ForgotPasswordRequest,
+    GoogleAuthRequest,
     LoginRequest,
     MessageResponse,
     PasswordResetRequestResponse,
@@ -20,6 +21,7 @@ from app.services.auth_workflows import (
     confirm_password_reset,
     confirm_email_verification,
     get_current_user_profile,
+    login_with_google_user,
     login_user,
     request_password_reset,
     refresh_user,
@@ -79,6 +81,17 @@ def register(request: RegisterRequest, response: Response, raw_request: Request)
 @router.post("/auth/login", response_model=AuthResponse)
 def login(request: LoginRequest, response: Response, raw_request: Request):
     session = login_user(
+        request,
+        ip_address=_client_ip(raw_request),
+        user_agent=raw_request.headers.get("user-agent"),
+    )
+    _apply_refresh_cookie(response, session.refresh_token)
+    return to_auth_response(session)
+
+
+@router.post("/auth/google", response_model=AuthResponse)
+def login_with_google(request: GoogleAuthRequest, response: Response, raw_request: Request):
+    session = login_with_google_user(
         request,
         ip_address=_client_ip(raw_request),
         user_agent=raw_request.headers.get("user-agent"),

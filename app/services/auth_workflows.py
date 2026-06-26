@@ -3,6 +3,7 @@ from app.auth.dependencies import auth_service
 from app.auth.types import (
     AuthResponse,
     ForgotPasswordRequest,
+    GoogleAuthRequest,
     LoginRequest,
     PasswordResetRequestResponse,
     RegisterRequest,
@@ -53,6 +54,15 @@ def login_user(
     user_agent: str | None = None,
 ) -> AuthSession:
     return auth_service.login(request, ip_address=ip_address, user_agent=user_agent)
+
+
+def login_with_google_user(
+    request: GoogleAuthRequest,
+    *,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> AuthSession:
+    return auth_service.login_with_google(request, ip_address=ip_address, user_agent=user_agent)
 
 
 def refresh_user(

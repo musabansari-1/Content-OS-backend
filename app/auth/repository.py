@@ -1,6 +1,7 @@
 from typing import Optional
 
 from app.auth.domain import (
+    AuthIdentityRecord,
     AuthSessionRecord,
     AuthUser,
     AuthUserCredentials,
@@ -81,6 +82,101 @@ class UserRepository:
             created_at=row["created_at"],
             email_verified_at=row["email_verified_at"],
             is_active=bool(row["is_active"]),
+        )
+
+    def create_auth_identity(
+        self,
+        *,
+        user_id: int,
+        provider: str,
+        provider_user_id: str,
+        email: Optional[str],
+    ) -> AuthIdentityRecord:
+        connection = get_connection()
+
+        try:
+            row = connection.execute(
+                """
+                INSERT INTO auth_identities (
+                    user_id,
+                    provider,
+                    provider_user_id,
+                    email
+                )
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (provider, provider_user_id)
+                DO UPDATE SET
+                    user_id = EXCLUDED.user_id,
+                    email = EXCLUDED.email
+                RETURNING id, user_id, provider, provider_user_id, email, created_at
+                """,
+                (user_id, provider, provider_user_id, email),
+            ).fetchone()
+            connection.commit()
+        finally:
+            connection.close()
+
+        return AuthIdentityRecord(
+            id=int(row["id"]),
+            user_id=int(row["user_id"]),
+            provider=row["provider"],
+            provider_user_id=row["provider_user_id"],
+            email=row["email"],
+            created_at=row["created_at"],
+        )
+
+    def get_auth_identity(self, *, provider: str, provider_user_id: str) -> Optional[AuthIdentityRecord]:
+        connection = get_connection()
+
+        try:
+            row = connection.execute(
+                """
+                SELECT id, user_id, provider, provider_user_id, email, created_at
+                FROM auth_identities
+                WHERE provider = %s AND provider_user_id = %s
+                """,
+                (provider, provider_user_id),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        if not row:
+            return None
+
+        return AuthIdentityRecord(
+            id=int(row["id"]),
+            user_id=int(row["user_id"]),
+            provider=row["provider"],
+            provider_user_id=row["provider_user_id"],
+            email=row["email"],
+            created_at=row["created_at"],
+        )
+
+    def get_auth_identity_by_email(self, *, provider: str, email: str) -> Optional[AuthIdentityRecord]:
+        connection = get_connection()
+
+        try:
+            row = connection.execute(
+                """
+                SELECT id, user_id, provider, provider_user_id, email, created_at
+                FROM auth_identities
+                WHERE provider = %s AND email = %s
+                """,
+                (provider, email),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        if not row:
+            return None
+
+        return AuthIdentityRecord(
+            id=int(row["id"]),
+            user_id=int(row["user_id"]),
+            provider=row["provider"],
+            provider_user_id=row["provider_user_id"],
+            email=row["email"],
+            created_at=row["created_at"],
         )
 
     def create_auth_session(

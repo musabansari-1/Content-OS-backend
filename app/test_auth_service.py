@@ -6,7 +6,9 @@ from urllib.parse import parse_qs, urlparse
 from fastapi import HTTPException
 
 import app.auth.notifications as notifications_module
+import app.auth.service as service_module
 from app.auth.domain import (
+    AuthIdentityRecord,
     AuthSessionRecord,
     AuthUser,
     AuthUserCredentials,
@@ -15,7 +17,7 @@ from app.auth.domain import (
 )
 from app.auth.security import hash_password
 from app.auth.service import AuthService
-from app.auth.types import ForgotPasswordRequest, LoginRequest, RegisterRequest, ResetPasswordConfirmRequest
+from app.auth.types import ForgotPasswordRequest, GoogleAuthRequest, LoginRequest, RegisterRequest, ResetPasswordConfirmRequest
 
 
 class FakeRepository:
@@ -23,10 +25,12 @@ class FakeRepository:
         self._users: dict[int, AuthUser] = {}
         self._credentials_by_email: dict[str, AuthUserCredentials] = {}
         self._sessions: dict[int, AuthSessionRecord] = {}
+        self._identities: dict[tuple[str, str], AuthIdentityRecord] = {}
         self._verification_tokens: dict[int, EmailVerificationTokenRecord] = {}
         self._password_reset_tokens: dict[int, PasswordResetTokenRecord] = {}
         self._next_user_id = 1
         self._next_session_id = 1
+        self._next_identity_id = 1
         self._next_verification_token_id = 1
         self._next_password_reset_token_id = 1
 
@@ -58,6 +62,33 @@ class FakeRepository:
 
     def get_by_id(self, user_id: int):
         return self._users.get(user_id)
+
+    def create_auth_identity(self, *, user_id: int, provider: str, provider_user_id: str, email: str | None):
+        existing = self._identities.get((provider, provider_user_id))
+        if existing:
+            updated = replace(existing, user_id=user_id, email=email)
+            self._identities[(provider, provider_user_id)] = updated
+            return updated
+        record = AuthIdentityRecord(
+            id=self._next_identity_id,
+            user_id=user_id,
+            provider=provider,
+            provider_user_id=provider_user_id,
+            email=email,
+            created_at=datetime.now(timezone.utc),
+        )
+        self._identities[(provider, provider_user_id)] = record
+        self._next_identity_id += 1
+        return record
+
+    def get_auth_identity(self, *, provider: str, provider_user_id: str):
+        return self._identities.get((provider, provider_user_id))
+
+    def get_auth_identity_by_email(self, *, provider: str, email: str):
+        for record in self._identities.values():
+            if record.provider == provider and record.email == email:
+                return record
+        return None
 
     def create_auth_session(self, *, user_id: int, refresh_token_hash: str, expires_at, user_agent, ip_address):
         record = AuthSessionRecord(
@@ -169,10 +200,13 @@ class AuthServiceTests(unittest.TestCase):
         self._old_frontend = notifications_module.FRONTEND_BASE_URL
         notifications_module.AUTH_EMAIL_PREVIEW_ENABLED = True
         notifications_module.FRONTEND_BASE_URL = "http://localhost:3000"
+        self._old_google_client_id = service_module.GOOGLE_CLIENT_ID
+        service_module.GOOGLE_CLIENT_ID = "google-client-id.apps.googleusercontent.com"
 
     def tearDown(self) -> None:
         notifications_module.AUTH_EMAIL_PREVIEW_ENABLED = self._old_preview_flag
         notifications_module.FRONTEND_BASE_URL = self._old_frontend
+        service_module.GOOGLE_CLIENT_ID = self._old_google_client_id
 
     def test_register_creates_session_and_verification_preview(self) -> None:
         session = self.service.register(
@@ -249,6 +283,47 @@ class AuthServiceTests(unittest.TestCase):
             self.service.refresh(session.refresh_token)
         new_session = self.service.login(LoginRequest(email="user@example.com", password="newpassword123"))
         self.assertTrue(new_session.access_token)
+
+    def test_google_login_creates_user_and_marks_verified(self) -> None:
+        original_verify = service_module.google_id_token.verify_oauth2_token
+        original_request = service_module.GoogleRequest
+        try:
+            service_module.GoogleRequest = lambda: object()
+            service_module.google_id_token.verify_oauth2_token = lambda token, req, aud: {
+                "sub": "google-sub-123",
+                "email": "googleuser@example.com",
+                "email_verified": True,
+                "name": "Google User",
+            }
+
+            session = self.service.login_with_google(GoogleAuthRequest(id_token="fake-google-token"))
+        finally:
+            service_module.google_id_token.verify_oauth2_token = original_verify
+            service_module.GoogleRequest = original_request
+
+        self.assertEqual(session.user.email, "googleuser@example.com")
+        self.assertIsNotNone(session.user.email_verified_at)
+        self.assertIsNotNone(self.repository.get_auth_identity(provider="google", provider_user_id="google-sub-123"))
+
+    def test_google_login_links_existing_email_user(self) -> None:
+        existing_user = self.repository.create_user("user@example.com", hash_password("password123"), "User")
+        original_verify = service_module.google_id_token.verify_oauth2_token
+        original_request = service_module.GoogleRequest
+        try:
+            service_module.GoogleRequest = lambda: object()
+            service_module.google_id_token.verify_oauth2_token = lambda token, req, aud: {
+                "sub": "google-sub-456",
+                "email": "user@example.com",
+                "email_verified": True,
+                "name": "User",
+            }
+
+            session = self.service.login_with_google(GoogleAuthRequest(id_token="fake-google-token"))
+        finally:
+            service_module.google_id_token.verify_oauth2_token = original_verify
+            service_module.GoogleRequest = original_request
+
+        self.assertEqual(session.user.id, existing_user.id)
 
 
 if __name__ == "__main__":

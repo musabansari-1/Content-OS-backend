@@ -2,6 +2,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
+from google.auth.transport.requests import Request as GoogleRequest
+from google.oauth2 import id_token as google_id_token
 
 from app.auth.notifications import (
     build_email_verification_url,
@@ -23,10 +25,12 @@ from app.auth.security import (
     parse_scoped_token,
     verify_password,
 )
-from app.auth.types import ForgotPasswordRequest, LoginRequest, RegisterRequest, ResetPasswordConfirmRequest
+from app.auth.types import ForgotPasswordRequest, GoogleAuthRequest, LoginRequest, RegisterRequest, ResetPasswordConfirmRequest
+from app.core.config import env
 
 
 logger = logging.getLogger(__name__)
+GOOGLE_CLIENT_ID = (env("GOOGLE_CLIENT_ID", "") or "").strip()
 
 
 def _now() -> datetime:
@@ -112,6 +116,66 @@ class AuthService:
             ip_address=ip_address,
             user_agent=user_agent,
         )
+
+    def login_with_google(
+        self,
+        request: GoogleAuthRequest,
+        *,
+        ip_address: str | None = None,
+        user_agent: str | None = None,
+    ) -> AuthSession:
+        if not GOOGLE_CLIENT_ID:
+            raise HTTPException(status_code=503, detail="Google sign-in is not configured.")
+
+        try:
+            token_payload = google_id_token.verify_oauth2_token(
+                request.id_token,
+                GoogleRequest(),
+                GOOGLE_CLIENT_ID,
+            )
+        except ValueError:
+            raise HTTPException(status_code=401, detail="Invalid Google sign-in token.")
+        provider_user_id = str(token_payload.get("sub") or "").strip()
+        email = _normalize_email(str(token_payload.get("email") or ""))
+        email_verified = bool(token_payload.get("email_verified"))
+        display_name = str(token_payload.get("name") or token_payload.get("given_name") or email.split("@")[0] or "Creator").strip()
+
+        if not provider_user_id or not email:
+            raise HTTPException(status_code=400, detail="Google did not return a valid user profile.")
+
+        identity = self.repository.get_auth_identity(provider="google", provider_user_id=provider_user_id)
+        if identity:
+            user = self.repository.get_by_id(identity.user_id)
+            if not user:
+                raise HTTPException(status_code=401, detail="Google account is linked to a missing user.")
+            if not user.is_active:
+                raise HTTPException(status_code=403, detail="This account has been disabled.")
+            return self._start_session(user, ip_address=ip_address, user_agent=user_agent)
+
+        existing_user = self.repository.get_by_email(email)
+        if existing_user:
+            user = self.repository.get_by_id(existing_user.id)
+            if not user or not user.is_active:
+                raise HTTPException(status_code=403, detail="This account has been disabled.")
+        else:
+            placeholder_password = hash_password(generate_opaque_token_secret())
+            user = self.repository.create_user(
+                email,
+                placeholder_password,
+                display_name or "Creator",
+            )
+
+        self.repository.create_auth_identity(
+            user_id=user.id,
+            provider="google",
+            provider_user_id=provider_user_id,
+            email=email,
+        )
+
+        if email_verified and not user.email_verified_at:
+            user = self.repository.mark_user_email_verified(user.id)
+
+        return self._start_session(user, ip_address=ip_address, user_agent=user_agent)
 
     def refresh(
         self,

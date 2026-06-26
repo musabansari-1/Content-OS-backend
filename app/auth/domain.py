@@ -66,3 +66,13 @@ class PasswordResetTokenRecord:
     expires_at: datetime
     used_at: Optional[datetime]
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class AuthIdentityRecord:
+    id: int
+    user_id: int
+    provider: str
+    provider_user_id: str
+    email: Optional[str]
+    created_at: datetime

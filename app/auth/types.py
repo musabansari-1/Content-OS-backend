@@ -33,6 +33,10 @@ class ResetPasswordConfirmRequest(BaseModel):
     password: str
 
 
+class GoogleAuthRequest(BaseModel):
+    id_token: str
+
+
 class AuthResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
