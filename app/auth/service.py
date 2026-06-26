@@ -68,11 +68,19 @@ class AuthService:
         *,
         ip_address: str | None = None,
         user_agent: str | None = None,
-    ) -> AuthSession:
+    ) -> dict:
         email = _normalize_email(request.email)
         _validate_email(email)
         existing_user = self.repository.get_by_email(email)
         if existing_user:
+            if not existing_user.is_active:
+                raise HTTPException(status_code=403, detail="This account has been disabled.")
+            if existing_user.email_verified_at is None:
+                verification_preview_url = self._issue_email_verification(existing_user.id, existing_user.email)
+                return self._build_registration_response(
+                    message="This email is already registered but still unverified. We sent you a fresh verification link.",
+                    email_verification_preview_url=verification_preview_url,
+                )
             raise HTTPException(status_code=409, detail="Email is already registered.")
 
         password = _validate_new_password(request.password)
@@ -84,11 +92,8 @@ class AuthService:
             display_name or "Creator",
         )
         verification_preview_url = self._issue_email_verification(user.id, user.email)
-        return self._start_session(
-            user,
-            ip_address=ip_address,
-            user_agent=user_agent,
-            email_verification_sent=True,
+        return self._build_registration_response(
+            message="Check your email to verify your account. Once you confirm it, we will sign you in automatically.",
             email_verification_preview_url=verification_preview_url,
         )
 
@@ -109,6 +114,17 @@ class AuthService:
             raise HTTPException(status_code=401, detail="Invalid email or password.")
         if not existing_user.is_active:
             raise HTTPException(status_code=403, detail="This account has been disabled.")
+        if existing_user.email_verified_at is None:
+            verification_preview_url = self._issue_email_verification(existing_user.id, existing_user.email)
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "message": "Verify your email before logging in. We sent you a fresh verification link.",
+                    "email_verification_required": True,
+                    "email_verification_sent": True,
+                    "email_verification_preview_url": verification_preview_url,
+                },
+            )
 
         user = self.repository.get_by_id(existing_user.id)
         return self._start_session(
@@ -235,7 +251,13 @@ class AuthService:
             "email_verification_preview_url": preview_url,
         }
 
-    def verify_email(self, token: str) -> AuthUser:
+    def verify_email(
+        self,
+        token: str,
+        *,
+        ip_address: str | None = None,
+        user_agent: str | None = None,
+    ) -> AuthSession:
         parsed = parse_scoped_token(token)
         if not parsed:
             raise HTTPException(status_code=400, detail="Invalid verification token.")
@@ -249,7 +271,7 @@ class AuthService:
         user = self.repository.mark_user_email_verified(record.user_id)
         if not user:
             raise HTTPException(status_code=404, detail="User not found.")
-        return user
+        return self._start_session(user, ip_address=ip_address, user_agent=user_agent)
 
     def request_password_reset(self, request: ForgotPasswordRequest) -> dict:
         email = _normalize_email(request.email)
@@ -338,6 +360,19 @@ class AuthService:
             email_verification_sent=email_verification_sent,
             email_verification_preview_url=email_verification_preview_url,
         )
+
+    def _build_registration_response(
+        self,
+        *,
+        message: str,
+        email_verification_preview_url: str | None,
+    ) -> dict:
+        return {
+            "message": message,
+            "email_verification_required": True,
+            "email_verification_sent": True,
+            "email_verification_preview_url": email_verification_preview_url,
+        }
 
     def _get_refresh_session_and_user(self, refresh_token: str):
         parsed = parse_scoped_token(refresh_token)

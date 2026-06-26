@@ -6,6 +6,7 @@ from app.auth.types import (
     GoogleAuthRequest,
     LoginRequest,
     PasswordResetRequestResponse,
+    RegisterResponse,
     RegisterRequest,
     ResetPasswordConfirmRequest,
     UserResponse,
@@ -43,8 +44,8 @@ def register_user(
     *,
     ip_address: str | None = None,
     user_agent: str | None = None,
-) -> AuthSession:
-    return auth_service.register(request, ip_address=ip_address, user_agent=user_agent)
+) -> RegisterResponse:
+    return RegisterResponse(**auth_service.register(request, ip_address=ip_address, user_agent=user_agent))
 
 
 def login_user(
@@ -83,8 +84,13 @@ def request_email_verification(current_user: AuthUser) -> VerifyEmailRequestResp
     return VerifyEmailRequestResponse(**payload)
 
 
-def confirm_email_verification(token: str) -> UserResponse:
-    return _to_user_response(auth_service.verify_email(token))
+def confirm_email_verification(
+    token: str,
+    *,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> AuthSession:
+    return auth_service.verify_email(token, ip_address=ip_address, user_agent=user_agent)
 
 
 def request_password_reset(request: ForgotPasswordRequest) -> PasswordResetRequestResponse:

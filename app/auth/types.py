@@ -50,6 +50,13 @@ class VerifyEmailConfirmRequest(BaseModel):
     token: str
 
 
+class RegisterResponse(BaseModel):
+    message: str
+    email_verification_required: bool
+    email_verification_sent: bool
+    email_verification_preview_url: Optional[str] = None
+
+
 class VerifyEmailRequestResponse(BaseModel):
     email_verification_required: bool
     email_verification_sent: bool

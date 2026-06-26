@@ -208,19 +208,48 @@ class AuthServiceTests(unittest.TestCase):
         notifications_module.FRONTEND_BASE_URL = self._old_frontend
         service_module.GOOGLE_CLIENT_ID = self._old_google_client_id
 
-    def test_register_creates_session_and_verification_preview(self) -> None:
-        session = self.service.register(
+    def _register_and_extract_token(self, email: str = "user@example.com") -> tuple[dict, str]:
+        payload = self.service.register(
+            RegisterRequest(email=email, password="password123", display_name="User"),
+        )
+        parsed = urlparse(payload["email_verification_preview_url"] or "")
+        token = parse_qs(parsed.query)["token"][0]
+        return payload, token
+
+    def _verify_registered_user(self, email: str = "user@example.com"):
+        _, token = self._register_and_extract_token(email)
+        return self.service.verify_email(token)
+
+    def test_register_requires_verification_and_returns_preview(self) -> None:
+        payload = self.service.register(
             RegisterRequest(email="  User@Example.com ", password="password123", display_name="User"),
             ip_address="127.0.0.1",
             user_agent="unittest",
         )
 
-        self.assertEqual(session.user.email, "user@example.com")
-        self.assertTrue(session.access_token)
-        self.assertTrue(session.refresh_token)
-        self.assertTrue(session.email_verification_required)
-        self.assertTrue(session.email_verification_sent)
-        self.assertIn("verify-email?token=", session.email_verification_preview_url or "")
+        self.assertEqual(self.repository.get_by_email("user@example.com").email, "user@example.com")
+        self.assertEqual(
+            payload["message"],
+            "Check your email to verify your account. Once you confirm it, we will sign you in automatically.",
+        )
+        self.assertTrue(payload["email_verification_required"])
+        self.assertTrue(payload["email_verification_sent"])
+        self.assertIn("verify-email?token=", payload["email_verification_preview_url"] or "")
+
+    def test_register_existing_unverified_email_resends_verification(self) -> None:
+        first_payload = self.service.register(
+            RegisterRequest(email="user@example.com", password="password123", display_name="User"),
+        )
+
+        second_payload = self.service.register(
+            RegisterRequest(email="user@example.com", password="password123", display_name="User"),
+        )
+
+        self.assertNotEqual(
+            first_payload["email_verification_preview_url"],
+            second_payload["email_verification_preview_url"],
+        )
+        self.assertIn("fresh verification link", second_payload["message"])
 
     def test_login_rejects_invalid_password(self) -> None:
         self.repository.create_user("user@example.com", hash_password("password123"), "User")
@@ -230,8 +259,21 @@ class AuthServiceTests(unittest.TestCase):
 
         self.assertEqual(exc.exception.status_code, 401)
 
+    def test_login_rejects_unverified_user_and_resends_verification(self) -> None:
+        self.service.register(
+            RegisterRequest(email="user@example.com", password="password123", display_name="User"),
+        )
+
+        with self.assertRaises(HTTPException) as exc:
+            self.service.login(LoginRequest(email="user@example.com", password="password123"))
+
+        self.assertEqual(exc.exception.status_code, 403)
+        self.assertEqual(exc.exception.detail["email_verification_required"], True)
+        self.assertEqual(exc.exception.detail["email_verification_sent"], True)
+        self.assertIn("verify-email?token=", exc.exception.detail["email_verification_preview_url"] or "")
+
     def test_refresh_rotates_refresh_token_and_invalidates_old_one(self) -> None:
-        session = self.service.register(RegisterRequest(email="user@example.com", password="password123", display_name="User"))
+        session = self._verify_registered_user()
 
         refreshed = self.service.refresh(session.refresh_token, ip_address="127.0.0.1", user_agent="refreshed")
 
@@ -242,7 +284,7 @@ class AuthServiceTests(unittest.TestCase):
         self.assertEqual(exc.exception.status_code, 401)
 
     def test_logout_revokes_session_and_access_token(self) -> None:
-        session = self.service.register(RegisterRequest(email="user@example.com", password="password123", display_name="User"))
+        session = self._verify_registered_user()
 
         self.service.logout(session.refresh_token)
 
@@ -250,20 +292,21 @@ class AuthServiceTests(unittest.TestCase):
             self.service.get_current_user(session.access_token)
         self.assertEqual(exc.exception.status_code, 401)
 
-    def test_verify_email_marks_user_verified(self) -> None:
-        session = self.service.register(RegisterRequest(email="user@example.com", password="password123", display_name="User"))
-        parsed = urlparse(session.email_verification_preview_url or "")
-        token = parse_qs(parsed.query)["token"][0]
+    def test_verify_email_marks_user_verified_and_starts_session(self) -> None:
+        _, token = self._register_and_extract_token()
 
-        user = self.service.verify_email(token)
+        session = self.service.verify_email(token, ip_address="127.0.0.1", user_agent="verify")
 
+        user = session.user
         self.assertIsNotNone(user.email_verified_at)
+        self.assertTrue(session.access_token)
+        self.assertTrue(session.refresh_token)
         payload = self.service.request_email_verification(user.id)
         self.assertFalse(payload["email_verification_required"])
         self.assertFalse(payload["email_verification_sent"])
 
     def test_request_password_reset_issues_preview_link(self) -> None:
-        self.repository.create_user("user@example.com", hash_password("password123"), "User")
+        self._verify_registered_user()
 
         payload = self.service.request_password_reset(ForgotPasswordRequest(email="user@example.com"))
 
@@ -271,7 +314,7 @@ class AuthServiceTests(unittest.TestCase):
         self.assertIn("reset-password?token=", payload["password_reset_preview_url"] or "")
 
     def test_reset_password_updates_credentials_and_revokes_sessions(self) -> None:
-        session = self.service.register(RegisterRequest(email="user@example.com", password="password123", display_name="User"))
+        session = self._verify_registered_user()
         payload = self.service.request_password_reset(ForgotPasswordRequest(email="user@example.com"))
         parsed = urlparse(payload["password_reset_preview_url"] or "")
         token = parse_qs(parsed.query)["token"][0]

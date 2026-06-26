@@ -11,6 +11,7 @@ from app.auth.types import (
     LoginRequest,
     MessageResponse,
     PasswordResetRequestResponse,
+    RegisterResponse,
     RegisterRequest,
     ResetPasswordConfirmRequest,
     UserResponse,
@@ -67,15 +68,13 @@ def get_me(current_user: AuthUser = Depends(require_current_user)):
     return get_current_user_profile(current_user)
 
 
-@router.post("/auth/register", response_model=AuthResponse)
-def register(request: RegisterRequest, response: Response, raw_request: Request):
-    session = register_user(
+@router.post("/auth/register", response_model=RegisterResponse)
+def register(request: RegisterRequest, raw_request: Request):
+    return register_user(
         request,
         ip_address=_client_ip(raw_request),
         user_agent=raw_request.headers.get("user-agent"),
     )
-    _apply_refresh_cookie(response, session.refresh_token)
-    return to_auth_response(session)
 
 
 @router.post("/auth/login", response_model=AuthResponse)
@@ -134,9 +133,15 @@ def resend_email_verification(current_user: AuthUser = Depends(require_current_u
     return request_email_verification(current_user)
 
 
-@router.post("/auth/verify-email/confirm", response_model=UserResponse)
-def verify_email_confirm(request: VerifyEmailConfirmRequest):
-    return confirm_email_verification(request.token)
+@router.post("/auth/verify-email/confirm", response_model=AuthResponse)
+def verify_email_confirm(request: VerifyEmailConfirmRequest, response: Response, raw_request: Request):
+    session = confirm_email_verification(
+        request.token,
+        ip_address=_client_ip(raw_request),
+        user_agent=raw_request.headers.get("user-agent"),
+    )
+    _apply_refresh_cookie(response, session.refresh_token)
+    return to_auth_response(session)
 
 
 @router.post("/auth/password/forgot", response_model=PasswordResetRequestResponse)
