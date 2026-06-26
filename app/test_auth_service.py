@@ -198,7 +198,9 @@ class AuthServiceTests(unittest.TestCase):
         self.service = AuthService(repository=self.repository)
         self._old_preview_flag = notifications_module.AUTH_EMAIL_PREVIEW_ENABLED
         self._old_frontend = notifications_module.FRONTEND_BASE_URL
+        self._old_provider = notifications_module.AUTH_EMAIL_PROVIDER
         notifications_module.AUTH_EMAIL_PREVIEW_ENABLED = True
+        notifications_module.AUTH_EMAIL_PROVIDER = "resend"
         notifications_module.FRONTEND_BASE_URL = "http://localhost:3000"
         self._old_google_client_id = service_module.GOOGLE_CLIENT_ID
         service_module.GOOGLE_CLIENT_ID = "google-client-id.apps.googleusercontent.com"
@@ -206,6 +208,7 @@ class AuthServiceTests(unittest.TestCase):
     def tearDown(self) -> None:
         notifications_module.AUTH_EMAIL_PREVIEW_ENABLED = self._old_preview_flag
         notifications_module.FRONTEND_BASE_URL = self._old_frontend
+        notifications_module.AUTH_EMAIL_PROVIDER = self._old_provider
         service_module.GOOGLE_CLIENT_ID = self._old_google_client_id
 
     def _register_and_extract_token(self, email: str = "user@example.com") -> tuple[dict, str]:
