@@ -575,13 +575,23 @@ def _wrap_text_to_width(text: str, *, max_chars: int) -> list[str]:
     return lines or [normalized]
 
 
+_FONT_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "arial.ttf": ("arial.ttf", "Arial.ttf", "DejaVuSans.ttf"),
+    "arialbd.ttf": ("arialbd.ttf", "Arial Bold.ttf", "DejaVuSans-Bold.ttf"),
+    "georgiab.ttf": ("georgiab.ttf", "Georgia Bold.ttf", "DejaVuSerif-Bold.ttf", "DejaVuSans-Bold.ttf"),
+}
+
+
 def _load_font(name: str, size: int):
     from PIL import ImageFont
 
-    try:
-        return ImageFont.truetype(name, size)
-    except Exception:
-        return None
+    candidates = _FONT_CANDIDATES.get(name, (name, "DejaVuSans.ttf"))
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, size)
+        except Exception:
+            continue
+    return None
 
 
 def _font_bundle():
@@ -595,12 +605,10 @@ def _font_bundle():
 
     regular = (
         _load_font("arial.ttf", 40)
-        or _load_font("Arial.ttf", 40)
         or ImageFont.load_default()
     )
     bold = (
         _load_font("arialbd.ttf", 40)
-        or _load_font("Arial Bold.ttf", 40)
         or regular
     )
     return regular, bold
