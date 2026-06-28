@@ -262,7 +262,12 @@ async def publish_instagram(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=result["message"])
         if error == "instagram_connection_incomplete":
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result["message"])
-        if error in {"instagram_unsupported_asset", "instagram_reel_missing_video", "instagram_carousel_missing_slides"}:
+        if error in {
+            "instagram_unsupported_asset",
+            "instagram_reel_missing_video",
+            "instagram_carousel_missing_slides",
+            "instagram_invalid_asset",
+        }:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result["message"])
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,

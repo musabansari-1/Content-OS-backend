@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import secrets
 import textwrap
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import httpx
 from fastapi import HTTPException
@@ -14,7 +16,7 @@ from starlette.responses import RedirectResponse
 
 from app.core.config import env
 from app.integrations_repository import SocialIntegrationRecord, SocialIntegrationRepository
-from app.services.generation_service import GENERATED_CLIPS_DIR
+from app.services.generation_service import GENERATED_CLIPS_DIR, _upload_generated_clip
 
 
 def _first_env(*names: str) -> str:
@@ -46,9 +48,12 @@ INSTAGRAM_SCOPES = (
 _OAUTH_STATE_TTL_SECONDS = 600
 _TOKEN_REFRESH_MIN_AGE = timedelta(hours=24)
 _TOKEN_REFRESH_SKEW = timedelta(days=7)
+_INSTAGRAM_PUBLISH_RETRY_ATTEMPTS = 5
+_INSTAGRAM_PUBLISH_RETRY_DELAY_SECONDS = 3
 _instagram_oauth_state_lock = threading.Lock()
 _instagram_oauth_state_store: dict[str, dict[str, int]] = {}
 social_integration_repository = SocialIntegrationRepository()
+logger = logging.getLogger(__name__)
 
 
 def start_instagram_auth(*, user_id: int) -> str:
@@ -171,9 +176,16 @@ async def publish_instagram_asset_for_user(*, user_id: int, asset: dict) -> dict
             return await _publish_instagram_reel(access_token, connection.platform_user_id, asset)
         return await _publish_instagram_carousel(access_token, connection.platform_user_id, asset)
     except HTTPException as error:
+        error_key = (
+            "instagram_invalid_asset"
+            if error.status_code == 400
+            else "instagram_connection_incomplete"
+            if error.status_code == 409
+            else "instagram_publish_failed"
+        )
         return {
             "ok": False,
-            "error": "instagram_publish_failed",
+            "error": error_key,
             "message": error.detail if isinstance(error.detail, str) else "Instagram publish failed.",
         }
     except httpx.HTTPStatusError as error:
@@ -516,6 +528,79 @@ def _public_media_url(file_path: Path) -> str:
     return f"{PUBLIC_BASE_URL}/generated-clips/{relative_path}"
 
 
+def _is_loopback_host(hostname: str) -> bool:
+    normalized = hostname.strip().lower().strip("[]")
+    return normalized in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+
+
+def _validate_instagram_media_url(url: str, *, media_label: str) -> str:
+    candidate = str(url or "").strip()
+    if not candidate:
+        raise HTTPException(status_code=400, detail=f"This Instagram {media_label} is missing a media URL.")
+
+    parsed = urlparse(candidate)
+    if parsed.scheme.lower() != "https":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"This Instagram {media_label} must use a public HTTPS URL. "
+                "Local files and plain HTTP URLs cannot be fetched by Instagram."
+            ),
+        )
+
+    hostname = parsed.hostname or ""
+    if not hostname or _is_loopback_host(hostname) or hostname.endswith(".local"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"This Instagram {media_label} must use a publicly reachable host. "
+                "Localhost and private local domains will not work."
+            ),
+        )
+
+    return candidate
+
+
+def _build_instagram_slide_storage_key(file_path: Path) -> str:
+    date_prefix = datetime.now(timezone.utc).strftime("%Y/%m/%d")
+    return f"instagram/carousels/{date_prefix}/{file_path.name}"
+
+
+def _resolve_instagram_carousel_slide_url(file_path: Path) -> str:
+    try:
+        upload = _upload_generated_clip(
+            file_path,
+            _build_instagram_slide_storage_key(file_path),
+            "image/png",
+        )
+        return _validate_instagram_media_url(upload.url, media_label="carousel slide")
+    except Exception as error:
+        fallback_url = _public_media_url(file_path)
+        parsed_fallback = urlparse(fallback_url)
+        if parsed_fallback.scheme.lower() == "https" and parsed_fallback.hostname and not _is_loopback_host(parsed_fallback.hostname):
+            logger.warning(
+                "Instagram carousel slide upload failed; falling back to PUBLIC_BASE_URL media URL. file_path=%s error=%s",
+                file_path,
+                error,
+            )
+            return fallback_url
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Instagram carousel publishing needs public HTTPS image URLs for each rendered slide. "
+                "Configure working S3/Supabase uploads or set PUBLIC_BASE_URL to a public HTTPS backend host."
+            ),
+        ) from error
+
+
+def _is_retryable_instagram_publish_error(error: httpx.HTTPStatusError) -> bool:
+    response = error.response
+    if response.status_code not in {400, 409}:
+        return False
+    message = response.text.lower()
+    return any(snippet in message for snippet in ("not ready", "not finished", "please wait", "processing"))
+
+
 async def _fetch_instagram_account_profile(access_token: str) -> dict:
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.get(
@@ -597,6 +682,25 @@ async def _publish_instagram_container(
     return response.json() if response.content else {}
 
 
+async def _publish_instagram_container_with_retry(
+    *,
+    access_token: str,
+    instagram_user_id: str,
+    creation_id: str,
+) -> dict:
+    for attempt in range(1, _INSTAGRAM_PUBLISH_RETRY_ATTEMPTS + 1):
+        try:
+            return await _publish_instagram_container(
+                access_token=access_token,
+                instagram_user_id=instagram_user_id,
+                creation_id=creation_id,
+            )
+        except httpx.HTTPStatusError as error:
+            if attempt >= _INSTAGRAM_PUBLISH_RETRY_ATTEMPTS or not _is_retryable_instagram_publish_error(error):
+                raise
+            await asyncio.sleep(_INSTAGRAM_PUBLISH_RETRY_DELAY_SECONDS)
+
+
 async def _publish_instagram_reel(access_token: str, instagram_user_id: str, asset: dict) -> dict:
     media = asset.get("media") if isinstance(asset.get("media"), dict) else {}
     video_url = str(media.get("videoUrl") or media.get("video_url") or "").strip()
@@ -607,18 +711,19 @@ async def _publish_instagram_reel(access_token: str, instagram_user_id: str, ass
             "message": "This Instagram reel does not include a video URL to publish.",
         }
 
+    publishable_video_url = _validate_instagram_media_url(video_url, media_label="reel video")
     caption = _build_caption_from_asset(asset)
     creation_id = await _create_instagram_media_container(
         access_token=access_token,
         instagram_user_id=instagram_user_id,
         payload={
             "media_type": "REELS",
-            "video_url": video_url,
+            "video_url": publishable_video_url,
             "caption": caption,
             "share_to_feed": "true",
         },
     )
-    publish_result = await _publish_instagram_container(
+    publish_result = await _publish_instagram_container_with_retry(
         access_token=access_token,
         instagram_user_id=instagram_user_id,
         creation_id=creation_id,
@@ -653,7 +758,7 @@ async def _publish_instagram_carousel(access_token: str, instagram_user_id: str,
             access_token=access_token,
             instagram_user_id=instagram_user_id,
             payload={
-                "image_url": _public_media_url(file_path),
+                "image_url": _resolve_instagram_carousel_slide_url(file_path),
                 "is_carousel_item": "true",
             },
         )
@@ -668,7 +773,7 @@ async def _publish_instagram_carousel(access_token: str, instagram_user_id: str,
             "caption": caption,
         },
     )
-    publish_result = await _publish_instagram_container(
+    publish_result = await _publish_instagram_container_with_retry(
         access_token=access_token,
         instagram_user_id=instagram_user_id,
         creation_id=creation_id,

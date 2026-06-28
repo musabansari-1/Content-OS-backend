@@ -1,19 +1,21 @@
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import parse_qs, urlparse
 
 import httpx
+from fastapi import HTTPException
 
 from app.integrations_repository import SocialIntegrationRecord
 from app.services import instagram_service as service
 
 
 class FakeResponse:
-    def __init__(self, payload: dict, *, status_code: int = 200) -> None:
+    def __init__(self, payload: dict, *, status_code: int = 200, text: str = "") -> None:
         self._payload = payload
         self.status_code = status_code
-        self.text = ""
+        self.text = text
         self.content = b"{}"
         self.request = httpx.Request("GET", "https://example.com")
 
@@ -182,6 +184,119 @@ class InstagramServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(token, "refreshed-token")
         mock_refresh.assert_awaited_once_with(connection)
+
+    async def test_publish_instagram_reel_rejects_localhost_video_url(self) -> None:
+        asset = {
+            "assetType": "instagram_reel",
+            "media": {
+                "videoUrl": "http://localhost:8000/generated-clips/run-1/reel.mp4",
+            },
+        }
+
+        with self.assertRaises(HTTPException) as error_context:
+            await service._publish_instagram_reel("token-123", "90010177253934", asset)
+
+        self.assertEqual(error_context.exception.status_code, 400)
+        self.assertIn("public HTTPS URL", str(error_context.exception.detail))
+
+    def test_resolve_instagram_carousel_slide_url_falls_back_to_public_base_url(self) -> None:
+        file_path = Path("D:/generated/instagram/slide-1.png")
+
+        with (
+            patch.object(service, "GENERATED_CLIPS_DIR", Path("D:/generated")),
+            patch.object(service, "PUBLIC_BASE_URL", "https://api.contentburst.app"),
+            patch.object(service, "_upload_generated_clip", side_effect=RuntimeError("upload unavailable")),
+        ):
+            resolved_url = service._resolve_instagram_carousel_slide_url(file_path)
+
+        self.assertEqual(resolved_url, "https://api.contentburst.app/generated-clips/instagram/slide-1.png")
+
+    def test_resolve_instagram_carousel_slide_url_requires_public_https_media(self) -> None:
+        file_path = Path("D:/generated/instagram/slide-1.png")
+
+        with (
+            patch.object(service, "GENERATED_CLIPS_DIR", Path("D:/generated")),
+            patch.object(service, "PUBLIC_BASE_URL", "http://localhost:8000"),
+            patch.object(service, "_upload_generated_clip", side_effect=RuntimeError("upload unavailable")),
+        ):
+            with self.assertRaises(HTTPException) as error_context:
+                service._resolve_instagram_carousel_slide_url(file_path)
+
+        self.assertEqual(error_context.exception.status_code, 400)
+        self.assertIn("public HTTPS image URLs", str(error_context.exception.detail))
+
+    async def test_publish_instagram_container_with_retry_retries_not_ready_response(self) -> None:
+        not_ready_response = FakeResponse(
+            {},
+            status_code=400,
+            text="The media is not ready to be published. Please wait.",
+        )
+        not_ready_response.request = httpx.Request("POST", "https://graph.instagram.com/v25.0/123/media_publish")
+        not_ready_error = httpx.HTTPStatusError(
+            "HTTP 400",
+            request=not_ready_response.request,
+            response=not_ready_response,
+        )
+
+        with (
+            patch.object(
+                service,
+                "_publish_instagram_container",
+                AsyncMock(side_effect=[not_ready_error, {"id": "published-123"}]),
+            ) as mock_publish,
+            patch("app.services.instagram_service.asyncio.sleep", AsyncMock()) as mock_sleep,
+        ):
+            result = await service._publish_instagram_container_with_retry(
+                access_token="token-123",
+                instagram_user_id="90010177253934",
+                creation_id="creation-123",
+            )
+
+        self.assertEqual(result, {"id": "published-123"})
+        self.assertEqual(mock_publish.await_count, 2)
+        mock_sleep.assert_awaited_once()
+
+    async def test_publish_instagram_carousel_uses_resolved_slide_urls(self) -> None:
+        asset = {
+            "assetType": "instagram_carousel",
+            "title": "My carousel",
+            "blocks": [{"key": "slides", "value": ["Slide 1", "Slide 2"]}],
+        }
+
+        render_paths = [
+            Path("D:/generated/instagram/slide-1.png"),
+            Path("D:/generated/instagram/slide-2.png"),
+        ]
+
+        with (
+            patch.object(service, "_render_carousel_slide", side_effect=render_paths),
+            patch.object(
+                service,
+                "_resolve_instagram_carousel_slide_url",
+                side_effect=[
+                    "https://cdn.example.com/slide-1.png",
+                    "https://cdn.example.com/slide-2.png",
+                ],
+            ),
+            patch.object(
+                service,
+                "_create_instagram_media_container",
+                AsyncMock(side_effect=["child-1", "child-2", "carousel-1"]),
+            ) as mock_create,
+            patch.object(
+                service,
+                "_publish_instagram_container_with_retry",
+                AsyncMock(return_value={"id": "post-123"}),
+            ),
+        ):
+            result = await service._publish_instagram_carousel("token-123", "90010177253934", asset)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["instagram_post_id"], "post-123")
+        create_calls = mock_create.await_args_list
+        self.assertEqual(create_calls[0].kwargs["payload"]["image_url"], "https://cdn.example.com/slide-1.png")
+        self.assertEqual(create_calls[1].kwargs["payload"]["image_url"], "https://cdn.example.com/slide-2.png")
+        self.assertEqual(create_calls[2].kwargs["payload"]["children"], "child-1,child-2")
 
 
 if __name__ == "__main__":
