@@ -298,6 +298,23 @@ class InstagramServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(create_calls[1].kwargs["payload"]["image_url"], "https://cdn.example.com/slide-2.png")
         self.assertEqual(create_calls[2].kwargs["payload"]["children"], "child-1,child-2")
 
+    def test_normalize_carousel_slide_preserves_structured_template_fields(self) -> None:
+        normalized = service._normalize_carousel_slide(
+            {
+                "type": "quote",
+                "quote": "Tiny preview cards beat giant text posters.",
+                "body": "Make the published asset match the preview layout.",
+                "eyebrow": "Insight",
+            },
+            index=1,
+            total=5,
+        )
+
+        self.assertEqual(normalized["type"], "quote")
+        self.assertEqual(normalized["quote"], "Tiny preview cards beat giant text posters.")
+        self.assertEqual(normalized["body"], "Make the published asset match the preview layout.")
+        self.assertEqual(normalized["eyebrow"], "Insight")
+
 
 if __name__ == "__main__":
     unittest.main()

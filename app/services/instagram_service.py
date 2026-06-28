@@ -399,6 +399,30 @@ def _normalize_text(value: object) -> str:
     return str(value).strip()
 
 
+def _is_structured_slide_candidate(value: object) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict):
+        return any(
+            _normalize_text(value.get(key))
+            for key in (
+                "title",
+                "hook",
+                "heading",
+                "headline",
+                "body",
+                "content",
+                "text",
+                "description",
+                "caption",
+                "quote",
+                "cta",
+                "call_to_action",
+            )
+        )
+    return False
+
+
 def _build_caption_from_asset(asset: dict) -> str:
     title = _asset_title(asset)
     blocks = _asset_blocks(asset)
@@ -420,23 +444,23 @@ def _build_caption_from_asset(asset: dict) -> str:
     return caption[:2200] if len(caption) > 2200 else caption
 
 
-def _extract_carousel_slides(asset: dict) -> list[str]:
+def _extract_carousel_slide_payloads(asset: dict) -> list[object]:
     blocks = _asset_blocks(asset)
-    slide_candidates: list[str] = []
+    slide_candidates: list[object] = []
 
     for block in blocks:
         key = str(block.get("key") or "").lower()
         value = block.get("value")
         if isinstance(value, list) and (key.startswith("slide") or "carousel" in key or key == "slides"):
-            slide_candidates = [_normalize_text(item) for item in value]
+            slide_candidates = [item for item in value if _is_structured_slide_candidate(item)]
             break
 
     if not slide_candidates:
         for block in blocks:
             value = block.get("value")
             if isinstance(value, list) and len(value) >= 2:
-                normalized_items = [_normalize_text(item) for item in value]
-                if sum(1 for item in normalized_items if item) >= 2:
+                normalized_items = [item for item in value if _is_structured_slide_candidate(item)]
+                if len(normalized_items) >= 2:
                     slide_candidates = normalized_items
                     break
 
@@ -447,7 +471,100 @@ def _extract_carousel_slides(asset: dict) -> list[str]:
             if _normalize_text(block.get("value"))
         ]
 
-    return [slide for slide in slide_candidates if slide][:10]
+    return [slide for slide in slide_candidates if _is_structured_slide_candidate(slide)][:10]
+
+
+def _split_slide_text(value: object) -> dict[str, object]:
+    text = _normalize_text(value)
+    if not text:
+        return {"title": "", "body": "", "items": []}
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    bullet_lines = [line.replace("- ", "", 1).replace("* ", "", 1).strip() for line in lines]
+    bullet_lines = [line for line in bullet_lines if line]
+
+    if len(bullet_lines) >= 3:
+        return {
+            "title": bullet_lines[0],
+            "body": "",
+            "items": bullet_lines[1:5],
+        }
+
+    if len(lines) >= 2:
+        return {
+            "title": lines[0],
+            "body": " ".join(lines[1:]),
+            "items": [],
+        }
+
+    if len(text) > 110:
+        sentence_break = -1
+        for marker in (". ", "! ", "? "):
+            candidate = text.find(marker)
+            if candidate > sentence_break:
+                sentence_break = candidate + 1
+        if sentence_break > 30:
+            return {
+                "title": text[: sentence_break + 1].strip(),
+                "body": text[sentence_break + 1 :].strip(),
+                "items": [],
+            }
+        chunk = text[:72]
+        split_at = chunk.rfind(" ")
+        if split_at <= 24:
+            split_at = 72
+        return {
+            "title": text[:split_at].strip(),
+            "body": text[split_at:].strip(),
+            "items": [],
+        }
+
+    return {"title": text, "body": "", "items": []}
+
+
+def _normalize_carousel_slide(raw: object, *, index: int, total: int) -> dict[str, object]:
+    if isinstance(raw, str):
+        parsed = _split_slide_text(raw)
+        return {
+            "type": "hook" if index == 0 else "cta" if index == total - 1 else "content",
+            "title": parsed["title"],
+            "body": parsed["body"],
+            "items": parsed["items"],
+            "quote": parsed["title"],
+            "cta": parsed["body"] or parsed["title"],
+            "eyebrow": "",
+        }
+
+    if isinstance(raw, dict):
+        normalized = {
+            "type": raw.get("type") or ("hook" if index == 0 else "cta" if index == total - 1 else "content"),
+            "title": _normalize_text(raw.get("title") or raw.get("hook") or raw.get("heading") or raw.get("headline")),
+            "body": _normalize_text(
+                raw.get("body") or raw.get("content") or raw.get("text") or raw.get("description") or raw.get("caption")
+            ),
+            "items": (
+                raw.get("items")
+                if isinstance(raw.get("items"), list)
+                else raw.get("points")
+                if isinstance(raw.get("points"), list)
+                else raw.get("tips")
+                if isinstance(raw.get("tips"), list)
+                else []
+            ),
+            "quote": _normalize_text(raw.get("quote") or raw.get("insight") or raw.get("title")),
+            "cta": _normalize_text(raw.get("cta") or raw.get("call_to_action") or raw.get("action") or raw.get("title")),
+            "eyebrow": _normalize_text(
+                raw.get("eyebrow") or raw.get("label") or raw.get("meta") or raw.get("kicker") or raw.get("category")
+            ),
+        }
+        if not normalized["body"] and not normalized["items"] and len(str(normalized["title"])) > 110:
+            parsed = _split_slide_text(normalized["title"])
+            normalized["title"] = parsed["title"]
+            normalized["body"] = parsed["body"]
+            normalized["items"] = parsed["items"]
+        return normalized
+
+    return _normalize_carousel_slide(_normalize_text(raw), index=index, total=total)
 
 
 def _wrap_text_to_width(text: str, *, max_chars: int) -> list[str]:
@@ -458,9 +575,352 @@ def _wrap_text_to_width(text: str, *, max_chars: int) -> list[str]:
     return lines or [normalized]
 
 
-def _render_carousel_slide(slide_text: str, *, index: int, total: int, title: str) -> Path:
+def _load_font(name: str, size: int):
+    from PIL import ImageFont
+
     try:
-        from PIL import Image, ImageDraw, ImageFont
+        return ImageFont.truetype(name, size)
+    except Exception:
+        return None
+
+
+def _font_bundle():
+    try:
+        from PIL import ImageFont
+    except ImportError as exc:  # pragma: no cover - dependency guard
+        raise HTTPException(
+            status_code=500,
+            detail="Pillow is required to render Instagram carousel slides.",
+        ) from exc
+
+    regular = (
+        _load_font("arial.ttf", 40)
+        or _load_font("Arial.ttf", 40)
+        or ImageFont.load_default()
+    )
+    bold = (
+        _load_font("arialbd.ttf", 40)
+        or _load_font("Arial Bold.ttf", 40)
+        or regular
+    )
+    return regular, bold
+
+
+def _fit_text(draw, text: str, *, font_name: str, max_size: int, min_size: int, max_width: int, max_height: int):
+    from PIL import ImageFont
+
+    words = text.split()
+    if not words:
+        return ImageFont.load_default(), []
+
+    def wrap_for_font(font):
+        lines: list[str] = []
+        current = ""
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            bbox = draw.textbbox((0, 0), candidate, font=font)
+            if current and bbox[2] - bbox[0] > max_width:
+                lines.append(current)
+                current = word
+            else:
+                current = candidate
+        if current:
+            lines.append(current)
+        return lines
+
+    for size in range(max_size, min_size - 1, -2):
+        font = _load_font(font_name, size)
+        if font is None:
+            continue
+        lines = wrap_for_font(font)
+        line_box = draw.textbbox((0, 0), "Ag", font=font)
+        line_height = line_box[3] - line_box[1] + max(8, size // 5)
+        total_height = line_height * len(lines)
+        if total_height <= max_height:
+            return font, lines
+
+    fallback = _load_font(font_name, min_size) or ImageFont.load_default()
+    return fallback, wrap_for_font(fallback)
+
+
+def _draw_footer(draw, *, width: int, height: int, footer_left: str, index: int, total: int, font, color):
+    slide_num = f"{index + 1:02d}"
+    draw.text((84, height - 96), footer_left, fill=color, font=font)
+    num_box = draw.textbbox((0, 0), slide_num, font=font)
+    draw.text((width - 84 - (num_box[2] - num_box[0]), height - 96), slide_num, fill=color, font=font)
+
+
+def _render_hook_or_cta_slide(draw, *, width: int, height: int, slide: dict[str, object], index: int, footer: str, is_cta: bool):
+    regular_font, bold_font = _font_bundle()
+    bg = (245, 244, 240) if not is_cta else (255, 246, 236)
+    draw.rectangle((0, 0, width, height), fill=bg)
+    draw.text((84, 84), str(slide.get("eyebrow") or ("Final slide" if is_cta else "Carousel")).upper(), fill=(55, 65, 81), font=_load_font("arialbd.ttf", 20) or bold_font)
+    draw.rounded_rectangle((84, 138, 164, 146), radius=4, fill=(249, 115, 22))
+
+    title_font, title_lines = _fit_text(
+        draw,
+        str(slide.get("title") or "Hook goes here"),
+        font_name="arialbd.ttf",
+        max_size=88,
+        min_size=42,
+        max_width=width - 168,
+        max_height=430,
+    )
+    y = 192
+    title_line_height = draw.textbbox((0, 0), "Ag", font=title_font)[3] + max(10, getattr(title_font, "size", 42) // 5)
+    for line in title_lines[:5]:
+        draw.text((84, y), line, fill=(15, 23, 42), font=title_font)
+        y += title_line_height
+
+    body = str(slide.get("body") or "").strip()
+    if body:
+        body_font, body_lines = _fit_text(
+            draw,
+            body,
+            font_name="arial.ttf",
+            max_size=38,
+            min_size=22,
+            max_width=width - 168,
+            max_height=220 if not is_cta else 180,
+        )
+        y += 18
+        body_line_height = draw.textbbox((0, 0), "Ag", font=body_font)[3] + 10
+        for line in body_lines[:6]:
+            draw.text((84, y), line, fill=(75, 85, 99), font=body_font)
+            y += body_line_height
+
+    if is_cta:
+        cta_text = str(slide.get("cta") or slide.get("title") or "Follow for more")
+        box_top = height - 300
+        draw.rounded_rectangle((84, box_top, width - 84, height - 104), radius=34, fill=(255, 237, 213))
+        cta_font, cta_lines = _fit_text(
+            draw,
+            cta_text,
+            font_name="arialbd.ttf",
+            max_size=42,
+            min_size=24,
+            max_width=width - 220,
+            max_height=120,
+        )
+        cy = box_top + 34
+        cta_line_height = draw.textbbox((0, 0), "Ag", font=cta_font)[3] + 10
+        for line in cta_lines[:3]:
+            draw.text((118, cy), line, fill=(124, 45, 18), font=cta_font)
+            cy += cta_line_height
+        pill_font = _load_font("arialbd.ttf", 24) or bold_font
+        pill_text = "Save this post"
+        pill_box = draw.textbbox((0, 0), pill_text, font=pill_font)
+        pill_width = (pill_box[2] - pill_box[0]) + 44
+        pill_height = (pill_box[3] - pill_box[1]) + 24
+        pill_left = 118
+        pill_top = height - 170
+        draw.rounded_rectangle((pill_left, pill_top, pill_left + pill_width, pill_top + pill_height), radius=999, fill=(249, 115, 22))
+        draw.text((pill_left + 22, pill_top + 12), pill_text, fill=(255, 255, 255), font=pill_font)
+    else:
+        _draw_footer(draw, width=width, height=height, footer_left=footer, index=index, total=0, font=_load_font("arialbd.ttf", 22) or bold_font, color=(55, 65, 81))
+
+    if is_cta:
+        _draw_footer(draw, width=width, height=height, footer_left="Save this", index=index, total=0, font=_load_font("arialbd.ttf", 22) or bold_font, color=(124, 45, 18))
+
+
+def _render_content_slide(draw, *, width: int, height: int, slide: dict[str, object], index: int):
+    regular_font, bold_font = _font_bundle()
+    draw.rectangle((0, 0, width, height), fill=(15, 23, 42))
+    meta_font = _load_font("arialbd.ttf", 20) or bold_font
+    draw.text((84, 84), str(slide.get("eyebrow") or f"Slide {index + 1}").upper(), fill=(148, 163, 184), font=meta_font)
+
+    title = str(slide.get("title") or "").strip()
+    y = 136
+    if title:
+        title_font, title_lines = _fit_text(
+            draw,
+            title,
+            font_name="arialbd.ttf",
+            max_size=58,
+            min_size=28,
+            max_width=width - 168,
+            max_height=180,
+        )
+        line_height = draw.textbbox((0, 0), "Ag", font=title_font)[3] + 10
+        for line in title_lines[:4]:
+            draw.text((84, y), line, fill=(248, 250, 252), font=title_font)
+            y += line_height
+        y += 20
+
+    items = slide.get("items") if isinstance(slide.get("items"), list) else []
+    if items:
+        row_top = y
+        for item_index, item in enumerate(items[:4]):
+            draw.line((84, row_top, width - 84, row_top), fill=(51, 65, 85), width=2)
+            row_y = row_top + 18
+            draw.ellipse((84, row_y, 132, row_y + 48), fill=(61, 33, 19), outline=(251, 146, 60))
+            num_font = _load_font("arialbd.ttf", 22) or bold_font
+            draw.text((102, row_y + 11), str(item_index + 1), fill=(251, 146, 60), font=num_font)
+
+            if isinstance(item, dict):
+                item_title = _normalize_text(item.get("title") or item.get("text") or item.get("point") or item.get("value"))
+                item_body = _normalize_text(item.get("body") or item.get("description"))
+            else:
+                item_title = _normalize_text(item)
+                item_body = ""
+
+            item_title_font, item_title_lines = _fit_text(
+                draw,
+                item_title,
+                font_name="arialbd.ttf",
+                max_size=28,
+                min_size=20,
+                max_width=width - 240,
+                max_height=70,
+            )
+            text_x = 156
+            ty = row_y
+            title_line_height = draw.textbbox((0, 0), "Ag", font=item_title_font)[3] + 6
+            for line in item_title_lines[:2]:
+                draw.text((text_x, ty), line, fill=(248, 250, 252), font=item_title_font)
+                ty += title_line_height
+            if item_body:
+                item_body_font, item_body_lines = _fit_text(
+                    draw,
+                    item_body,
+                    font_name="arial.ttf",
+                    max_size=20,
+                    min_size=16,
+                    max_width=width - 240,
+                    max_height=42,
+                )
+                for line in item_body_lines[:2]:
+                    draw.text((text_x, ty), line, fill=(148, 163, 184), font=item_body_font)
+                    ty += draw.textbbox((0, 0), "Ag", font=item_body_font)[3] + 4
+            row_top += 170
+    else:
+        body = str(slide.get("body") or "").strip()
+        body_font, body_lines = _fit_text(
+            draw,
+            body,
+            font_name="arial.ttf",
+            max_size=34,
+            min_size=20,
+            max_width=width - 168,
+            max_height=height - y - 140,
+        )
+        body_line_height = draw.textbbox((0, 0), "Ag", font=body_font)[3] + 10
+        for line in body_lines[:12]:
+            draw.text((84, y), line, fill=(148, 163, 184), font=body_font)
+            y += body_line_height
+
+    _draw_footer(draw, width=width, height=height, footer_left=str(slide.get("eyebrow") or "Key insight"), index=index, total=0, font=_load_font("arialbd.ttf", 22) or bold_font, color=(241, 245, 249))
+
+
+def _render_quote_slide(draw, *, width: int, height: int, slide: dict[str, object], index: int):
+    regular_font, bold_font = _font_bundle()
+    draw.rectangle((0, 0, width, height), fill=(17, 24, 39))
+    meta_font = _load_font("arialbd.ttf", 20) or bold_font
+    draw.text((84, 84), str(slide.get("eyebrow") or "Insight").upper(), fill=(156, 163, 175), font=meta_font)
+    quote_mark_font = _load_font("georgiab.ttf", 180) or _load_font("arialbd.ttf", 180) or bold_font
+    draw.text((72, 130), '"', fill=(249, 115, 22), font=quote_mark_font)
+
+    quote_text = str(slide.get("quote") or slide.get("title") or "Key insight goes here.")
+    quote_font, quote_lines = _fit_text(
+        draw,
+        quote_text,
+        font_name="arialbd.ttf",
+        max_size=60,
+        min_size=28,
+        max_width=width - 168,
+        max_height=420,
+    )
+    y = 270
+    line_height = draw.textbbox((0, 0), "Ag", font=quote_font)[3] + 12
+    for line in quote_lines[:7]:
+        draw.text((84, y), line, fill=(248, 250, 252), font=quote_font)
+        y += line_height
+
+    body = str(slide.get("body") or "").strip()
+    if body:
+        body_font, body_lines = _fit_text(
+            draw,
+            body,
+            font_name="arial.ttf",
+            max_size=24,
+            min_size=18,
+            max_width=width - 168,
+            max_height=140,
+        )
+        y += 18
+        for line in body_lines[:4]:
+            draw.text((84, y), line, fill=(209, 213, 219), font=body_font)
+            y += draw.textbbox((0, 0), "Ag", font=body_font)[3] + 6
+
+    _draw_footer(draw, width=width, height=height, footer_left="Save this", index=index, total=0, font=meta_font, color=(156, 163, 175))
+
+
+def _render_breakdown_slide(draw, *, width: int, height: int, slide: dict[str, object], index: int):
+    regular_font, bold_font = _font_bundle()
+    draw.rectangle((0, 0, width, height), fill=(241, 245, 249))
+    meta_font = _load_font("arialbd.ttf", 20) or bold_font
+    draw.text((84, 84), str(slide.get("eyebrow") or "Breakdown").upper(), fill=(71, 85, 105), font=meta_font)
+    title = str(slide.get("title") or "").strip()
+    y = 126
+    if title:
+        title_font, title_lines = _fit_text(
+            draw,
+            title,
+            font_name="arialbd.ttf",
+            max_size=44,
+            min_size=26,
+            max_width=width - 168,
+            max_height=130,
+        )
+        for line in title_lines[:3]:
+            draw.text((84, y), line, fill=(15, 23, 42), font=title_font)
+            y += draw.textbbox((0, 0), "Ag", font=title_font)[3] + 8
+        y += 16
+
+    cells = slide.get("items") if isinstance(slide.get("items"), list) and slide.get("items") else []
+    if not cells and slide.get("body"):
+        cells = [{"label": "Key point", "value": slide.get("body")}]
+
+    grid_top = y
+    card_w = (width - 84 * 2 - 20) // 2
+    card_h = 210
+    for cell_index, cell in enumerate(cells[:4]):
+        row = cell_index // 2
+        col = cell_index % 2
+        left = 84 + col * (card_w + 20)
+        top = grid_top + row * (card_h + 20)
+        right = left + card_w
+        bottom = top + card_h
+        draw.rounded_rectangle((left, top, right, bottom), radius=28, fill=(255, 255, 255), outline=(226, 232, 240))
+
+        if isinstance(cell, dict):
+            label = _normalize_text(cell.get("label") or cell.get("kicker")) or f"Point {cell_index + 1}"
+            value = _normalize_text(cell.get("value") or cell.get("title") or cell.get("text"))
+        else:
+            label = f"Point {cell_index + 1}"
+            value = _normalize_text(cell)
+
+        draw.text((left + 24, top + 24), label.upper(), fill=(249, 115, 22), font=meta_font)
+        value_font, value_lines = _fit_text(
+            draw,
+            value,
+            font_name="arialbd.ttf",
+            max_size=28,
+            min_size=18,
+            max_width=card_w - 48,
+            max_height=120,
+        )
+        vy = top + 66
+        for line in value_lines[:5]:
+            draw.text((left + 24, vy), line, fill=(15, 23, 42), font=value_font)
+            vy += draw.textbbox((0, 0), "Ag", font=value_font)[3] + 6
+
+    _draw_footer(draw, width=width, height=height, footer_left="Framework", index=index, total=0, font=meta_font, color=(71, 85, 105))
+
+
+def _render_carousel_slide(slide_payload: object, *, index: int, total: int, title: str) -> Path:
+    try:
+        from PIL import Image, ImageDraw
     except ImportError as exc:  # pragma: no cover - dependency guard
         raise HTTPException(
             status_code=500,
@@ -469,50 +929,21 @@ def _render_carousel_slide(slide_text: str, *, index: int, total: int, title: st
 
     canvas_width = 1080
     canvas_height = 1350
-    bg_color = (18, 18, 22)
-    panel_color = (28, 28, 36)
-    accent_color = (242, 116, 86)
-    text_color = (248, 248, 250)
-    muted_color = (176, 176, 190)
-
-    image = Image.new("RGB", (canvas_width, canvas_height), bg_color)
+    slide = _normalize_carousel_slide(slide_payload, index=index, total=total)
+    slide_type = str(slide.get("type") or "content").lower()
+    image = Image.new("RGB", (canvas_width, canvas_height), (15, 23, 42))
     draw = ImageDraw.Draw(image)
 
-    margin = 88
-    draw.rounded_rectangle(
-        (40, 40, canvas_width - 40, canvas_height - 40),
-        radius=48,
-        fill=panel_color,
-    )
-    draw.rectangle((margin, 120, canvas_width - margin, 126), fill=accent_color)
-
-    try:
-        title_font = ImageFont.truetype("arial.ttf", 56)
-        body_font = ImageFont.truetype("arial.ttf", 40)
-        meta_font = ImageFont.truetype("arial.ttf", 30)
-    except Exception:
-        title_font = ImageFont.load_default()
-        body_font = ImageFont.load_default()
-        meta_font = ImageFont.load_default()
-
-    draw.text((margin, 160), title[:56], fill=muted_color, font=meta_font)
-    draw.text((margin, 220), f"{index + 1:02d}", fill=accent_color, font=title_font)
-
-    wrapped_lines = _wrap_text_to_width(slide_text, max_chars=24)
-    y = 380
-    for line in wrapped_lines[:12]:
-        draw.text((margin, y), line, fill=text_color, font=body_font)
-        y += 64 if body_font != ImageFont.load_default() else 20
-
-    footer = f"Slide {index + 1} of {total}"
-    footer_box = draw.textbbox((0, 0), footer, font=meta_font)
-    footer_width = footer_box[2] - footer_box[0]
-    draw.text(
-        (canvas_width - margin - footer_width, canvas_height - margin - 24),
-        footer,
-        fill=muted_color,
-        font=meta_font,
-    )
+    if slide_type in {"hook"}:
+        _render_hook_or_cta_slide(draw, width=canvas_width, height=canvas_height, slide=slide, index=index, footer="Swipe to read", is_cta=False)
+    elif slide_type in {"quote", "insight"}:
+        _render_quote_slide(draw, width=canvas_width, height=canvas_height, slide=slide, index=index)
+    elif slide_type in {"breakdown", "framework"}:
+        _render_breakdown_slide(draw, width=canvas_width, height=canvas_height, slide=slide, index=index)
+    elif slide_type in {"cta", "outro"}:
+        _render_hook_or_cta_slide(draw, width=canvas_width, height=canvas_height, slide=slide, index=index, footer="Save this", is_cta=True)
+    else:
+        _render_content_slide(draw, width=canvas_width, height=canvas_height, slide=slide, index=index)
 
     safe_title = "".join(ch for ch in title.lower() if ch.isalnum() or ch in ("-", "_", " ")).strip()
     safe_title = safe_title.replace(" ", "-")[:36] or "instagram-carousel"
@@ -739,7 +1170,7 @@ async def _publish_instagram_reel(access_token: str, instagram_user_id: str, ass
 
 
 async def _publish_instagram_carousel(access_token: str, instagram_user_id: str, asset: dict) -> dict:
-    slides = _extract_carousel_slides(asset)
+    slides = _extract_carousel_slide_payloads(asset)
     if len(slides) < 2:
         return {
             "ok": False,
