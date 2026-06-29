@@ -15,21 +15,14 @@ jobs:
     runs-on: [self-hosted, linux, x64]
 
     steps:
-      - name: Checkout latest code
-        uses: actions/checkout@v4
-
-      - name: Copy code to backend directory
+      - name: Deploy latest backend
         run: |
-          rsync -av --delete \
-            --filter=':- .gitignore' \
-            --exclude ".git" \
-            --exclude ".github" \
-            --exclude ".env" \
-            ./ /home/ubuntu/Content-OS-backend/
+          set -e
 
-      - name: Rebuild and restart Docker
-        run: |
           cd /home/ubuntu/Content-OS-backend
+
+          git fetch origin
+          git reset --hard origin/master
 
           docker compose up -d --build
 
@@ -37,6 +30,4 @@ jobs:
 
           docker compose ps
 
-      - name: Health check
-        run: |
           curl -f http://localhost:8000/check
