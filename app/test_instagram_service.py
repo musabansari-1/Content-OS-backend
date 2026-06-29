@@ -315,6 +315,26 @@ class InstagramServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(normalized["body"], "Make the published asset match the preview layout.")
         self.assertEqual(normalized["eyebrow"], "Insight")
 
+    def test_build_caption_from_asset_uses_caption_and_cta_without_labels(self) -> None:
+        asset = {
+            "title": "Manual releases are a nightmare",
+            "blocks": [
+                {"key": "slides", "value": ["slide 1", "slide 2"]},
+                {"key": "caption", "value": "Manual releases are a nightmare. CI/CD turns that into a one-click pipeline."},
+                {"key": "cta", "value": "Watch the full video for the full Jenkinsfile template."},
+            ],
+        }
+
+        caption = service._build_caption_from_asset(asset)
+
+        self.assertEqual(
+            caption,
+            "Manual releases are a nightmare. CI/CD turns that into a one-click pipeline.\n\n"
+            "Watch the full video for the full Jenkinsfile template.",
+        )
+        self.assertNotIn("caption:", caption.lower())
+        self.assertNotIn("cta:", caption.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

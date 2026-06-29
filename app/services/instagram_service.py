@@ -426,19 +426,39 @@ def _is_structured_slide_candidate(value: object) -> bool:
 def _build_caption_from_asset(asset: dict) -> str:
     title = _asset_title(asset)
     blocks = _asset_blocks(asset)
-    chunks: list[str] = [title]
+    caption_value = ""
+    cta_value = ""
+    fallback_chunks: list[str] = []
 
     for block in blocks:
         block_label = str(block.get("label") or block.get("key") or "").strip()
+        block_label_lower = block_label.lower()
         block_value = _normalize_text(block.get("value"))
         if not block_value:
             continue
-        if block_label.lower() in {"slides", "slide", "carousel"}:
+        if block_label_lower in {"slides", "slide", "carousel"}:
+            continue
+        if block_label_lower in {"caption", "post caption", "instagram caption"}:
+            caption_value = block_value
+            continue
+        if block_label_lower in {"cta", "call to action", "call_to_action"}:
+            cta_value = block_value
             continue
         if block_label:
-            chunks.append(f"{block_label}: {block_value}")
+            fallback_chunks.append(block_value)
         else:
-            chunks.append(block_value)
+            fallback_chunks.append(block_value)
+
+    chunks: list[str] = []
+    if caption_value:
+        chunks.append(caption_value)
+    else:
+        if title:
+            chunks.append(title)
+        chunks.extend(fallback_chunks)
+
+    if cta_value and cta_value not in chunks:
+        chunks.append(cta_value)
 
     caption = "\n\n".join(chunk for chunk in chunks if chunk).strip()
     return caption[:2200] if len(caption) > 2200 else caption
