@@ -71,12 +71,14 @@ import logging
 import os
 import re
 import shutil
+import time
 import subprocess
 import sys
 import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 #
@@ -96,6 +98,75 @@ logger = logging.getLogger(__name__)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_CLIP_SELECTION_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+DEFAULT_CLIP_SELECTION_TIMEOUT_SECONDS = 20.0
+
+
+def _env_text(name: str) -> str | None:
+    value = (os.getenv(name) or "").strip()
+    return value or None
+
+
+def _env_float(name: str, default: float) -> float:
+    raw_value = _env_text(name)
+    if raw_value is None:
+        return default
+
+    try:
+        return float(raw_value)
+    except ValueError:
+        return default
+
+
+def _resolve_clip_selection_model(explicit_model: str | None, *env_names: str) -> str:
+    candidate = (explicit_model or "").strip()
+    if candidate and candidate != DEFAULT_CLIP_SELECTION_MODEL:
+        return candidate
+
+    for env_name in env_names:
+        env_value = _env_text(env_name)
+        if env_value:
+            return env_value
+
+    return candidate or DEFAULT_CLIP_SELECTION_MODEL
+
+
+def _is_response_format_compatibility_error(error: Exception) -> bool:
+    message = str(error).lower()
+    compatibility_signals = (
+        "response_format",
+        "json_schema",
+        "json schema",
+        "not supported",
+        "unsupported",
+        "invalid parameter",
+    )
+    return any(signal in message for signal in compatibility_signals)
+
+
+def _run_with_wall_timeout(
+    *,
+    label: str,
+    timeout_seconds: float | None,
+    operation: Callable[[], Any],
+) -> Any:
+    if timeout_seconds is None or timeout_seconds <= 0:
+        return operation()
+
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"clip-{label}")
+    future = executor.submit(operation)
+
+    try:
+        return future.result(timeout=timeout_seconds)
+    except FutureTimeoutError as error:
+        future.cancel()
+        logger.warning(
+            "Clip LLM operation timed out: label=%s timeout_seconds=%s",
+            label,
+            timeout_seconds,
+        )
+        raise TimeoutError(f"{label} timed out after {timeout_seconds:.0f}s") from error
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _extract_json_object(raw_content: str) -> dict[str, Any]:
@@ -126,25 +197,30 @@ def _chat_completion_with_json_fallback(
     temperature: float,
     messages: list[dict[str, str]],
     response_format: dict[str, Any],
+    timeout_seconds: float | None = None,
 ):
+    request_kwargs = {
+        "model": model,
+        "temperature": temperature,
+        "messages": messages,
+    }
+    if timeout_seconds is not None:
+        request_kwargs["timeout"] = timeout_seconds
+
     try:
         return client.chat.completions.create(
-            model=model,
-            temperature=temperature,
             response_format=response_format,
-            messages=messages,
+            **request_kwargs,
         )
     except Exception as error:
+        if not _is_response_format_compatibility_error(error):
+            raise
         logger.warning(
             "Structured clip LLM call failed; retrying without response_format. model=%s error=%s",
             model,
             error,
         )
-        return client.chat.completions.create(
-            model=model,
-            temperature=temperature,
-            messages=messages,
-        )
+        return client.chat.completions.create(**request_kwargs)
 
 
 #
@@ -444,9 +520,10 @@ SCORING GUIDANCE:
 Return ONLY valid JSON - no explanation, no markdown, no preamble.
 """.strip()
 
-    def __init__(self, client: Any, model: str) -> None:
+    def __init__(self, client: Any, model: str, timeout_seconds: float | None = None) -> None:
         self.client = client
         self.model = model
+        self.timeout_seconds = timeout_seconds
 
     def chunk_units(self, units: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not units or not self.client:
@@ -522,12 +599,19 @@ Return ONLY valid JSON - no explanation, no markdown, no preamble.
                     ),
                 },
             ]
+        started_at = time.monotonic()
         response = _chat_completion_with_json_fallback(
             client=self.client,
             model=self.model,
             temperature=0.2,
             response_format=response_format,
             messages=messages,
+            timeout_seconds=self.timeout_seconds,
+        )
+        logger.info(
+            "TranscriptChunker completed: units=%s duration_seconds=%.2f",
+            len(units),
+            time.monotonic() - started_at,
         )
 
         try:
@@ -596,9 +680,10 @@ Return ONLY valid JSON:
 }
 """.strip()
 
-    def __init__(self, client: Any, model: str) -> None:
+    def __init__(self, client: Any, model: str, timeout_seconds: float | None = None) -> None:
         self.client = client
         self.model = model
+        self.timeout_seconds = timeout_seconds
 
     def score_candidates(
         self,
@@ -689,12 +774,20 @@ Return ONLY valid JSON:
                         ),
                     },
                 ]
+            started_at = time.monotonic()
             response = _chat_completion_with_json_fallback(
                 client=self.client,
                 model=self.model,
                 temperature=0.2,
                 response_format=response_format,
                 messages=messages,
+                timeout_seconds=self.timeout_seconds,
+            )
+            logger.info(
+                "LLMMomentScorer batch completed: batch_start=%s batch_size=%s duration_seconds=%.2f",
+                i,
+                len(batch),
+                time.monotonic() - started_at,
             )
 
             try:
@@ -935,6 +1028,7 @@ class GroqShortsPipeline:
         debug: bool = True,
         target_asset_types: list[str] | None = None,
         genre_profile: str | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         source_video = Path(source_video_path)
         self._validate_process_inputs(source_video, clip_count, words_per_caption)
@@ -954,6 +1048,14 @@ class GroqShortsPipeline:
         transcript = self._normalize_input(transcription)
         if not transcript["segments"]:
             raise ValueError("Transcription must include timestamped segments or words to generate clips.")
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "clip_analysis",
+                    "message": "Selecting the strongest reel moment.",
+                    "detail": "Reviewing the transcript to find the best cut for your short-form clip.",
+                }
+            )
         logger.info(
             "Normalized transcription: text_chars=%s segments=%s words=%s",
             len(transcript.get("text", "")),
@@ -997,14 +1099,38 @@ class GroqShortsPipeline:
 
         if self.chunker:
             try:
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "phase": "clip_analysis",
+                            "message": "Analyzing transcript structure.",
+                            "detail": "Finding complete moments that can stand alone as a reel.",
+                        }
+                )
                 logger.info("Running chunker on %s units", len(units))
-                raw_llm_chunks  = self.chunker.chunk_units(units)
+                raw_llm_chunks = _run_with_wall_timeout(
+                    label="chunker",
+                    timeout_seconds=self.chunker.timeout_seconds,
+                    operation=lambda: self.chunker.chunk_units(units),
+                )
                 llm_candidates = self._materialize_llm_chunks(raw_llm_chunks, units)
                 logger.info(
                     "Chunker produced %s raw chunks and %s materialized candidates",
                     len(raw_llm_chunks),
                     len(llm_candidates),
                 )
+            except TimeoutError as e:
+                logger.warning("Chunker timed out; continuing with deterministic clip selection: %s", e)
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "phase": "clip_analysis",
+                            "message": "Using fast fallback clip selection.",
+                            "detail": "The transcript analyzer took too long, so deterministic selection is continuing.",
+                        }
+                    )
+                if debug:
+                    self._write_json(debug_dir / "chunker_error.json", {"error": str(e)})
             except Exception as e:
                 logger.exception("Chunker failed")
                 if debug:
@@ -1031,10 +1157,35 @@ class GroqShortsPipeline:
 
         if self.scorer and candidate_dicts:
             try:
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "phase": "clip_analysis",
+                            "message": "Ranking the shortlisted reel moments.",
+                            "detail": "Scoring the best transcript sections so the final cut feels complete.",
+                        }
+                )
                 logger.info("Scoring %s candidates", len(candidate_dicts))
-                candidate_dicts = self.scorer.score_candidates(candidate_dicts)
+                candidate_dicts = _run_with_wall_timeout(
+                    label="scorer",
+                    timeout_seconds=self.scorer.timeout_seconds,
+                    operation=lambda: self.scorer.score_candidates(candidate_dicts),
+                )
                 candidate_dicts = self._apply_editorial_scores(candidate_dicts)
                 logger.info("Scoring complete: %s candidates", len(candidate_dicts))
+            except TimeoutError as e:
+                logger.warning("Scorer timed out; continuing with editorial scores: %s", e)
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "phase": "clip_analysis",
+                            "message": "Using fast editorial ranking.",
+                            "detail": "The ranking model took too long, so local scoring is continuing.",
+                        }
+                    )
+                candidate_dicts = self._apply_editorial_scores(candidate_dicts)
+                if debug:
+                    self._write_json(debug_dir / "scorer_error.json", {"error": str(e)})
             except Exception as e:
                 logger.exception("Scorer failed")
                 if debug:
@@ -1045,6 +1196,15 @@ class GroqShortsPipeline:
         else:
             candidate_dicts = self._select_diverse_candidates(candidate_dicts, clip_count)
         logger.info("Selected %s diverse candidates", len(candidate_dicts))
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "clip_selection_complete",
+                    "message": "Clip moment selected.",
+                    "detail": f"Picked {len(candidate_dicts)} candidate clip{'s' if len(candidate_dicts) != 1 else ''} for rendering.",
+                    "selected_count": len(candidate_dicts),
+                }
+            )
 
         if debug:
             self._write_json(debug_dir / "atomic_units.json", atomic_units)
@@ -1058,6 +1218,7 @@ class GroqShortsPipeline:
 
         rendered: list[dict[str, Any]] = []
         render_errors: list[dict[str, Any]] = []
+        total_candidates = max(1, len(candidates))
         for idx, candidate in enumerate(candidates, start=1):
             safe_name  = (self._slugify(candidate.title)[:70] or f"clip-{idx}")
             clip_path  = clips_dir / f"{idx:02d}-{safe_name}.mp4"
@@ -1089,6 +1250,17 @@ class GroqShortsPipeline:
                 clip_path,
                 sub_path,
             )
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "clip_render_start",
+                        "message": f"Rendering clip {idx} of {total_candidates}.",
+                        "detail": f"FFmpeg is creating the reel video for '{candidate.title}'.",
+                        "current_index": idx,
+                        "total_count": total_candidates,
+                        "clip_title": candidate.title,
+                    }
+                )
 
             try:
                 if add_captions and transcript["words"]:
@@ -1115,6 +1287,17 @@ class GroqShortsPipeline:
                     create_blur_background = create_blur_background,
                 )
                 logger.info("Finished FFmpeg render for clip_id=%s output=%s", candidate.clip_id, clip_path)
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "phase": "clip_render_complete",
+                            "message": f"Rendered clip {idx} of {total_candidates}.",
+                            "detail": f"Finished rendering '{candidate.title}'.",
+                            "current_index": idx,
+                            "total_count": total_candidates,
+                            "clip_title": candidate.title,
+                        }
+                    )
             except Exception as exc:
                 logger.exception("Failed to render clip_id=%s", candidate.clip_id)
                 render_errors.append(
@@ -4396,6 +4579,7 @@ def generate_short_clips_from_groq(
     debug: bool = True,
     target_asset_types: list[str] | None = None,
     genre_profile: str | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """
     High-level entry point.  Accepts a Groq transcription object or plain dict.
@@ -4434,15 +4618,60 @@ def generate_short_clips_from_groq(
     # Keep groq_api_key as a deprecated compatibility alias; clip selection now
     # uses OpenRouter while transcription can still be produced by Groq upstream.
     api_key = openrouter_api_key or env("OPENROUTER_API_KEY") or groq_api_key
+    clip_timeout_seconds = max(
+        1.0,
+        _env_float(
+            "OPENROUTER_CLIP_SELECTION_TIMEOUT_SECONDS",
+            DEFAULT_CLIP_SELECTION_TIMEOUT_SECONDS,
+        ),
+    )
+    resolved_chunk_model = _resolve_clip_selection_model(
+        chunk_model,
+        "OPENROUTER_CLIP_SELECTION_MODEL",
+        "OPENROUTER_CLIP_MODEL",
+    )
+    resolved_scorer_model = _resolve_clip_selection_model(
+        scorer_model,
+        "OPENROUTER_CLIP_SCORER_MODEL",
+        "OPENROUTER_CLIP_MODEL",
+        "OPENROUTER_CLIP_SELECTION_MODEL",
+    )
     client = (
-        OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL)
+        OpenAI(
+            api_key=api_key,
+            base_url=OPENROUTER_BASE_URL,
+            timeout=clip_timeout_seconds,
+            max_retries=1,
+        )
         if (api_key and OpenAI is not None)
         else None
     )
-    logger.info("OpenRouter clip-selection client initialized: has_client=%s", bool(client))
+    logger.info(
+        "OpenRouter clip-selection client initialized: has_client=%s timeout_seconds=%s chunk_model=%s scorer_model=%s",
+        bool(client),
+        clip_timeout_seconds,
+        resolved_chunk_model,
+        resolved_scorer_model,
+    )
 
-    chunker = TranscriptChunker(client=client, model=chunk_model) if client else None
-    scorer  = LLMMomentScorer(client=client,  model=scorer_model) if client else None
+    chunker = (
+        TranscriptChunker(
+            client=client,
+            model=resolved_chunk_model,
+            timeout_seconds=clip_timeout_seconds,
+        )
+        if client
+        else None
+    )
+    scorer  = (
+        LLMMomentScorer(
+            client=client,
+            model=resolved_scorer_model,
+            timeout_seconds=clip_timeout_seconds,
+        )
+        if client
+        else None
+    )
     logger.info("Pipeline helpers ready: has_chunker=%s has_scorer=%s", bool(chunker), bool(scorer))
 
     pipeline = GroqShortsPipeline(
@@ -4461,6 +4690,7 @@ def generate_short_clips_from_groq(
         debug                  = debug,
         target_asset_types     = target_asset_types,
         genre_profile          = genre_profile,
+        progress_callback      = progress_callback,
     )
 
 

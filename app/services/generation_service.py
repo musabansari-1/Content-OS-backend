@@ -778,6 +778,7 @@ import json
 import logging
 import mimetypes
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -813,10 +814,12 @@ from app.youtube_transcripts import (
 
 try:
     import boto3
+    from boto3.s3.transfer import TransferConfig
     from botocore.config import Config
     from botocore.exceptions import BotoCoreError, ClientError
 except ImportError:
     boto3 = None  # type: ignore
+    TransferConfig = None  # type: ignore
     Config = None  # type: ignore
     BotoCoreError = ClientError = Exception  # type: ignore[misc,assignment]
 
@@ -882,6 +885,31 @@ S3_TEXT_CACHE_CONTROL = (
     env("S3_TEXT_CACHE_CONTROL", "private, max-age=3600") or "private, max-age=3600"
 ).strip()
 
+S3_CONNECT_TIMEOUT_SECONDS = max(
+    1,
+    int(env("S3_CONNECT_TIMEOUT_SECONDS", "10") or "10"),
+)
+
+S3_READ_TIMEOUT_SECONDS = max(
+    1,
+    int(env("S3_READ_TIMEOUT_SECONDS", "180") or "180"),
+)
+
+S3_UPLOAD_MAX_CONCURRENCY = max(
+    1,
+    int(env("S3_UPLOAD_MAX_CONCURRENCY", "4") or "4"),
+)
+
+S3_UPLOAD_MULTIPART_THRESHOLD_BYTES = max(
+    5 * 1024 * 1024,
+    int(env("S3_UPLOAD_MULTIPART_THRESHOLD_BYTES", str(8 * 1024 * 1024)) or str(8 * 1024 * 1024)),
+)
+
+S3_UPLOAD_MULTIPART_CHUNKSIZE_BYTES = max(
+    5 * 1024 * 1024,
+    int(env("S3_UPLOAD_MULTIPART_CHUNKSIZE_BYTES", str(8 * 1024 * 1024)) or str(8 * 1024 * 1024)),
+)
+
 
 @dataclass(frozen=True)
 class StorageUploadResult:
@@ -925,6 +953,57 @@ def _validate_local_file(local_path: Path) -> None:
         raise RuntimeError(f"File is empty: {local_path}")
 
 
+def _build_s3_transfer_config() -> Any | None:
+    if TransferConfig is None:
+        return None
+
+    return TransferConfig(
+        multipart_threshold=S3_UPLOAD_MULTIPART_THRESHOLD_BYTES,
+        multipart_chunksize=S3_UPLOAD_MULTIPART_CHUNKSIZE_BYTES,
+        max_concurrency=S3_UPLOAD_MAX_CONCURRENCY,
+        use_threads=True,
+    )
+
+
+def _build_upload_progress_callback(
+    *,
+    local_path: Path,
+    progress_callback=None,
+):
+    if progress_callback is None:
+        return None
+
+    total_bytes = max(local_path.stat().st_size, 1)
+    uploaded_bytes = 0
+    last_reported_bucket = -1
+
+    def _emit(bytes_transferred: int) -> None:
+        nonlocal uploaded_bytes, last_reported_bucket
+
+        uploaded_bytes = min(total_bytes, uploaded_bytes + max(0, bytes_transferred))
+        fraction = uploaded_bytes / total_bytes
+        progress_bucket = min(2, int(fraction * 3))
+
+        if uploaded_bytes < total_bytes and progress_bucket <= last_reported_bucket:
+            return
+
+        last_reported_bucket = progress_bucket
+        uploaded_mb = uploaded_bytes / (1024 * 1024)
+        total_mb = total_bytes / (1024 * 1024)
+
+        progress_callback(
+            {
+                "stage": "execution_video",
+                "message": "Uploading rendered reel.",
+                "detail": f"Uploaded {uploaded_mb:.1f}MB of {total_mb:.1f}MB.",
+                "progress_percent": min(98, 96 + progress_bucket),
+                "steps": {"execution": "completed", "finalize": "active"},
+            }
+        )
+
+    return _emit
+
+
 @lru_cache(maxsize=1)
 def _get_s3_client():
     if boto3 is None:
@@ -951,6 +1030,8 @@ def _get_s3_client():
     if Config is not None:
         client_kwargs["config"] = Config(
             signature_version="s3v4",
+            connect_timeout=S3_CONNECT_TIMEOUT_SECONDS,
+            read_timeout=S3_READ_TIMEOUT_SECONDS,
             retries={
                 "max_attempts": 3,
                 "mode": "standard",
@@ -993,6 +1074,7 @@ def _upload_file_to_s3(
     local_path: Path,
     object_path: str,
     content_type: str | None = None,
+    upload_progress_callback=None,
 ) -> StorageUploadResult:
     _validate_local_file(local_path)
 
@@ -1023,12 +1105,17 @@ def _upload_file_to_s3(
         local_path.stat().st_size,
     )
 
+    started_at = time.monotonic()
+    transfer_config = _build_s3_transfer_config()
+
     try:
         client.upload_file(
             Filename=str(local_path),
             Bucket=S3_BUCKET,
             Key=object_key,
             ExtraArgs=extra_args,
+            Callback=upload_progress_callback,
+            Config=transfer_config,
         )
     except (BotoCoreError, ClientError) as error:
         logger.exception(
@@ -1038,6 +1125,8 @@ def _upload_file_to_s3(
             S3_BUCKET,
         )
         raise RuntimeError(f"S3 upload failed for {local_path.name}: {error}") from error
+
+    upload_duration_seconds = time.monotonic() - started_at
 
     if S3_USE_PRESIGNED_URLS:
         playback_url = _build_s3_signed_url(object_key)
@@ -1049,10 +1138,11 @@ def _upload_file_to_s3(
         is_signed_url = False
 
     logger.info(
-        "Uploaded file to S3: object_key=%s signed_url=%s expires_in=%s",
+        "Uploaded file to S3: object_key=%s signed_url=%s expires_in=%s duration_seconds=%.2f",
         object_key,
         is_signed_url,
         expires_in,
+        upload_duration_seconds,
     )
 
     return StorageUploadResult(
@@ -1147,9 +1237,15 @@ def _upload_generated_clip(
     local_path: Path,
     object_path: str,
     content_type: str | None = None,
+    upload_progress_callback=None,
 ) -> StorageUploadResult:
     if S3_BUCKET:
-        return _upload_file_to_s3(local_path, object_path, content_type)
+        return _upload_file_to_s3(
+            local_path,
+            object_path,
+            content_type,
+            upload_progress_callback=upload_progress_callback,
+        )
 
     return _upload_file_to_supabase(local_path, object_path, content_type)
 
@@ -1626,6 +1722,35 @@ def _attach_generated_clips_to_results(
             }
         )
 
+    def emit_clip_progress(event: dict[str, Any]) -> None:
+        if not progress_callback:
+            return
+
+        phase = str(event.get("phase") or "").strip().lower()
+        current_index = int(event.get("current_index") or 0)
+        total_count = max(1, int(event.get("total_count") or 1))
+        base_progress = 89
+        if phase == "clip_analysis":
+            progress = 89
+        elif phase == "clip_selection_complete":
+            progress = 91
+        elif phase == "clip_render_start":
+            progress = min(96, 92 + int(((max(current_index, 1) - 1) / total_count) * 3))
+        elif phase == "clip_render_complete":
+            progress = min(97, 94 + int((max(current_index, 1) / total_count) * 3))
+        else:
+            progress = base_progress
+
+        progress_callback(
+            {
+                "stage": "execution_video",
+                "message": event.get("message") or "Rendering short-form clips.",
+                "detail": event.get("detail") or "Preparing your reel clip for export.",
+                "progress_percent": progress,
+                "steps": {"execution": "completed", "finalize": "active"},
+            }
+        )
+
     logger.info(
         "Starting generate_short_clips_from_groq: source_video_path=%s clip_count=%s output_dir=%s",
         source_video_path,
@@ -1642,6 +1767,7 @@ def _attach_generated_clips_to_results(
             create_blur_background=True,
             debug=True,
             target_asset_types=requested_short_assets,
+            progress_callback=emit_clip_progress,
         )
     except Exception:
         logger.exception(
@@ -1693,10 +1819,24 @@ def _attach_generated_clips_to_results(
             clip_subtitle_path = clip_payload.get("subtitle_path")
 
             try:
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "stage": "execution_video",
+                            "message": "Uploading rendered reel.",
+                            "detail": "Saving the generated video so it can be returned to the workspace.",
+                            "progress_percent": 96,
+                            "steps": {"execution": "completed", "finalize": "active"},
+                        }
+                    )
                 video_storage = _upload_generated_clip(
                     clip_video_path,
                     f"clips/{run_id}/{clip_video_path.name}",
                     "video/mp4",
+                    upload_progress_callback=_build_upload_progress_callback(
+                        local_path=clip_video_path,
+                        progress_callback=progress_callback,
+                    ),
                 )
 
                 subtitle_storage = None
@@ -1707,6 +1847,16 @@ def _attach_generated_clips_to_results(
                         subtitle_file,
                         f"subtitles/{run_id}/{subtitle_file.name}",
                         "text/plain",
+                    )
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "stage": "finalize",
+                            "message": "Finishing the reel package.",
+                            "detail": "The reel has been rendered and uploaded. Final workspace metadata is being assembled.",
+                            "progress_percent": 99,
+                            "steps": {"execution": "completed", "finalize": "active"},
+                        }
                     )
 
             except Exception:

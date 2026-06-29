@@ -199,6 +199,109 @@ class InstagramServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(error_context.exception.status_code, 400)
         self.assertIn("public HTTPS URL", str(error_context.exception.detail))
 
+    async def test_publish_instagram_reel_waits_for_container_to_finish(self) -> None:
+        asset = {
+            "assetType": "instagram_reel",
+            "media": {
+                "videoUrl": "https://cdn.example.com/reel.mp4",
+            },
+        }
+
+        with (
+            patch.object(service, "_create_instagram_media_container", AsyncMock(return_value="creation-123")),
+            patch.object(service, "_wait_for_instagram_container_ready", AsyncMock(return_value={"status_code": "FINISHED"})) as mock_wait,
+            patch.object(service, "_publish_instagram_container_with_retry", AsyncMock(return_value={"id": "post-123"})),
+        ):
+            result = await service._publish_instagram_reel("token-123", "90010177253934", asset)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["instagram_post_id"], "post-123")
+        mock_wait.assert_awaited_once_with(
+            access_token="token-123",
+            creation_id="creation-123",
+        )
+
+    async def test_wait_for_instagram_container_ready_polls_until_finished(self) -> None:
+        with (
+            patch.object(
+                service,
+                "_fetch_instagram_container_status",
+                AsyncMock(
+                    side_effect=[
+                        {"status_code": "IN_PROGRESS", "status": "Processing"},
+                        {"status_code": "FINISHED", "status": "Finished"},
+                    ]
+                ),
+            ) as mock_fetch,
+            patch("app.services.instagram_service.asyncio.sleep", AsyncMock()) as mock_sleep,
+        ):
+            result = await service._wait_for_instagram_container_ready(
+                access_token="token-123",
+                creation_id="creation-123",
+            )
+
+        self.assertEqual(result["status_code"], "FINISHED")
+        self.assertEqual(mock_fetch.await_count, 2)
+        mock_sleep.assert_awaited_once()
+
+    async def test_wait_for_instagram_container_ready_fails_on_error_status(self) -> None:
+        with patch.object(
+            service,
+            "_fetch_instagram_container_status",
+            AsyncMock(return_value={"status_code": "ERROR", "status": "Invalid video format"}),
+        ):
+            with self.assertRaises(HTTPException) as error_context:
+                await service._wait_for_instagram_container_ready(
+                    access_token="token-123",
+                    creation_id="creation-123",
+                )
+
+        self.assertEqual(error_context.exception.status_code, 502)
+        self.assertIn("Invalid video format", str(error_context.exception.detail))
+
+    async def test_publish_instagram_asset_for_user_surfaces_graph_error_message(self) -> None:
+        response = httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "The video format is unsupported.",
+                    "error_user_msg": "Upload a supported MP4 file.",
+                }
+            },
+            request=httpx.Request("POST", "https://graph.instagram.com/v25.0/123/media"),
+        )
+        graph_error = httpx.HTTPStatusError("HTTP 400", request=response.request, response=response)
+        connection = SocialIntegrationRecord(
+            id=1,
+            user_id=17,
+            platform="instagram",
+            platform_user_id="90010177253934",
+            platform_username="creator_handle",
+            access_token="token-123",
+            refresh_token=None,
+            scope="instagram_business_basic,instagram_business_content_publish",
+            token_type="bearer",
+            token_expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        with (
+            patch.object(service.social_integration_repository, "get_by_user_and_platform", return_value=connection),
+            patch.object(service, "_publish_instagram_reel", AsyncMock(side_effect=graph_error)),
+        ):
+            result = await service.publish_instagram_asset_for_user(
+                user_id=17,
+                asset={
+                    "assetType": "instagram_reel",
+                    "media": {"videoUrl": "https://cdn.example.com/reel.mp4"},
+                },
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("Upload a supported MP4 file.", result["message"])
+        self.assertIn("The video format is unsupported.", result["message"])
+
     def test_resolve_instagram_carousel_slide_url_falls_back_to_public_base_url(self) -> None:
         file_path = Path("D:/generated/instagram/slide-1.png")
 

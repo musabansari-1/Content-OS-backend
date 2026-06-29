@@ -1,7 +1,16 @@
 import unittest
+import time
 from types import SimpleNamespace
+from unittest.mock import patch
 
-from app.utils.generate_video_clips import ClipCandidate, GroqShortsPipeline, TranscriptChunker
+from app.utils.generate_video_clips import (
+    ClipCandidate,
+    GroqShortsPipeline,
+    TranscriptChunker,
+    _chat_completion_with_json_fallback,
+    _resolve_clip_selection_model,
+    _run_with_wall_timeout,
+)
 
 
 class _FallbackChatCompletions:
@@ -34,6 +43,21 @@ class _FallbackChatCompletions:
 class _FallbackClient:
     def __init__(self) -> None:
         self.completions = _FallbackChatCompletions()
+        self.chat = SimpleNamespace(completions=self.completions)
+
+
+class _TimeoutChatCompletions:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def create(self, **kwargs):  # noqa: ANN003, ANN201
+        self.calls.append(kwargs)
+        raise TimeoutError("request timed out")
+
+
+class _TimeoutClient:
+    def __init__(self) -> None:
+        self.completions = _TimeoutChatCompletions()
         self.chat = SimpleNamespace(completions=self.completions)
 
 
@@ -295,6 +319,47 @@ class GenerateVideoClipsBoundaryTests(unittest.TestCase):
         self.assertEqual(len(client.completions.calls), 2)
         self.assertIn("response_format", client.completions.calls[0])
         self.assertNotIn("response_format", client.completions.calls[1])
+
+    def test_json_fallback_does_not_retry_non_compatibility_errors(self) -> None:
+        client = _TimeoutClient()
+
+        with self.assertRaises(TimeoutError):
+            _chat_completion_with_json_fallback(
+                client=client,
+                model="nvidia/nemotron-3-super-120b-a12b:free",
+                temperature=0.2,
+                messages=[{"role": "user", "content": "test"}],
+                response_format={"type": "json_object"},
+                timeout_seconds=12.0,
+            )
+
+        self.assertEqual(len(client.completions.calls), 1)
+        self.assertEqual(client.completions.calls[0]["timeout"], 12.0)
+
+    def test_resolve_clip_selection_model_uses_env_override_for_default(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"OPENROUTER_CLIP_SELECTION_MODEL": "openai/gpt-4.1-mini"},
+            clear=False,
+        ):
+            resolved = _resolve_clip_selection_model(
+                "nvidia/nemotron-3-super-120b-a12b:free",
+                "OPENROUTER_CLIP_SELECTION_MODEL",
+            )
+
+        self.assertEqual(resolved, "openai/gpt-4.1-mini")
+
+    def test_wall_timeout_releases_slow_clip_operation(self) -> None:
+        started_at = time.monotonic()
+
+        with self.assertRaises(TimeoutError):
+            _run_with_wall_timeout(
+                label="test",
+                timeout_seconds=0.05,
+                operation=lambda: time.sleep(0.5),
+            )
+
+        self.assertLess(time.monotonic() - started_at, 0.4)
 
     def test_reasonable_sentence_without_topic_boundary_cannot_start_clip(self) -> None:
         unit = self._unit(

@@ -50,6 +50,8 @@ _TOKEN_REFRESH_MIN_AGE = timedelta(hours=24)
 _TOKEN_REFRESH_SKEW = timedelta(days=7)
 _INSTAGRAM_PUBLISH_RETRY_ATTEMPTS = 5
 _INSTAGRAM_PUBLISH_RETRY_DELAY_SECONDS = 3
+_INSTAGRAM_CONTAINER_STATUS_ATTEMPTS = 24
+_INSTAGRAM_CONTAINER_STATUS_DELAY_SECONDS = 3
 _instagram_oauth_state_lock = threading.Lock()
 _instagram_oauth_state_store: dict[str, dict[str, int]] = {}
 social_integration_repository = SocialIntegrationRepository()
@@ -190,10 +192,11 @@ async def publish_instagram_asset_for_user(*, user_id: int, asset: dict) -> dict
         }
     except httpx.HTTPStatusError as error:
         response = error.response
+        error_message = _extract_instagram_error_message(response)
         return {
             "ok": False,
             "error": "instagram_publish_failed",
-            "message": "Instagram rejected the post request.",
+            "message": f"Instagram rejected the post request: {error_message}",
             "status_code": response.status_code,
             "response_text": response.text,
         }
@@ -1060,6 +1063,32 @@ def _is_retryable_instagram_publish_error(error: httpx.HTTPStatusError) -> bool:
     return any(snippet in message for snippet in ("not ready", "not finished", "please wait", "processing"))
 
 
+def _extract_instagram_error_message(response: httpx.Response) -> str:
+    fallback = (response.text or "").strip()
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {}
+
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            parts = [
+                str(error.get(key) or "").strip()
+                for key in ("error_user_msg", "message", "error_subcode")
+                if str(error.get(key) or "").strip()
+            ]
+            if parts:
+                return " ".join(dict.fromkeys(parts))
+
+        for key in ("error_message", "message"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                return value
+
+    return fallback or f"HTTP {response.status_code}"
+
+
 async def _fetch_instagram_account_profile(access_token: str) -> dict:
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.get(
@@ -1141,6 +1170,64 @@ async def _publish_instagram_container(
     return response.json() if response.content else {}
 
 
+async def _fetch_instagram_container_status(
+    *,
+    access_token: str,
+    creation_id: str,
+) -> dict:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(
+            f"{INSTAGRAM_GRAPH_URL}/{creation_id}",
+            params={
+                "fields": "status_code,status",
+                "access_token": access_token,
+            },
+        )
+        response.raise_for_status()
+    return response.json() if response.content else {}
+
+
+async def _wait_for_instagram_container_ready(
+    *,
+    access_token: str,
+    creation_id: str,
+) -> dict:
+    last_status: dict = {}
+    for attempt in range(1, _INSTAGRAM_CONTAINER_STATUS_ATTEMPTS + 1):
+        last_status = await _fetch_instagram_container_status(
+            access_token=access_token,
+            creation_id=creation_id,
+        )
+        status_code = str(last_status.get("status_code") or "").strip().upper()
+        status_text = str(last_status.get("status") or "").strip()
+
+        logger.info(
+            "Instagram media container status: creation_id=%s attempt=%s status_code=%s status=%s",
+            creation_id,
+            attempt,
+            status_code,
+            status_text,
+        )
+
+        if status_code == "FINISHED":
+            return last_status
+
+        if status_code in {"ERROR", "EXPIRED"}:
+            detail = status_text or status_code.lower()
+            raise HTTPException(
+                status_code=502,
+                detail=f"Instagram could not process the reel video: {detail}",
+            )
+
+        if attempt < _INSTAGRAM_CONTAINER_STATUS_ATTEMPTS:
+            await asyncio.sleep(_INSTAGRAM_CONTAINER_STATUS_DELAY_SECONDS)
+
+    raise HTTPException(
+        status_code=502,
+        detail="Instagram is still processing the reel video. Please try publishing again in a minute.",
+    )
+
+
 async def _publish_instagram_container_with_retry(
     *,
     access_token: str,
@@ -1181,6 +1268,10 @@ async def _publish_instagram_reel(access_token: str, instagram_user_id: str, ass
             "caption": caption,
             "share_to_feed": "true",
         },
+    )
+    await _wait_for_instagram_container_ready(
+        access_token=access_token,
+        creation_id=creation_id,
     )
     publish_result = await _publish_instagram_container_with_retry(
         access_token=access_token,
