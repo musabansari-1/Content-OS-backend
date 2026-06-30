@@ -31,6 +31,12 @@ from app.services.tiktok_service import (
     publish_tiktok_asset_for_user,
     start_tiktok_auth,
 )
+from app.services.youtube_service import (
+    get_youtube_channel_for_user,
+    handle_youtube_callback,
+    publish_youtube_asset_for_user,
+    start_youtube_auth,
+)
 
 
 router = APIRouter()
@@ -59,6 +65,18 @@ class TikTokPublishRequest(BaseModel):
 
 class TikTokStatusRequest(BaseModel):
     publish_id: str = Field(..., description="The TikTok publish id returned by /tiktok/publish.")
+
+
+class YouTubePublishRequest(BaseModel):
+    asset: dict = Field(..., description="The YouTube Shorts asset payload to publish.")
+    privacy_status: str | None = Field(None, description="One of public, private, or unlisted.")
+    title: str | None = Field(None, description="Optional YouTube title override.")
+    description: str | None = Field(None, description="Optional YouTube description override.")
+    tags: list[str] | None = Field(None, description="Optional YouTube tags.")
+    category_id: str | None = Field(None, description="YouTube video category id. Defaults to People & Blogs.")
+    notify_subscribers: bool | None = None
+    self_declared_made_for_kids: bool | None = None
+    contains_synthetic_media: bool | None = None
 
 
 class GhostConnectRequest(BaseModel):
@@ -133,6 +151,16 @@ def auth_tiktok(current_user: AuthUser = Depends(require_verified_user)):
 @router.get("/auth/tiktok/callback")
 async def auth_tiktok_callback(code: str = None, state: str = None, error: str = None):
     return await handle_tiktok_callback(code=code, state=state, error=error)
+
+
+@router.get("/auth/youtube")
+def auth_youtube(current_user: AuthUser = Depends(require_verified_user)):
+    return {"auth_url": start_youtube_auth(user_id=current_user.id)}
+
+
+@router.get("/auth/youtube/callback")
+async def auth_youtube_callback(code: str = None, state: str = None, error: str = None):
+    return await handle_youtube_callback(code=code, state=state, error=error)
 
 
 @router.post("/ghost/connect")
@@ -337,6 +365,66 @@ async def get_tiktok_creator_info(current_user: AuthUser = Depends(require_verif
             detail=result.get("message", "TikTok creator info request failed."),
         )
     return result
+
+
+@router.get("/youtube/channel")
+async def get_youtube_channel(current_user: AuthUser = Depends(require_verified_user)):
+    result = await get_youtube_channel_for_user(user_id=current_user.id)
+    if not result.get("ok"):
+        error = result.get("error")
+        if error == "youtube_not_connected":
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=result["message"])
+        raise HTTPException(
+            status_code=result.get("status_code") or status.HTTP_502_BAD_GATEWAY,
+            detail=result.get("message", "YouTube channel lookup failed."),
+        )
+    return result
+
+
+@router.post("/youtube/publish")
+async def publish_youtube(
+    request: YouTubePublishRequest,
+    current_user: AuthUser = Depends(require_verified_user),
+):
+    ensure_can_direct_publish(current_user.id, 1)
+
+    asset = request.asset if isinstance(request.asset, dict) else {}
+    result = await publish_youtube_asset_for_user(
+        user_id=current_user.id,
+        asset=asset,
+        privacy_status=request.privacy_status,
+        title=request.title,
+        description=request.description,
+        tags=request.tags,
+        category_id=request.category_id,
+        notify_subscribers=request.notify_subscribers,
+        self_declared_made_for_kids=request.self_declared_made_for_kids,
+        contains_synthetic_media=request.contains_synthetic_media,
+    )
+    if not result.get("ok"):
+        error = result.get("error")
+        if error == "youtube_not_connected":
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=result["message"])
+        if error == "youtube_connection_incomplete":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result["message"])
+        if error in {"youtube_not_configured", "youtube_unsupported_asset", "youtube_invalid_asset"}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result["message"])
+        raise HTTPException(
+            status_code=result.get("status_code") or status.HTTP_502_BAD_GATEWAY,
+            detail=result.get("message", "YouTube publish failed."),
+        )
+
+    record_direct_publish(current_user.id, 1)
+    return {
+        "message": "YouTube video uploaded.",
+        "platform": result["platform"],
+        "asset_type": result.get("asset_type"),
+        "youtube_video_id": result.get("youtube_video_id"),
+        "youtube_video_url": result.get("youtube_video_url"),
+        "privacy_status": result.get("privacy_status"),
+        "youtube_channel_id": result.get("youtube_channel_id"),
+        "youtube_channel_title": result.get("youtube_channel_title"),
+    }
 
 
 @router.post("/tiktok/publish")

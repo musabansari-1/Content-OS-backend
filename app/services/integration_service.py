@@ -704,4 +704,5 @@ def get_connected_platforms_for_user(*, user_id: int) -> dict:
         "x_connected": X_PLATFORM in platforms,
         "tiktok_connected": "tiktok" in platforms,
         "ghost_connected": "ghost" in platforms,
+        "youtube_connected": "youtube" in platforms,
     }

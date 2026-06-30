@@ -14,9 +14,10 @@ from app.scheduling.repository import ScheduledPostRepository
 from app.services.instagram_service import publish_instagram_asset_for_user
 from app.services.integration_service import publish_linkedin_post_for_user, publish_x_asset_for_user
 from app.services.tiktok_service import publish_tiktok_asset_for_user
+from app.services.youtube_service import publish_youtube_asset_for_user
 
 
-VALID_PLATFORMS = {"linkedin", "x", "instagram", "tiktok", "ghost"}
+VALID_PLATFORMS = {"linkedin", "x", "instagram", "tiktok", "ghost", "youtube"}
 VALID_STATUSES = {"scheduled", "publishing", "published", "failed", "canceled"}
 MINIMUM_SCHEDULE_DELAY_SECONDS = 30
 DEFAULT_MAX_ATTEMPTS = 3
@@ -171,6 +172,19 @@ async def _publish_claimed_post(post: ScheduledPostRecord) -> dict[str, Any]:
             asset=post.payload["asset"],
             newsletter_slug=post.payload.get("newsletter_slug"),
         )
+    elif post.platform == "youtube":
+        result = await publish_youtube_asset_for_user(
+            user_id=post.user_id,
+            asset=post.payload["asset"],
+            privacy_status=post.payload.get("privacy_status"),
+            title=post.payload.get("title"),
+            description=post.payload.get("description"),
+            tags=post.payload.get("tags"),
+            category_id=post.payload.get("category_id"),
+            notify_subscribers=post.payload.get("notify_subscribers"),
+            self_declared_made_for_kids=post.payload.get("self_declared_made_for_kids"),
+            contains_synthetic_media=post.payload.get("contains_synthetic_media"),
+        )
     else:
         result = {
             "ok": False,
@@ -210,6 +224,7 @@ def _platform_label(platform: str) -> str:
         "instagram": "Instagram",
         "tiktok": "TikTok",
         "ghost": "Ghost",
+        "youtube": "YouTube",
     }
     return labels.get(platform, platform.title())
 
@@ -229,7 +244,7 @@ def _normalize_payload(platform: str, payload: dict[str, Any]) -> dict[str, Any]
             normalized_payload["metadata"] = metadata
         return normalized_payload
 
-    if platform in {"x", "instagram", "tiktok", "ghost"}:
+    if platform in {"x", "instagram", "tiktok", "ghost", "youtube"}:
         asset = payload.get("asset")
         if not isinstance(asset, dict):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{platform.title()} scheduled posts require an asset.")
@@ -250,6 +265,19 @@ def _normalize_payload(platform: str, payload: dict[str, Any]) -> dict[str, Any]
             newsletter_slug = str(payload.get("newsletter_slug") or "").strip()
             if newsletter_slug:
                 normalized_payload["newsletter_slug"] = newsletter_slug
+        if platform == "youtube":
+            for key in (
+                "privacy_status",
+                "title",
+                "description",
+                "tags",
+                "category_id",
+                "notify_subscribers",
+                "self_declared_made_for_kids",
+                "contains_synthetic_media",
+            ):
+                if key in payload:
+                    normalized_payload[key] = payload[key]
         return normalized_payload
 
     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported scheduling platform.")
@@ -300,7 +328,7 @@ def _client_asset_id(payload: dict[str, Any]) -> str:
 
 
 def _external_post_id(result: dict[str, Any]) -> str | None:
-    for key in ("linkedin_post_id", "x_post_id", "instagram_post_id", "publish_id", "ghost_post_id"):
+    for key in ("linkedin_post_id", "x_post_id", "instagram_post_id", "publish_id", "ghost_post_id", "youtube_video_id"):
         value = result.get(key)
         if value:
             return str(value)

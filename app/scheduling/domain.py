@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 
 ScheduledPostStatus = Literal["scheduled", "publishing", "published", "failed", "canceled"]
-ScheduledPostPlatform = Literal["linkedin", "instagram", "tiktok", "ghost"]
+ScheduledPostPlatform = Literal["linkedin", "instagram", "tiktok", "ghost", "x", "youtube"]
 
 
 @dataclass(frozen=True)

@@ -23,7 +23,7 @@ router = APIRouter(prefix="/scheduled-posts", tags=["scheduled-posts"])
 
 
 class ScheduledPostCreateRequest(BaseModel):
-    platform: str = Field(..., description="One of linkedin, x, instagram, tiktok, or ghost.")
+    platform: str = Field(..., description="One of linkedin, x, instagram, tiktok, ghost, or youtube.")
     payload: dict[str, Any] = Field(..., description="Platform publish payload snapshot.")
     scheduled_for: datetime = Field(..., description="Scheduled publish time. Timezone-aware values are recommended.")
     timezone: str | None = Field("UTC", description="User-facing timezone label for display.")
