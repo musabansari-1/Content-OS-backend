@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes
 import secrets
 import tempfile
@@ -44,6 +45,7 @@ _DEFAULT_CATEGORY_ID = "22"
 _youtube_oauth_state_lock = threading.Lock()
 _youtube_oauth_state_store: dict[str, dict[str, int]] = {}
 social_integration_repository = SocialIntegrationRepository()
+logger = logging.getLogger(__name__)
 
 
 def start_youtube_auth(*, user_id: int) -> str:
@@ -231,11 +233,20 @@ async def publish_youtube_asset_for_user(
         }
     except httpx.HTTPStatusError as error:
         return _youtube_http_error_result(error, default_message="YouTube rejected the upload request.")
-    except Exception:
+    except httpx.HTTPError as error:
+        logger.exception("YouTube publish network failure.")
+        return {
+            "ok": False,
+            "error": "youtube_network_failed",
+            "message": _safe_exception_message(error, fallback="YouTube publish could not reach the required video or Google upload endpoint."),
+            "retryable": True,
+        }
+    except Exception as error:
+        logger.exception("YouTube publish failed unexpectedly.")
         return {
             "ok": False,
             "error": "youtube_publish_failed",
-            "message": "YouTube publish failed unexpectedly.",
+            "message": _safe_exception_message(error, fallback="YouTube publish failed unexpectedly."),
         }
     finally:
         if downloaded_path:
@@ -432,7 +443,16 @@ async def _upload_youtube_video(
             )
         upload_response.raise_for_status()
 
-    return upload_response.json() if upload_response.content else {}
+    if not upload_response.content:
+        return {}
+    try:
+        payload = upload_response.json()
+    except ValueError as error:
+        raise HTTPException(
+            status_code=502,
+            detail="YouTube returned a non-JSON upload response.",
+        ) from error
+    return payload if isinstance(payload, dict) else {}
 
 
 async def _resolve_youtube_video_source(asset: dict[str, Any]) -> tuple[Path, Path | None, str]:
@@ -749,3 +769,13 @@ def _http_exception_result(error: HTTPException, *, default_error: str) -> dict[
         "message": error.detail if isinstance(error.detail, str) else "YouTube request failed.",
         "status_code": error.status_code,
     }
+
+
+def _safe_exception_message(error: Exception, *, fallback: str) -> str:
+    detail = str(error).strip()
+    if not detail:
+        return fallback
+    detail = detail.replace(YOUTUBE_CLIENT_SECRET, "[redacted]") if YOUTUBE_CLIENT_SECRET else detail
+    if len(detail) > 220:
+        detail = detail[:217].rstrip() + "..."
+    return f"{fallback}: {type(error).__name__}: {detail}"
