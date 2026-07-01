@@ -31,6 +31,9 @@ STRATEGY_BRIEF:
 FEEDBACK:
 {feedback}
 
+REVISION_CONTEXT:
+{revision_context}
+
 SOURCE:
 {source}
 
@@ -87,6 +90,10 @@ VOICE RULES:
 
 CRITICAL CONSTRAINT:
 - If there is feedback then strictly follow it.
+- If REVISION_CONTEXT contains a previous draft, revise that draft instead of starting over.
+- Preserve the strongest source-grounded parts of the previous draft.
+- Fix every critique item directly; do not ignore, soften, or route around the feedback.
+- If an issue appears in recurring_issues, treat it as a hard failure to correct in this attempt.
 - Use ONLY details explicitly present in the input transcript
 - DO NOT invent numbers, companies, salaries, or scenarios
 - Extract REAL moments from the story
@@ -148,6 +155,22 @@ def build_execution_user_prompt(
         "must_use_details": task.get("must_use_details", []),
         "must_avoid_claims": task.get("must_avoid_claims", []),
     }
+    revision_context = {
+        "mode": (
+            "revise_previous_draft"
+            if task.get("previous_output")
+            else "create_initial_draft"
+        ),
+        "previous_output": task.get("previous_output"),
+        "previous_critique": task.get("previous_critique"),
+        "recurring_issues": task.get("recurring_issues", []),
+        "revision_instruction": (
+            "Revise the previous output using the critique. Keep what is strong, "
+            "fix every issue, and return only the improved publish-ready JSON."
+            if task.get("previous_output")
+            else "Create the first publish-ready draft from the strategy brief."
+        ),
+    }
 
     return EXECUTION_PROMPT.format(
         platform=task["platform"],
@@ -161,6 +184,11 @@ def build_execution_user_prompt(
             ensure_ascii=False,
         ),
         feedback=json.dumps(task.get("feedback", []), ensure_ascii=False),
+        revision_context=json.dumps(
+            revision_context,
+            indent=2,
+            ensure_ascii=False,
+        ),
         source=source,
         creator_voice_profile=json.dumps(
             voice_profile_payload,

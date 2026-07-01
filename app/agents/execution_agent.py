@@ -171,6 +171,7 @@ def run_execution_pipeline(
 
         current_task = base_task
         accumulated_feedback = []
+        issue_counts = {}
 
         if task["asset_type"] in (skip_text_asset_types or set()):
             if progress_callback:
@@ -264,10 +265,21 @@ def run_execution_pipeline(
 
             accumulated_feedback.extend(critique["improvements"])
             accumulated_feedback = list(dict.fromkeys(accumulated_feedback))
+            for issue in critique.get("issues", []):
+                issue_counts[issue] = issue_counts.get(issue, 0) + 1
+
+            recurring_issues = [
+                issue
+                for issue, count in issue_counts.items()
+                if count > 1
+            ]
 
             current_task = {
                 **base_task,
                 "feedback": accumulated_feedback,
+                "previous_output": output,
+                "previous_critique": critique,
+                "recurring_issues": recurring_issues,
             }
 
             attempt += 1
