@@ -46,6 +46,65 @@ def _normalize_preferred_devices(values: List[str]) -> List[str]:
     return list(dict.fromkeys(normalized))
 
 
+def _coerce_text(value: Any) -> str:
+    if value is None:
+        return ""
+
+    if isinstance(value, str):
+        return value.strip()
+
+    if isinstance(value, list):
+        normalized = []
+        seen = set()
+
+        for item in value:
+            text = _coerce_text(item)
+            if not text:
+                continue
+
+            key = text.casefold()
+            if key in seen:
+                continue
+
+            seen.add(key)
+            normalized.append(text)
+
+        return "; ".join(normalized)
+
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+
+    return ""
+
+
+def _normalize_string_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+
+    if isinstance(value, str):
+        value = [value]
+
+    if not isinstance(value, list):
+        return []
+
+    normalized = []
+    seen = set()
+
+    for item in value:
+        text = _coerce_text(item)
+        if not text:
+            continue
+
+        key = text.casefold()
+        if key in seen:
+            continue
+
+        seen.add(key)
+        normalized.append(text)
+
+    return normalized
+
+
 class VoiceProfile(BaseModel):
     sample_count: int = 0
     field_confidence: Dict[str, float] = Field(default_factory=dict)
@@ -114,13 +173,33 @@ class VoiceProfile(BaseModel):
 
     @validator("preferred_devices", pre=True, always=True)
     def validate_preferred_devices(cls, value):
-        if value is None:
-            return []
+        return _normalize_preferred_devices(_normalize_string_list(value))
 
-        if isinstance(value, str):
-            value = [value]
+    @validator(
+        "sentence_rhythm",
+        "humor_style",
+        "emotional_intensity",
+        "emoji_usage",
+        "punctuation_style",
+        "style_summary",
+        pre=True,
+        always=True,
+    )
+    def validate_text_fields(cls, value):
+        return _coerce_text(value)
 
-        return _normalize_preferred_devices(value)
+    @validator(
+        "tone",
+        "hook_style",
+        "cta_style",
+        "banned_phrases",
+        "preferred_phrases",
+        "voice_anchors",
+        pre=True,
+        always=True,
+    )
+    def validate_list_fields(cls, value):
+        return _normalize_string_list(value)
 
 
 class NarrativeBehavior(BaseModel):
@@ -131,6 +210,22 @@ class NarrativeBehavior(BaseModel):
     authority_pattern: str = ""
     closing_pattern: str = ""
 
+    @validator(
+        "opening_pattern",
+        "tension_pattern",
+        "teaching_pattern",
+        "authority_pattern",
+        "closing_pattern",
+        pre=True,
+        always=True,
+    )
+    def validate_text_fields(cls, value):
+        return _coerce_text(value)
+
+    @validator("idea_progression", pre=True, always=True)
+    def validate_list_fields(cls, value):
+        return _normalize_string_list(value)
+
 
 class CognitiveStyle(BaseModel):
     reasoning_style: List[str] = Field(default_factory=list)
@@ -139,11 +234,29 @@ class CognitiveStyle(BaseModel):
     problem_solving_style: str = ""
     common_reframes: List[str] = Field(default_factory=list)
 
+    @validator("abstraction_pattern", "problem_solving_style", pre=True, always=True)
+    def validate_text_fields(cls, value):
+        return _coerce_text(value)
+
+    @validator(
+        "reasoning_style",
+        "decision_lens",
+        "common_reframes",
+        pre=True,
+        always=True,
+    )
+    def validate_list_fields(cls, value):
+        return _normalize_string_list(value)
+
 
 class ConstraintProfile(BaseModel):
     avoids: List[str] = Field(default_factory=list)
     never_does: List[str] = Field(default_factory=list)
     overuse_risks: List[str] = Field(default_factory=list)
+
+    @validator("avoids", "never_does", "overuse_risks", pre=True, always=True)
+    def validate_list_fields(cls, value):
+        return _normalize_string_list(value)
 
 
 class CreatorVoiceProfileRecord(BaseModel):
